@@ -32,10 +32,13 @@ temp/
 node_modules/
 dist/
 build/
+target/
 .next/
 .nuxt/
 .svelte-kit/
 coverage/
+!/dashboard/dist/
+!/dashboard/dist/**
 
 # Local caches
 .cache/
@@ -43,7 +46,11 @@ coverage/
 .turbo/
 .vite/
 
+# Local app databases
+*.db
+*.sqlite3
+*.sqlite3-*
+
 # Beads / Dolt files (added by bd init)
 .dolt/
-*.db
 .beads-credential-key
