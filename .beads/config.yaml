@@ -55,3 +55,5 @@
 # - github.token    → use GITHUB_TOKEN env var instead
 
 sync.remote: "http://dolt.deltaisland.io/dirtydash"
+
+federation.remote: "http://dolt.deltaisland.io/dirtydash"
