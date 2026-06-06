@@ -303,6 +303,7 @@ td {
 }
 
 .provenance,
+.pricing-version,
 .raw-path {
   display: block;
   max-width: 360px;
@@ -313,6 +314,11 @@ td {
 
 .provenance {
   color: var(--cyan);
+}
+
+.pricing-version {
+  color: var(--soft);
+  font-size: 12px;
 }
 
 .raw-path {

@@ -110,6 +110,28 @@ pub struct RemoteRow {
     pub last_file_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageEventWrite {
+    Inserted,
+    Updated,
+    Skipped,
+}
+
+#[derive(Debug)]
+struct UsageEventPricingState {
+    provider: String,
+    model: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+    estimated_cost_usd: f64,
+    confidence: f64,
+    pricing_version: String,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -221,11 +243,83 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_usage_event(&self, event: &UsageEvent) -> Result<bool> {
+    pub fn upsert_usage_event(&self, event: &UsageEvent) -> Result<UsageEventWrite> {
         let conn = self.connection()?;
+        let existing = conn
+            .query_row(
+                r#"
+                SELECT provider, model, prompt_tokens, completion_tokens, cache_read_tokens,
+                    cache_write_tokens, reasoning_tokens, total_tokens, estimated_cost_usd,
+                    confidence, pricing_version
+                FROM usage_events
+                WHERE raw_event_hash = ?1
+                "#,
+                params![event.raw_event_hash],
+                |row| {
+                    Ok(UsageEventPricingState {
+                        provider: row.get(0)?,
+                        model: row.get(1)?,
+                        prompt_tokens: row.get::<_, i64>(2)? as u64,
+                        completion_tokens: row.get::<_, i64>(3)? as u64,
+                        cache_read_tokens: row.get::<_, i64>(4)? as u64,
+                        cache_write_tokens: row.get::<_, i64>(5)? as u64,
+                        reasoning_tokens: row.get::<_, i64>(6)? as u64,
+                        total_tokens: row.get::<_, i64>(7)? as u64,
+                        estimated_cost_usd: row.get(8)?,
+                        confidence: row.get(9)?,
+                        pricing_version: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        if let Some(existing) = existing {
+            if existing.matches(event) {
+                return Ok(UsageEventWrite::Skipped);
+            }
+            conn.execute(
+                r#"
+                UPDATE usage_events
+                SET provider = ?1,
+                    model = ?2,
+                    prompt_tokens = ?3,
+                    completion_tokens = ?4,
+                    cache_read_tokens = ?5,
+                    cache_write_tokens = ?6,
+                    reasoning_tokens = ?7,
+                    total_tokens = ?8,
+                    estimated_cost_usd = ?9,
+                    confidence = ?10,
+                    parser_version = ?11,
+                    imported_at = ?12,
+                    pricing_version = ?13,
+                    metadata_only = ?14
+                WHERE raw_event_hash = ?15
+                "#,
+                params![
+                    event.provider,
+                    event.model,
+                    event.prompt_tokens,
+                    event.completion_tokens,
+                    event.cache_read_tokens,
+                    event.cache_write_tokens,
+                    event.reasoning_tokens,
+                    event.total_tokens,
+                    event.estimated_cost_usd,
+                    event.confidence,
+                    event.parser_version,
+                    event.imported_at,
+                    event.pricing_version,
+                    if event.metadata_only { 1 } else { 0 },
+                    event.raw_event_hash,
+                ],
+            )?;
+            return Ok(UsageEventWrite::Updated);
+        }
+
         let changed = conn.execute(
             r#"
-            INSERT OR IGNORE INTO usage_events (
+            INSERT INTO usage_events (
                 machine, source, project_path, session_id, provider, model,
                 prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
                 reasoning_tokens, total_tokens, estimated_cost_usd, confidence,
@@ -261,7 +355,11 @@ impl Database {
                 if event.metadata_only { 1 } else { 0 },
             ],
         )?;
-        Ok(changed > 0)
+        Ok(if changed > 0 {
+            UsageEventWrite::Inserted
+        } else {
+            UsageEventWrite::Skipped
+        })
     }
 
     pub fn upsert_source_file(&self, record: &SourceFileRecord) -> Result<()> {
@@ -355,27 +453,27 @@ impl Database {
 
     pub fn pricing_record(&self, provider: &str, model: &str) -> Result<Option<PricingRecord>> {
         let conn = self.connection()?;
-        let mut candidates = vec![model.to_string()];
-        if let Some(stripped) = strip_version_suffix(model) {
-            candidates.push(stripped);
-        }
+        let provider_candidates = pricing_provider_candidates(provider);
+        let model_candidates = pricing_model_candidates(model);
 
-        for candidate in candidates {
-            let record = conn
-                .query_row(
-                    r#"
-                    SELECT provider, model, input_rate, output_rate, cache_read_rate,
-                        cache_write_rate, source_label, snapshot_version, override_flag,
-                        local_free_flag, updated_at
-                    FROM pricing_records
-                    WHERE provider = ?1 AND model = ?2
-                    "#,
-                    params![provider, candidate],
-                    pricing_from_row,
-                )
-                .optional()?;
-            if record.is_some() {
-                return Ok(record);
+        for provider_candidate in provider_candidates {
+            for model_candidate in &model_candidates {
+                let record = conn
+                    .query_row(
+                        r#"
+                        SELECT provider, model, input_rate, output_rate, cache_read_rate,
+                            cache_write_rate, source_label, snapshot_version, override_flag,
+                            local_free_flag, updated_at
+                        FROM pricing_records
+                        WHERE provider = ?1 AND model = ?2
+                        "#,
+                        params![provider_candidate, model_candidate],
+                        pricing_from_row,
+                    )
+                    .optional()?;
+                if record.is_some() {
+                    return Ok(record);
+                }
             }
         }
         Ok(None)
@@ -680,6 +778,22 @@ impl Database {
     }
 }
 
+impl UsageEventPricingState {
+    fn matches(&self, event: &UsageEvent) -> bool {
+        self.provider == event.provider
+            && self.model == event.model
+            && self.prompt_tokens == event.prompt_tokens
+            && self.completion_tokens == event.completion_tokens
+            && self.cache_read_tokens == event.cache_read_tokens
+            && self.cache_write_tokens == event.cache_write_tokens
+            && self.reasoning_tokens == event.reasoning_tokens
+            && self.total_tokens == event.total_tokens
+            && (self.estimated_cost_usd - event.estimated_cost_usd).abs() < 0.0000001
+            && (self.confidence - event.confidence).abs() < 0.0000001
+            && self.pricing_version == event.pricing_version
+    }
+}
+
 fn pricing_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PricingRecord> {
     Ok(PricingRecord {
         provider: row.get(0)?,
@@ -694,6 +808,40 @@ fn pricing_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PricingRecord> 
         local_free_flag: row.get::<_, i64>(9)? != 0,
         updated_at: row.get(10)?,
     })
+}
+
+fn pricing_provider_candidates(provider: &str) -> Vec<String> {
+    let normalized = provider.trim().to_ascii_lowercase();
+    let mut candidates = vec![normalized.clone()];
+    if matches!(
+        normalized.as_str(),
+        "openai-codex" | "openai-code" | "codex" | "codex-openai"
+    ) {
+        candidates.push("openai".to_string());
+    }
+    dedupe(candidates)
+}
+
+fn pricing_model_candidates(model: &str) -> Vec<String> {
+    let normalized = model.trim().to_string();
+    let mut candidates = vec![normalized.clone()];
+    if let Some(stripped) = strip_version_suffix(&normalized) {
+        candidates.push(stripped);
+    }
+    if let Some(stripped) = normalized.strip_suffix("-spark") {
+        candidates.push(stripped.to_string());
+    }
+    dedupe(candidates)
+}
+
+fn dedupe(values: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for value in values {
+        if !value.trim().is_empty() && !deduped.contains(&value) {
+            deduped.push(value);
+        }
+    }
+    deduped
 }
 
 fn count_row(conn: &Connection, sql: &str) -> Result<u64> {
