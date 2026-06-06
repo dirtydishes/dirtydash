@@ -44,6 +44,7 @@ pub struct ImportOptions {
 pub struct ImportReport {
     pub files_seen: u64,
     pub inserted_events: u64,
+    pub updated_existing_events: u64,
     pub skipped_existing_events: u64,
     pub parse_errors: u64,
 }
@@ -261,10 +262,10 @@ pub fn import_sources(
             })?;
 
             for event in parsed.events {
-                if db.insert_usage_event(&event)? {
-                    report.inserted_events += 1;
-                } else {
-                    report.skipped_existing_events += 1;
+                match db.upsert_usage_event(&event)? {
+                    crate::db::UsageEventWrite::Inserted => report.inserted_events += 1,
+                    crate::db::UsageEventWrite::Updated => report.updated_existing_events += 1,
+                    crate::db::UsageEventWrite::Skipped => report.skipped_existing_events += 1,
                 }
             }
         }
@@ -641,8 +642,19 @@ fn event_from_usage(
     let project_path =
         extract_string(value, PROJECT_KEYS).unwrap_or_else(|| infer_project_path(source, file));
     let event_timestamp = extract_timestamp(value).or_else(|| file_modified_at(file));
-    let cost = pricing::estimate_cost(db, &provider, &model, &usage)?;
-    let confidence = if cost.priced { 0.92 } else { 0.62 };
+    let reported_cost = extract_reported_cost(value);
+    let cost = if reported_cost.is_some() {
+        None
+    } else {
+        Some(pricing::estimate_cost(db, &provider, &model, &usage)?)
+    };
+    let confidence = if reported_cost.is_some() {
+        0.98
+    } else if cost.as_ref().is_some_and(|estimate| estimate.priced) {
+        0.92
+    } else {
+        0.62
+    };
     let hash = raw_hash(source.kind, file, raw_span.as_deref(), value)?;
 
     Ok(Some(UsageEvent {
@@ -658,7 +670,9 @@ fn event_from_usage(
         cache_write_tokens: usage.cache_write_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.total_tokens(),
-        estimated_cost_usd: cost.estimated_cost_usd,
+        estimated_cost_usd: reported_cost
+            .or_else(|| cost.as_ref().map(|estimate| estimate.estimated_cost_usd))
+            .unwrap_or(0.0),
         confidence,
         event_timestamp,
         raw_path: file.display().to_string(),
@@ -667,12 +681,22 @@ fn event_from_usage(
         parser_version: PARSER_VERSION.to_string(),
         raw_event_hash: hash,
         imported_at: imported_at.to_string(),
-        pricing_version: cost.pricing_version,
+        pricing_version: reported_cost
+            .map(|_| "reported-cost".to_string())
+            .or_else(|| {
+                cost.as_ref()
+                    .map(|estimate| estimate.pricing_version.clone())
+            })
+            .unwrap_or_else(|| "unpriced".to_string()),
         metadata_only: options.metadata_only,
     }))
 }
 
 fn extract_usage_numbers(value: &Value) -> UsageNumbers {
+    if let Some(usage) = extract_direct_usage_numbers(value) {
+        return usage;
+    }
+
     UsageNumbers {
         prompt_tokens: extract_u64(value, PROMPT_KEYS).unwrap_or(0),
         completion_tokens: extract_u64(value, COMPLETION_KEYS).unwrap_or(0),
@@ -682,6 +706,73 @@ fn extract_usage_numbers(value: &Value) -> UsageNumbers {
     }
 }
 
+fn extract_direct_usage_numbers(value: &Value) -> Option<UsageNumbers> {
+    match value {
+        Value::Object(map) => {
+            if let Some(usage) = map.get("usage") {
+                let usage = UsageNumbers {
+                    prompt_tokens: extract_direct_u64(usage, DIRECT_PROMPT_KEYS).unwrap_or(0),
+                    completion_tokens: extract_direct_u64(usage, DIRECT_COMPLETION_KEYS)
+                        .unwrap_or(0),
+                    cache_read_tokens: extract_direct_u64(usage, DIRECT_CACHE_READ_KEYS)
+                        .unwrap_or(0),
+                    cache_write_tokens: extract_direct_u64(usage, DIRECT_CACHE_WRITE_KEYS)
+                        .unwrap_or(0),
+                    reasoning_tokens: extract_direct_u64(usage, DIRECT_REASONING_KEYS).unwrap_or(0),
+                };
+                if usage.has_usage() {
+                    return Some(usage);
+                }
+            }
+            map.values().find_map(extract_direct_usage_numbers)
+        }
+        Value::Array(items) => items.iter().find_map(extract_direct_usage_numbers),
+        _ => None,
+    }
+}
+
+const DIRECT_PROMPT_KEYS: &[&str] = &[
+    "input",
+    "inputTokens",
+    "input_tokens",
+    "prompt_tokens",
+    "promptTokens",
+    "total_input_tokens",
+    "totalInputTokens",
+];
+const DIRECT_COMPLETION_KEYS: &[&str] = &[
+    "output",
+    "outputTokens",
+    "output_tokens",
+    "completion_tokens",
+    "completionTokens",
+    "total_output_tokens",
+    "totalOutputTokens",
+];
+const DIRECT_CACHE_READ_KEYS: &[&str] = &[
+    "cacheRead",
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "cache_read_tokens",
+    "cacheReadTokens",
+    "cached_input_tokens",
+    "cachedInputTokens",
+];
+const DIRECT_CACHE_WRITE_KEYS: &[&str] = &[
+    "cacheWrite",
+    "cache_creation_input_tokens",
+    "cacheCreationInputTokens",
+    "cache_write_tokens",
+    "cacheWriteTokens",
+    "cacheCreationTokens",
+];
+const DIRECT_REASONING_KEYS: &[&str] = &[
+    "reasoning",
+    "reasoning_tokens",
+    "reasoningTokens",
+    "reasoning_output_tokens",
+    "reasoningOutputTokens",
+];
 const PROMPT_KEYS: &[&str] = &[
     "input_tokens",
     "inputTokens",
@@ -768,12 +859,46 @@ fn extract_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     }
 }
 
+fn extract_direct_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+    keys.iter()
+        .find_map(|key| map.get(*key).and_then(value_to_u64))
+}
+
 fn value_to_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number
             .as_u64()
             .or_else(|| number.as_f64().map(|n| n.max(0.0) as u64)),
         Value::String(raw) => raw.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_reported_cost(value: &Value) -> Option<f64> {
+    match value {
+        Value::Object(map) => {
+            if let Some(cost) = map
+                .get("usage")
+                .and_then(|usage| usage.pointer("/cost/total"))
+                .and_then(value_to_f64)
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            {
+                return Some(cost);
+            }
+            map.values().find_map(extract_reported_cost)
+        }
+        Value::Array(items) => items.iter().find_map(extract_reported_cost),
         _ => None,
     }
 }
@@ -977,6 +1102,96 @@ mod tests {
         .unwrap();
         assert_eq!(report.inserted_events, 1);
         assert_eq!(report.parse_errors, 1);
+    }
+
+    #[test]
+    fn pi_agent_reported_cost_updates_stale_imported_rows() {
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("data");
+        let pi = data.join("pi/agent/sessions/project-pi");
+        fs::create_dir_all(&pi).unwrap();
+        let file = pi.join("session.jsonl");
+        fs::write(
+            &file,
+            r#"{"type":"session","id":"pi-1","timestamp":"2026-06-06T12:00:00Z","cwd":"/repo/pi"}
+{"type":"model_change","provider":"openai-codex","modelId":"gpt-5.4"}
+{"type":"message","id":"msg-1","timestamp":"2026-06-06T12:01:00Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.4","usage":{"input":1782,"output":169,"cacheRead":1536,"cacheWrite":0,"totalTokens":3487,"cost":{"input":0.004455,"output":0.002535,"cacheRead":0.000384,"cacheWrite":0,"total":0.00699}}}}"#,
+        )
+        .unwrap();
+
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+        let source = detected(SourceKind::PiAgent, data.join("pi/agent/sessions"));
+        let parsed = parse_file(
+            &db,
+            &source,
+            &file,
+            &crate::db::local_machine(),
+            "2026-06-06T12:02:00Z",
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+        let mut stale = parsed.events[0].clone();
+        stale.prompt_tokens = 0;
+        stale.cache_read_tokens = stale.total_tokens;
+        stale.completion_tokens = 0;
+        stale.estimated_cost_usd = 0.0;
+        stale.confidence = 0.62;
+        stale.pricing_version = "unpriced".to_string();
+        let hash = stale.raw_event_hash.clone();
+        assert!(matches!(
+            db.upsert_usage_event(&stale).unwrap(),
+            crate::db::UsageEventWrite::Inserted
+        ));
+
+        let report = import_sources(
+            &db,
+            vec![source],
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.inserted_events, 0);
+        assert_eq!(report.updated_existing_events, 1);
+        assert_eq!(report.skipped_existing_events, 0);
+
+        let conn = db.connection().unwrap();
+        let repaired = conn
+            .query_row(
+                r#"
+                SELECT provider, model, prompt_tokens, completion_tokens, cache_read_tokens,
+                    total_tokens, estimated_cost_usd, pricing_version
+                FROM usage_events
+                WHERE raw_event_hash = ?1
+                "#,
+                rusqlite::params![hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)? as u64,
+                        row.get::<_, i64>(4)? as u64,
+                        row.get::<_, i64>(5)? as u64,
+                        row.get::<_, f64>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(repaired.0, "openai-codex");
+        assert_eq!(repaired.1, "gpt-5.4");
+        assert_eq!(repaired.2, 1782);
+        assert_eq!(repaired.3, 169);
+        assert_eq!(repaired.4, 1536);
+        assert_eq!(repaired.5, 3487);
+        assert!((repaired.6 - 0.00699).abs() < 0.00001);
+        assert_eq!(repaired.7, "reported-cost");
     }
 
     fn detected(kind: SourceKind, path: PathBuf) -> DetectedSource {
