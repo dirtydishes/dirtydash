@@ -1,3 +1,47 @@
+# macOS and filesystem metadata
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+
+# Editor and local workspace files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.mobileprovision
+
+# Logs and local runtime output
+*.log
+logs/
+tmp/
+temp/
+
+# Dependency and build output
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+.svelte-kit/
+coverage/
+
+# Local caches
+.cache/
+.parcel-cache/
+.turbo/
+.vite/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
