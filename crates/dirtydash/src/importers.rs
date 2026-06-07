@@ -535,9 +535,10 @@ fn parse_codex_jsonl(
 
         if payload_type == Some("token_count") {
             let usage_value = value.pointer("/payload").unwrap_or(&value);
-            let current = extract_usage_numbers(usage_value);
-            let delta = current.saturating_delta(&previous);
-            previous = current;
+            let (delta, current) = extract_codex_token_count_usage(usage_value, &previous);
+            if let Some(current) = current {
+                previous = current;
+            }
             if !delta.has_usage() {
                 continue;
             }
@@ -704,6 +705,42 @@ fn extract_usage_numbers(value: &Value) -> UsageNumbers {
         cache_write_tokens: extract_u64(value, CACHE_WRITE_KEYS).unwrap_or(0),
         reasoning_tokens: extract_u64(value, REASONING_KEYS).unwrap_or(0),
     }
+}
+
+fn extract_codex_token_count_usage(
+    payload: &Value,
+    previous: &UsageNumbers,
+) -> (UsageNumbers, Option<UsageNumbers>) {
+    let info = payload.get("info").unwrap_or(payload);
+    let last_usage = info
+        .get("last_token_usage")
+        .map(extract_usage_numbers)
+        .map(split_codex_cached_input);
+    let total_usage = info
+        .get("total_token_usage")
+        .map(extract_usage_numbers)
+        .map(split_codex_cached_input);
+
+    match (last_usage, total_usage) {
+        (Some(last), Some(total)) => (last, Some(total)),
+        (Some(last), None) => (last, None),
+        (None, Some(total)) => {
+            let delta = total.saturating_delta(previous);
+            (delta, Some(total))
+        }
+        (None, None) => {
+            let current = split_codex_cached_input(extract_usage_numbers(payload));
+            let delta = current.saturating_delta(previous);
+            (delta, Some(current))
+        }
+    }
+}
+
+fn split_codex_cached_input(mut usage: UsageNumbers) -> UsageNumbers {
+    let cached = usage.cache_read_tokens.min(usage.prompt_tokens);
+    usage.prompt_tokens -= cached;
+    usage.cache_read_tokens = cached;
+    usage
 }
 
 fn extract_direct_usage_numbers(value: &Value) -> Option<UsageNumbers> {
@@ -1028,7 +1065,8 @@ mod tests {
         fs::write(
             codex.join("session.jsonl"),
             r#"{"type":"event_msg","payload":{"type":"turn_context","model":"gpt-5.3-codex","cwd":"/repo/codex"}}
-{"type":"event_msg","payload":{"type":"token_count","input_tokens":1000,"cached_input_tokens":100,"output_tokens":50,"reasoning_output_tokens":25}}"#,
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50,"reasoning_output_tokens":25},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50,"reasoning_output_tokens":25}}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":400,"output_tokens":110,"reasoning_output_tokens":55},"last_token_usage":{"input_tokens":2000,"cached_input_tokens":300,"output_tokens":60,"reasoning_output_tokens":30}}}}"#,
         )
         .unwrap();
         fs::write(
@@ -1060,8 +1098,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(first.inserted_events, 4);
+        assert_eq!(first.inserted_events, 5);
         assert_eq!(first.parse_errors, 0);
+
+        let codex_session = db
+            .sessions(10)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.source == "codex")
+            .expect("codex session should be imported");
+        assert_eq!(codex_session.total_tokens, 3_165);
 
         let second = import_sources(
             &db,
@@ -1072,7 +1118,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second.inserted_events, 0);
-        assert_eq!(second.skipped_existing_events, 4);
+        assert_eq!(second.skipped_existing_events, 5);
     }
 
     #[test]
