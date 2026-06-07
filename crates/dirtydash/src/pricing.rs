@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::importers::UsageNumbers;
 
-pub const BUNDLED_PRICING_VERSION: &str = "2026-06-06-bundled";
+pub const BUNDLED_PRICING_VERSION: &str = "2026-06-07-cursor";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingRecord {
@@ -124,15 +124,34 @@ fn per_million(tokens: u64, rate: f64) -> f64 {
 fn bundled_records() -> Vec<PricingRecord> {
     let now = Utc::now().to_rfc3339();
     [
-        rec("openai", "gpt-5.5", 5.0, 30.0, 0.50, 5.0, "OpenAI pricing"),
+        rec("openai", "gpt-5.5", 5.0, 30.0, 0.50, 0.0, "Cursor pricing"),
         rec(
             "openai",
-            "gpt-5.4",
-            2.50,
-            15.0,
-            0.25,
-            2.50,
-            "OpenAI pricing",
+            "gpt-5.5-fast",
+            12.50,
+            75.0,
+            1.25,
+            0.0,
+            "Cursor pricing",
+        ),
+        rec(
+            "openai",
+            "gpt-5.5-long",
+            10.0,
+            45.0,
+            1.0,
+            0.0,
+            "Cursor pricing",
+        ),
+        rec("openai", "gpt-5.4", 2.50, 15.0, 0.25, 0.0, "Cursor pricing"),
+        rec(
+            "openai",
+            "gpt-5.4-fast",
+            5.0,
+            30.0,
+            0.50,
+            0.0,
+            "Cursor pricing",
         ),
         rec(
             "openai",
@@ -140,8 +159,8 @@ fn bundled_records() -> Vec<PricingRecord> {
             0.75,
             4.50,
             0.075,
-            0.75,
-            "OpenAI pricing",
+            0.0,
+            "Cursor pricing",
         ),
         rec(
             "openai",
@@ -149,8 +168,8 @@ fn bundled_records() -> Vec<PricingRecord> {
             0.20,
             1.25,
             0.02,
-            0.20,
-            "OpenAI pricing",
+            0.0,
+            "Cursor pricing",
         ),
         rec(
             "openai",
@@ -158,8 +177,8 @@ fn bundled_records() -> Vec<PricingRecord> {
             1.75,
             14.0,
             0.175,
-            1.75,
-            "OpenAI pricing",
+            0.0,
+            "Cursor pricing",
         ),
         rec(
             "openai",
@@ -167,8 +186,8 @@ fn bundled_records() -> Vec<PricingRecord> {
             1.50,
             6.0,
             0.375,
-            1.50,
-            "OpenAI pricing",
+            0.0,
+            "Cursor pricing",
         ),
         rec(
             "anthropic",
@@ -328,5 +347,45 @@ mod tests {
         let estimate = estimate_cost(&db, "openai-codex", "gpt-5.4-spark", &usage).unwrap();
         assert!(estimate.priced);
         assert!((estimate.estimated_cost_usd - 2.75).abs() < 0.0001);
+    }
+
+    #[test]
+    fn gpt_cache_writes_are_not_charged_in_cursor_snapshot() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+
+        let usage = UsageNumbers {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 1_000_000,
+            reasoning_tokens: 0,
+        };
+        let estimate = estimate_cost(&db, "openai-codex", "gpt-5.5-fast", &usage).unwrap();
+        assert!(estimate.priced);
+        assert_eq!(estimate.estimated_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn bundled_seed_refreshes_non_override_pricing_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        db.upsert_pricing_record(
+            &rec("openai", "gpt-5.5", 99.0, 99.0, 99.0, 99.0, "stale bundled"),
+            false,
+        )
+        .unwrap();
+
+        seed_bundled_pricing(&db).unwrap();
+
+        let record = db.pricing_record("openai", "gpt-5.5").unwrap().unwrap();
+        assert_eq!(record.input_rate, 5.0);
+        assert_eq!(record.output_rate, 30.0);
+        assert_eq!(record.cache_read_rate, 0.50);
+        assert_eq!(record.cache_write_rate, 0.0);
+        assert_eq!(record.snapshot_version, BUNDLED_PRICING_VERSION);
     }
 }

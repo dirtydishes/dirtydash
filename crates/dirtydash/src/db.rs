@@ -428,11 +428,21 @@ impl Database {
         } else {
             conn.execute(
                 r#"
-                INSERT OR IGNORE INTO pricing_records (
+                INSERT INTO pricing_records (
                     provider, model, input_rate, output_rate, cache_read_rate, cache_write_rate,
                     source_label, snapshot_version, override_flag, local_free_flag, updated_at
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(provider, model) DO UPDATE SET
+                    input_rate = excluded.input_rate,
+                    output_rate = excluded.output_rate,
+                    cache_read_rate = excluded.cache_read_rate,
+                    cache_write_rate = excluded.cache_write_rate,
+                    source_label = excluded.source_label,
+                    snapshot_version = excluded.snapshot_version,
+                    updated_at = excluded.updated_at
+                WHERE pricing_records.override_flag = 0
+                    AND pricing_records.local_free_flag = 0
                 "#,
                 params![
                     &record.provider,
@@ -545,7 +555,7 @@ impl Database {
             cache: self.cache_stats()?,
             daily: self.grouped_usage("date(COALESCE(event_timestamp, imported_at))", 30)?,
             by_source: self.grouped_usage("source", 20)?,
-            by_model: self.grouped_usage("provider || '/' || model", 20)?,
+            by_model: self.grouped_model_usage(20)?,
             by_project: self.grouped_usage("project_path", 20)?,
             expensive_sessions: self.sessions(12)?,
         })
@@ -778,6 +788,61 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    fn grouped_model_usage(&self, limit: usize) -> Result<Vec<NamedUsagePoint>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT provider,
+                model,
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_write_tokens), 0),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(estimated_cost_usd), 0)
+            FROM usage_events
+            GROUP BY provider, model
+            "#,
+        )?;
+        let mut rows = stmt
+            .query_map([], |row| {
+                Ok(NamedUsagePoint {
+                    name: canonical_model_label(row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    prompt_tokens: row.get::<_, i64>(2)? as u64,
+                    completion_tokens: row.get::<_, i64>(3)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(4)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(5)? as u64,
+                    total_tokens: row.get::<_, i64>(6)? as u64,
+                    estimated_cost_usd: row.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut merged = Vec::<NamedUsagePoint>::new();
+        for row in rows.drain(..) {
+            if let Some(existing) = merged.iter_mut().find(|existing| existing.name == row.name) {
+                existing.prompt_tokens += row.prompt_tokens;
+                existing.completion_tokens += row.completion_tokens;
+                existing.cache_read_tokens += row.cache_read_tokens;
+                existing.cache_write_tokens += row.cache_write_tokens;
+                existing.total_tokens += row.total_tokens;
+                existing.estimated_cost_usd += row.estimated_cost_usd;
+            } else {
+                merged.push(row);
+            }
+        }
+
+        merged.sort_by(|a, b| {
+            b.estimated_cost_usd
+                .partial_cmp(&a.estimated_cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.total_tokens.cmp(&a.total_tokens))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        merged.truncate(limit);
+        Ok(merged)
+    }
 }
 
 impl UsageEventPricingState {
@@ -827,6 +892,9 @@ fn pricing_provider_candidates(provider: &str) -> Vec<String> {
 fn pricing_model_candidates(model: &str) -> Vec<String> {
     let normalized = model.trim().to_string();
     let mut candidates = vec![normalized.clone()];
+    if let Some(dot_version) = cursor_doc_slug_to_model(&normalized) {
+        candidates.push(dot_version);
+    }
     if let Some(stripped) = strip_version_suffix(&normalized) {
         candidates.push(stripped);
     }
@@ -834,6 +902,15 @@ fn pricing_model_candidates(model: &str) -> Vec<String> {
         candidates.push(stripped.to_string());
     }
     dedupe(candidates)
+}
+
+fn canonical_model_label(_provider: String, model: String) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        "unknown".to_string()
+    } else {
+        model.to_string()
+    }
 }
 
 fn dedupe(values: Vec<String>) -> Vec<String> {
@@ -881,5 +958,92 @@ fn strip_version_suffix(model: &str) -> Option<String> {
         }
     } else {
         None
+    }
+}
+
+fn cursor_doc_slug_to_model(model: &str) -> Option<String> {
+    let parts: Vec<&str> = model.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let major = parts[0];
+    let minor = parts[1];
+    let patch = parts[2];
+    if !major.chars().all(|c| c.is_ascii_alphabetic())
+        || !minor.chars().all(|c| c.is_ascii_digit())
+        || !patch.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let suffix = if parts.len() > 3 {
+        format!("-{}", parts[3..].join("-"))
+    } else {
+        String::new()
+    };
+    Some(format!("{major}-{minor}.{patch}{suffix}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn model_summary_hides_provider_and_keeps_fast_slugs_separate() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        db.upsert_usage_event(&event("openai", "gpt-5.5", 1_000, "hash-1"))
+            .unwrap();
+        db.upsert_usage_event(&event("openai-codex", "gpt-5.5", 2_000, "hash-2"))
+            .unwrap();
+        db.upsert_usage_event(&event("openai", "gpt-5.5-fast", 3_000, "hash-3"))
+            .unwrap();
+
+        let summary = db.dashboard_summary().unwrap();
+        let standard = summary
+            .by_model
+            .iter()
+            .find(|row| row.name == "gpt-5.5")
+            .expect("standard model row should be present");
+        let fast = summary
+            .by_model
+            .iter()
+            .find(|row| row.name == "gpt-5.5-fast")
+            .expect("fast model row should be present");
+
+        assert_eq!(standard.total_tokens, 3_000);
+        assert_eq!(fast.total_tokens, 3_000);
+        assert!(summary.by_model.iter().all(|row| !row.name.contains('/')));
+    }
+
+    fn event(provider: &str, model: &str, tokens: u64, hash: &str) -> UsageEvent {
+        UsageEvent {
+            machine: "test-machine".to_string(),
+            source: importers::SourceKind::Codex,
+            project_path: "/repo".to_string(),
+            session_id: format!("session-{hash}"),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            prompt_tokens: tokens,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: tokens,
+            estimated_cost_usd: tokens as f64 / 1_000_000.0,
+            confidence: 0.92,
+            event_timestamp: None,
+            raw_path: "/tmp/session.jsonl".to_string(),
+            raw_span: None,
+            parser_name: "test-parser".to_string(),
+            parser_version: "test".to_string(),
+            raw_event_hash: hash.to_string(),
+            imported_at: Utc::now().to_rfc3339(),
+            pricing_version: "test-pricing".to_string(),
+            metadata_only: true,
+        }
     }
 }
