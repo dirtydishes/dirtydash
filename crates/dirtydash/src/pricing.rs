@@ -310,4 +310,23 @@ mod tests {
         assert_eq!(estimate.estimated_cost_usd, 0.0);
         assert!(estimate.priced);
     }
+
+    #[test]
+    fn openai_codex_provider_alias_uses_openai_pricing() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+
+        let usage = UsageNumbers {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let estimate = estimate_cost(&db, "openai-codex", "gpt-5.4-spark", &usage).unwrap();
+        assert!(estimate.priced);
+        assert!((estimate.estimated_cost_usd - 2.75).abs() < 0.0001);
+    }
 }

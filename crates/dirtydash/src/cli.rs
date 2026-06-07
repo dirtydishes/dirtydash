@@ -225,8 +225,11 @@ fn import(paths: &AppPaths, config: &Config, args: ImportArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "imported {} new events from {} files ({} parse errors)",
-            report.inserted_events, report.files_seen, report.parse_errors
+            "imported {} new events and updated {} existing events from {} files ({} parse errors)",
+            report.inserted_events,
+            report.updated_existing_events,
+            report.files_seen,
+            report.parse_errors
         );
     }
     Ok(())
@@ -341,8 +344,8 @@ fn first_run(paths: AppPaths, config: Config) -> Result<()> {
     )
     .context("first-run import failed")?;
     println!(
-        "metadata-only import complete: {} new events from {} files",
-        report.inserted_events, report.files_seen
+        "metadata-only import complete: {} new events and {} updated events from {} files",
+        report.inserted_events, report.updated_existing_events, report.files_seen
     );
 
     let args = ServeArgs {

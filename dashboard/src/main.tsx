@@ -311,7 +311,7 @@ function Overview({
 }) {
   return (
     <div className="page-grid">
-      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="bundled or manual pricing" />
+      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, bundled, manual pricing" />
       <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub="prompt, output, cache, reasoning" />
       <Metric label="Cache hit ratio" value={percent(summary.cache.hit_ratio)} sub={`${compact(summary.cache.cache_read_tokens)} read`} />
       <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
@@ -371,11 +371,13 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
 }
 
 function BurnReport({ summary }: { summary: DashboardSummary }) {
+  const unpriced = summary.by_model.filter((row) => row.total_tokens > 0 && row.estimated_cost_usd === 0);
+  const unpricedTokens = unpriced.reduce((total, row) => total + row.total_tokens, 0);
   return (
     <div className="page-grid">
       <Metric label="Biggest session" value={summary.expensive_sessions[0] ? money(summary.expensive_sessions[0].estimated_cost_usd) : "$0.00"} sub={summary.expensive_sessions[0]?.session_id ?? "no sessions yet"} />
       <Metric label="Biggest model" value={summary.by_model[0]?.name ?? "unknown"} sub={summary.by_model[0] ? money(summary.by_model[0].estimated_cost_usd) : "no spend"} />
-      <Metric label="Unknown spend" value={money(0)} sub="unpriced models stay visible as $0" />
+      <Metric label="Unpriced tokens" value={compact(unpricedTokens)} sub={`${unpriced.length} model rows need pricing`} />
       <SessionsTable title="Sessions to inspect first" sessions={summary.expensive_sessions} />
     </div>
   );
@@ -585,6 +587,7 @@ function SessionsTable({ title, sessions }: { title: string; sessions: SessionSu
                 <td>{money(session.estimated_cost_usd)}</td>
                 <td>
                   <span className="provenance">{session.parser_name}</span>
+                  <span className="pricing-version">{session.pricing_version}</span>
                   <span className="raw-path">{session.raw_path}</span>
                 </td>
               </tr>
