@@ -518,7 +518,8 @@ fn parse_codex_jsonl(
         };
 
         if let Some(model) = extract_string(&value, MODEL_KEYS) {
-            current_model = Some(model);
+            let effort = extract_string(&value, REASONING_EFFORT_KEYS);
+            current_model = Some(model_with_reasoning_effort(&model, effort.as_deref()));
         }
         if let Some(provider) = extract_string(&value, PROVIDER_KEYS) {
             current_provider = Some(provider);
@@ -634,6 +635,10 @@ fn event_from_usage(
     let provider = extract_string(value, PROVIDER_KEYS)
         .unwrap_or_else(|| source.kind.default_provider().to_string());
     let model = extract_string(value, MODEL_KEYS)
+        .map(|model| {
+            let effort = extract_string(value, REASONING_EFFORT_KEYS);
+            model_with_reasoning_effort(&model, effort.as_deref())
+        })
         .or_else(|| fallback_model.map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".to_string());
     let session_id = extract_string(value, SESSION_KEYS).unwrap_or_else(|| {
@@ -850,6 +855,14 @@ const REASONING_KEYS: &[&str] = &[
     "reasoningOutputTokens",
 ];
 const MODEL_KEYS: &[&str] = &["model", "model_id", "modelID", "modelId", "active_model"];
+const REASONING_EFFORT_KEYS: &[&str] = &[
+    "model_reasoning_effort",
+    "modelReasoningEffort",
+    "reasoning_effort",
+    "reasoningEffort",
+    "thinkingLevel",
+    "effort",
+];
 const PROVIDER_KEYS: &[&str] = &["provider", "provider_id", "providerID", "providerId"];
 const SESSION_KEYS: &[&str] = &[
     "session_id",
@@ -959,6 +972,21 @@ fn extract_string(value: &Value, keys: &[&str]) -> Option<String> {
         }
         Value::Array(items) => items.iter().find_map(|item| extract_string(item, keys)),
         _ => None,
+    }
+}
+
+fn model_with_reasoning_effort(model: &str, effort: Option<&str>) -> String {
+    let model = model.trim();
+    let Some(effort) = effort else {
+        return model.to_string();
+    };
+    let effort = effort.trim().to_ascii_lowercase();
+    if matches!(effort.as_str(), "fast" | "low" | "minimal" | "off" | "none")
+        && matches!(model, "gpt-5.5" | "gpt-5.4")
+    {
+        format!("{model}-fast")
+    } else {
+        model.to_string()
     }
 }
 
@@ -1148,6 +1176,60 @@ mod tests {
         .unwrap();
         assert_eq!(report.inserted_events, 1);
         assert_eq!(report.parse_errors, 1);
+    }
+
+    #[test]
+    fn codex_low_effort_gpt_models_import_as_fast_pricing_slugs() {
+        let dir = tempdir().unwrap();
+        let source_root = dir.path().join("codex/sessions");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("session-55.jsonl"),
+            r#"{"timestamp":"2026-06-07T12:00:00Z","type":"turn_context","payload":{"turn_id":"turn-fast-55","cwd":"/repo/fast","model":"gpt-5.5","collaboration_mode":{"settings":{"model":"gpt-5.5","reasoning_effort":"low"}},"effort":"low"}}
+{"timestamp":"2026-06-07T12:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50}}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            source_root.join("session-54.jsonl"),
+            r#"{"timestamp":"2026-06-07T12:01:00Z","type":"turn_context","payload":{"turn_id":"turn-fast-54","cwd":"/repo/fast","model":"gpt-5.4","collaboration_mode":{"settings":{"model":"gpt-5.4","reasoning_effort":"minimal"}},"effort":"minimal"}}
+{"timestamp":"2026-06-07T12:01:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50}}}}"#,
+        )
+        .unwrap();
+
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+        let source = detected(SourceKind::Codex, source_root);
+
+        let report = import_sources(
+            &db,
+            vec![source],
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.inserted_events, 2);
+        let sessions = db.sessions(10).unwrap();
+        let gpt55 = sessions
+            .iter()
+            .find(|session| session.model == "gpt-5.5-fast")
+            .expect("gpt-5.5 low effort should import as fast");
+        let gpt54 = sessions
+            .iter()
+            .find(|session| session.model == "gpt-5.4-fast")
+            .expect("gpt-5.4 minimal effort should import as fast");
+        assert_eq!(
+            gpt55.pricing_version,
+            crate::pricing::BUNDLED_PRICING_VERSION
+        );
+        assert_eq!(
+            gpt54.pricing_version,
+            crate::pricing::BUNDLED_PRICING_VERSION
+        );
+        assert!((gpt55.estimated_cost_usd - 0.015125).abs() < 0.000001);
+        assert!((gpt54.estimated_cost_usd - 0.00605).abs() < 0.000001);
     }
 
     #[test]
