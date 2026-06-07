@@ -46,7 +46,7 @@ pub fn estimate_cost(
     model: &str,
     usage: &UsageNumbers,
 ) -> Result<CostEstimate> {
-    if let Some(record) = db.pricing_record(provider, model)? {
+    if let Some(record) = pricing_record_with_provider_alias(db, provider, model)? {
         if record.local_free_flag {
             return Ok(CostEstimate {
                 estimated_cost_usd: 0.0,
@@ -73,6 +73,27 @@ pub fn estimate_cost(
             priced: false,
         })
     }
+}
+
+fn pricing_record_with_provider_alias(
+    db: &Database,
+    provider: &str,
+    model: &str,
+) -> Result<Option<PricingRecord>> {
+    if let Some(record) = db.pricing_record(provider, model)? {
+        return Ok(Some(record));
+    }
+
+    let canonical_provider = match provider {
+        "openai-codex" | "openai_codex" => Some("openai"),
+        _ => None,
+    };
+
+    if let Some(provider) = canonical_provider {
+        return db.pricing_record(provider, model);
+    }
+
+    Ok(None)
 }
 
 pub fn override_price(
@@ -163,12 +184,39 @@ fn bundled_records() -> Vec<PricingRecord> {
         ),
         rec(
             "openai",
+            "gpt-5.3-codex-spark",
+            1.75,
+            14.0,
+            0.175,
+            1.75,
+            "OpenAI pricing",
+        ),
+        rec(
+            "openai",
+            "gpt-5.4-fast",
+            2.50,
+            15.0,
+            0.25,
+            2.50,
+            "OpenAI pricing",
+        ),
+        rec(
+            "openai",
             "codex-mini-latest",
             1.50,
             6.0,
             0.375,
             1.50,
             "OpenAI pricing",
+        ),
+        rec(
+            "opencode",
+            "big-pickle",
+            0.60,
+            2.20,
+            0.11,
+            0.60,
+            "OpenRouter pricing",
         ),
         rec(
             "anthropic",

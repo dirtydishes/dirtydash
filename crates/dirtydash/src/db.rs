@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -223,9 +223,74 @@ impl Database {
 
     pub fn insert_usage_event(&self, event: &UsageEvent) -> Result<bool> {
         let conn = self.connection()?;
+        let existing = conn
+            .query_row(
+                "SELECT id FROM usage_events WHERE raw_event_hash = ?1",
+                params![event.raw_event_hash],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if existing.is_some() {
+            conn.execute(
+                r#"
+                UPDATE usage_events
+                SET machine = ?1,
+                    source = ?2,
+                    project_path = ?3,
+                    session_id = ?4,
+                    provider = ?5,
+                    model = ?6,
+                    prompt_tokens = ?7,
+                    completion_tokens = ?8,
+                    cache_read_tokens = ?9,
+                    cache_write_tokens = ?10,
+                    reasoning_tokens = ?11,
+                    total_tokens = ?12,
+                    estimated_cost_usd = ?13,
+                    confidence = ?14,
+                    event_timestamp = ?15,
+                    raw_path = ?16,
+                    raw_span = ?17,
+                    parser_name = ?18,
+                    parser_version = ?19,
+                    imported_at = ?20,
+                    pricing_version = ?21,
+                    metadata_only = ?22
+                WHERE raw_event_hash = ?23
+                "#,
+                params![
+                    event.machine,
+                    event.source.as_str(),
+                    event.project_path,
+                    event.session_id,
+                    event.provider,
+                    event.model,
+                    event.prompt_tokens,
+                    event.completion_tokens,
+                    event.cache_read_tokens,
+                    event.cache_write_tokens,
+                    event.reasoning_tokens,
+                    event.total_tokens,
+                    event.estimated_cost_usd,
+                    event.confidence,
+                    event.event_timestamp,
+                    event.raw_path,
+                    event.raw_span,
+                    event.parser_name,
+                    event.parser_version,
+                    event.imported_at,
+                    event.pricing_version,
+                    if event.metadata_only { 1 } else { 0 },
+                    event.raw_event_hash,
+                ],
+            )?;
+            return Ok(false);
+        }
+
         let changed = conn.execute(
             r#"
-            INSERT OR IGNORE INTO usage_events (
+            INSERT INTO usage_events (
                 machine, source, project_path, session_id, provider, model,
                 prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
                 reasoning_tokens, total_tokens, estimated_cost_usd, confidence,
@@ -262,6 +327,48 @@ impl Database {
             ],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn delete_usage_events_for_file_except(
+        &self,
+        source: importers::SourceKind,
+        machine: &str,
+        raw_path: &Path,
+        keep_hashes: &[String],
+    ) -> Result<u64> {
+        let conn = self.connection()?;
+        let raw_path = raw_path.display().to_string();
+
+        if keep_hashes.is_empty() {
+            let changed = conn.execute(
+                r#"
+                DELETE FROM usage_events
+                WHERE source = ?1 AND machine = ?2 AND raw_path = ?3
+                "#,
+                params![source.as_str(), machine, raw_path],
+            )?;
+            return Ok(changed as u64);
+        }
+
+        let placeholders = std::iter::repeat_n("?", keep_hashes.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+            DELETE FROM usage_events
+            WHERE source = ?
+              AND machine = ?
+              AND raw_path = ?
+              AND raw_event_hash NOT IN ({placeholders})
+            "#
+        );
+        let mut values = Vec::with_capacity(3 + keep_hashes.len());
+        values.push(source.as_str().to_string());
+        values.push(machine.to_string());
+        values.push(raw_path);
+        values.extend(keep_hashes.iter().cloned());
+        let changed = conn.execute(&sql, params_from_iter(values))?;
+        Ok(changed as u64)
     }
 
     pub fn upsert_source_file(&self, record: &SourceFileRecord) -> Result<()> {
