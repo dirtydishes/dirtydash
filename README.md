@@ -1,6 +1,6 @@
 # dirtydash
 
-dirtydash is a local-first dashboard for inspecting AI coding usage across terminal-native tools and GUI coding agents, including Codex, T3 Code, Claude Code, OpenCode, pi-agent, and others. It is built for developers who want to answer grounded questions about token volume, estimated cost, cache behavior, model usage, sessions, source files, and provenance without sending their activity to a hosted SaaS dashboard.
+dirtydash is a local-first dashboard for inspecting AI coding usage across both terminal-native and GUI agent harnesses and tools, including Codex, T3 Code, Claude Code, OpenCode, pi, and others. It is built for developers who want to answer grounded questions about token volume, estimated cost, cache behavior, model usage, sessions, source files, and provenance without sending their activity to a hosted SaaS dashboard.
 
 The project is intentionally practical and a little blunt: scan the files your tools already write, import the usage metadata into local SQLite, and serve a dense dashboard from your own machine.
 
