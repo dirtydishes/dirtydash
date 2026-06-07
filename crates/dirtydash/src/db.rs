@@ -58,6 +58,7 @@ pub struct UsageTotals {
 pub struct CacheStats {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_read_share: f64,
     pub hit_ratio: f64,
     pub estimated_savings_usd: f64,
 }
@@ -730,7 +731,7 @@ impl Database {
         let totals = self.usage_totals()?;
         let cache_input = totals.cache_read_tokens + totals.cache_write_tokens;
         let denominator = totals.prompt_tokens + cache_input;
-        let hit_ratio = if denominator == 0 {
+        let cache_read_share = if denominator == 0 {
             0.0
         } else {
             totals.cache_read_tokens as f64 / denominator as f64
@@ -738,7 +739,8 @@ impl Database {
         Ok(CacheStats {
             cache_read_tokens: totals.cache_read_tokens,
             cache_write_tokens: totals.cache_write_tokens,
-            hit_ratio,
+            cache_read_share,
+            hit_ratio: cache_read_share,
             estimated_savings_usd: 0.0,
         })
     }

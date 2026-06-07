@@ -63,6 +63,7 @@ type DashboardSummary = {
   cache: {
     cache_read_tokens: number;
     cache_write_tokens: number;
+    cache_read_share: number;
     hit_ratio: number;
     estimated_savings_usd: number;
   };
@@ -114,6 +115,7 @@ const emptySummary: DashboardSummary = {
   cache: {
     cache_read_tokens: 0,
     cache_write_tokens: 0,
+    cache_read_share: 0,
     hit_ratio: 0,
     estimated_savings_usd: 0
   },
@@ -313,7 +315,7 @@ function Overview({
     <div className="page-grid">
       <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, bundled, manual pricing" />
       <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub="prompt, output, cache, reasoning" />
-      <Metric label="Cache hit ratio" value={percent(summary.cache.hit_ratio)} sub={`${compact(summary.cache.cache_read_tokens)} read`} />
+      <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.cache.cache_read_tokens)} observed reads`} />
       <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
       <TrendPanel title="Usage by source" rows={summary.by_source} />
       <TrendPanel title="Usage by model" rows={summary.by_model} />
@@ -340,7 +342,24 @@ function SinkPage({
 }
 
 function CachePage({ summary }: { summary: DashboardSummary }) {
+  const observedInputTokens =
+    summary.totals.prompt_tokens +
+    summary.totals.cache_read_tokens +
+    summary.totals.cache_write_tokens;
+  const cacheWriteSub =
+    summary.totals.cache_write_tokens > 0
+      ? "source-reported cache creation"
+      : "not exposed by current logs";
   const rows: NamedUsagePoint[] = [
+    {
+      name: "uncached input",
+      prompt_tokens: summary.totals.prompt_tokens,
+      completion_tokens: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+      total_tokens: summary.totals.prompt_tokens,
+      estimated_cost_usd: 0
+    },
     {
       name: "cache read",
       prompt_tokens: 0,
@@ -362,9 +381,19 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
   ];
   return (
     <div className="page-grid">
-      <Metric label="Hit ratio" value={percent(summary.cache.hit_ratio)} sub="read tokens over input plus cache" />
-      <Metric label="Cache reads" value={compact(summary.totals.cache_read_tokens)} sub="prompt cache hits" />
-      <Metric label="Cache writes" value={compact(summary.totals.cache_write_tokens)} sub="new cached context" />
+      <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.totals.cache_read_tokens)} of ${compact(observedInputTokens)} input`} />
+      <Metric label="Cache reads" value={compact(summary.totals.cache_read_tokens)} sub="cached input reported by logs" />
+      <Metric label="Reported writes" value={compact(summary.totals.cache_write_tokens)} sub={cacheWriteSub} />
+      <section className="panel note-panel">
+        <div className="panel-header">
+          <h2>Accounting note</h2>
+          <span>observed only</span>
+        </div>
+        <p>
+          Dirtydash only counts cache lifecycle tokens present in local session logs. Codex logs
+          usually expose cached input reads, but not cache creation/write tokens.
+        </p>
+      </section>
       <Breakdown title="Cache behavior" rows={rows} />
     </div>
   );

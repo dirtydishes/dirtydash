@@ -400,6 +400,14 @@ td {
   margin-top: 6px;
 }
 
+.note-panel p {
+  max-width: 62ch;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .command-list {
   display: flex;
   flex-wrap: wrap;

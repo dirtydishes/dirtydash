@@ -67,7 +67,7 @@ AI coding tools leave useful usage traces behind, but those traces are scattered
 - How many tokens did I use?
 - What did that probably cost?
 - Which models and projects are driving usage?
-- How much cache is being read or written?
+- What cache reads or writes do the logs actually report?
 - Which sessions are worth inspecting?
 - Which numbers are trustworthy, stale, unknown, or estimated?
 
