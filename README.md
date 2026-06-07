@@ -6,7 +6,7 @@ The project is intentionally practical and a little blunt: scan the files your t
 
 ## Current State
 
-dirtydash is in an early V1 foundation state. The core workflow exists, but the product is still young and should be treated as a developer preview rather than polished release software.
+dirtydash is in a V1 foundation state. That means the local CLI, SQLite index, import path, bundled dashboard, pricing scaffold, and basic health checks exist, but the product is not a finished V1 release yet. Treat it as a developer preview while the remaining V1 surface is tightened.
 
 Implemented today:
 
@@ -23,12 +23,14 @@ Implemented today:
 - Embedded React/Vite dashboard served by the Rust binary
 - CLI tests for scan, import, doctor, pricing, serve startup, parser behavior, idempotency, and malformed records
 
-Important current limitations:
+Current limitations are tracked directly in the roadmap below. The important ones today:
 
 - Remote support currently discovers files over SSH; it is not yet a full remote import/sync pipeline.
 - Pricing is a bundled snapshot plus local overrides, not a live pricing service.
 - The dashboard is useful but still mostly inspection-oriented; many settings are CLI-backed rather than editable in the UI.
 - Importers are real, but still need more real-world fixtures before they should be considered hardened.
+- Confidence is currently numeric in stored events and UI-adjacent data; the planned exact / partial / inferred / unknown labels still need to be made explicit.
+- Source reindex/ignore commands are planned but not implemented yet.
 - Usage costs are estimates. dirtydash keeps provenance and confidence visible because source formats and pricing assumptions can drift.
 
 ## Why It Exists
@@ -218,66 +220,66 @@ dirtydash is local-first:
 
 The project should continue to prefer visible provenance and honest uncertainty over hidden assumptions.
 
-## Roadmap
+## Project Roadmap
 
-### V1: Local Foundation
+### V1: Local Token Observatory
 
-V1 is slightly adjusted to match the current codebase: the first version is not a giant end-to-end ingestion machine yet. It is a working local foundation with a real CLI, SQLite schema, import pipeline, bundled dashboard, and cautious remote discovery.
+Status: in progress. The repository has the V1 foundation, but V1 should not be called complete until confidence labels, provenance drilldowns, source management, importer hardening, and the core dashboard surface are all tightened.
 
 Already present:
 
-- Local source scanning
-- Metadata-only import
-- SQLite persistence and migrations
-- Cost estimation using bundled pricing and overrides
-- Dashboard server and embedded UI
-- Doctor checks
-- Initial remote configuration and SSH discovery
-- Test coverage for the core happy path
+- Rust CLI and local web dashboard under the `dirtydash` binary
+- SQLite-backed local import and index
+- Importers for Claude Code, Codex, OpenCode, and pi-agent
+- Pricing snapshot with manual overrides and local/free model marking
+- Metadata-only import by default
+- Stored provenance including raw path, raw span, parser name, parser version, pricing version, event hash, and import time
+- Core pages for Overview, The Sink, Sessions, Sources, Cache, Burn Report, Import/Files, Pricing, Privacy, Settings, and Doctor
+- CLI commands for `doctor`, `scan`, `import`, `serve`, `remote`, and `pricing`
+- Embedded React/Vite dashboard served by Rust
 
-Still needed for V1:
+Still needed before V1 is complete:
 
-- Harden importers with real-world fixtures from supported tools
-- Improve Codex model/pricing coverage as model names evolve
-- Turn SSH discovery into a safe remote import workflow
-- Clarify stale, unknown, and unpriced states in the dashboard
-- Add more explicit first-run guidance
-- Make UI empty states and error states more useful
-- Package a repeatable install/release path
+- Replace numeric-only confidence with explicit exact / partial / inferred / unknown confidence labels
+- Add deeper provenance drilldowns from dashboard rows to source files and parser metadata
+- Add source reindex and ignore commands
+- Clarify unknown, stale, unpriced, and partially inferred states in the UI
+- Decide whether redacted previews belong in V1; current import is metadata-only and does not expose conversation previews
+- Harden importer behavior with real-world fixtures and parser diagnostics
+- Polish first-run guidance, empty states, and setup repair
 
-### V2: Trust And Inspection Depth
+### V1.1: Accuracy And Remote Pull
 
-Planned after the foundation is stable:
+Planned next after the V1 local surface is trustworthy:
 
-- Better parser diagnostics and per-file import reports
-- Session drill-downs with richer provenance
-- Time range controls and comparisons
-- More cache analysis, including savings estimates and cache miss patterns
-- Better model alias handling
-- Safer handling for changed upstream log formats
-- Exportable reports for local review
+- SSH pull-based remote machine sync that imports remote usage, not just file counts
+- Machines and Remotes dashboard pages
+- Better model alias mapping and unknown-pricing warnings
+- Expanded cache and reasoning token accounting
+- More importer fixtures and cost regression tests
+- Bundled pricing updates from external model price sources
+- Reconciliation views that explain differences between dirtydash estimates and other tools
 
-### V3: Multi-Machine Workflow
+### V2: Broader Harness Support
+
+Planned once the core parser and pricing model are steady:
+
+- Importers for Gemini CLI, Pi, Hermes, Goose, Amp, Qwen, Kimi, Copilot CLI, and other coding harnesses
+- Support for GUI coding agents where their local usage traces are available
+- Live session tailing
+- Parser diagnostics and richer Import/Files views
+- Advanced Burn Report insights
+- Export/import support for offline or airgapped machines
+
+### Post-V2: Fleet And Collaboration
 
 Longer-term direction:
 
-- Full pull-based remote import across machines
-- Remote source health summaries
-- Machine-level comparisons
-- Deduplication across copied or synced session files
-- Optional scheduled imports
-- Stronger controls for what metadata is stored locally
-
-### V4: Product Polish
-
-Once the data path is trustworthy:
-
-- More complete dashboard interactions
-- Keyboard-first navigation
-- Saved filters and views
-- Better onboarding and setup repair
-- Installer or packaged binary distribution
-- Documentation for common tool setups
+- Optional `dirtydash-agent` for remote hosts
+- Shared dashboards and team/workspace views
+- Role-based access and privacy-aware sharing
+- Alerts, budgets, anomaly detection, and usage recommendations
+- Plugin/importer system for custom harnesses
 
 ## Development Notes
 
