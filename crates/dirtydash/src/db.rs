@@ -73,6 +73,7 @@ pub struct NamedUsagePoint {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub estimated_cost_usd: f64,
     pub standard_tokens: u64,
@@ -828,6 +829,7 @@ impl Database {
                 COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
                 COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(estimated_cost_usd), 0),
                 COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN 0 ELSE total_tokens END), 0),
@@ -848,11 +850,12 @@ impl Database {
                     completion_tokens: row.get::<_, i64>(2)? as u64,
                     cache_read_tokens: row.get::<_, i64>(3)? as u64,
                     cache_write_tokens: row.get::<_, i64>(4)? as u64,
-                    total_tokens: row.get::<_, i64>(5)? as u64,
-                    estimated_cost_usd: row.get(6)?,
-                    standard_tokens: row.get::<_, i64>(7)? as u64,
-                    priority_tokens: row.get::<_, i64>(8)? as u64,
-                    priority_estimated_cost_usd: row.get(9)?,
+                    reasoning_tokens: row.get::<_, i64>(5)? as u64,
+                    total_tokens: row.get::<_, i64>(6)? as u64,
+                    estimated_cost_usd: row.get(7)?,
+                    standard_tokens: row.get::<_, i64>(8)? as u64,
+                    priority_tokens: row.get::<_, i64>(9)? as u64,
+                    priority_estimated_cost_usd: row.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -869,6 +872,7 @@ impl Database {
                 COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
                 COALESCE(SUM(total_tokens), 0),
                 COALESCE(SUM(estimated_cost_usd), 0),
                 COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN 0 ELSE total_tokens END), 0),
@@ -886,11 +890,12 @@ impl Database {
                     completion_tokens: row.get::<_, i64>(3)? as u64,
                     cache_read_tokens: row.get::<_, i64>(4)? as u64,
                     cache_write_tokens: row.get::<_, i64>(5)? as u64,
-                    total_tokens: row.get::<_, i64>(6)? as u64,
-                    estimated_cost_usd: row.get(7)?,
-                    standard_tokens: row.get::<_, i64>(8)? as u64,
-                    priority_tokens: row.get::<_, i64>(9)? as u64,
-                    priority_estimated_cost_usd: row.get(10)?,
+                    reasoning_tokens: row.get::<_, i64>(6)? as u64,
+                    total_tokens: row.get::<_, i64>(7)? as u64,
+                    estimated_cost_usd: row.get(8)?,
+                    standard_tokens: row.get::<_, i64>(9)? as u64,
+                    priority_tokens: row.get::<_, i64>(10)? as u64,
+                    priority_estimated_cost_usd: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -902,6 +907,7 @@ impl Database {
                 existing.completion_tokens += row.completion_tokens;
                 existing.cache_read_tokens += row.cache_read_tokens;
                 existing.cache_write_tokens += row.cache_write_tokens;
+                existing.reasoning_tokens += row.reasoning_tokens;
                 existing.total_tokens += row.total_tokens;
                 existing.estimated_cost_usd += row.estimated_cost_usd;
                 existing.standard_tokens += row.standard_tokens;

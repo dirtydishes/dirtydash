@@ -40,6 +40,7 @@ type NamedUsagePoint = {
   completion_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  reasoning_tokens: number;
   total_tokens: number;
   estimated_cost_usd: number;
   standard_tokens: number;
@@ -320,10 +321,15 @@ function Overview({
   sessions: SessionSummary[];
   sources: SourceSummary[];
 }) {
+  const observedInput =
+    summary.totals.prompt_tokens +
+    summary.totals.cache_read_tokens +
+    summary.totals.cache_write_tokens;
+  const generatedTokens = summary.totals.completion_tokens + summary.totals.reasoning_tokens;
   return (
     <div className="page-grid">
       <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, manual, local CodexBar pricing" />
-      <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub="prompt, output, cache, reasoning" />
+      <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub={`${compact(observedInput)} input incl. cache, ${compact(generatedTokens)} generated`} />
       <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.cache.cache_read_tokens)} observed reads`} />
       <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
       <TrendPanel title="Usage by source" rows={summary.by_source} />
@@ -366,6 +372,7 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       completion_tokens: 0,
       cache_read_tokens: 0,
       cache_write_tokens: 0,
+      reasoning_tokens: 0,
       total_tokens: summary.totals.prompt_tokens,
       estimated_cost_usd: 0,
       standard_tokens: summary.totals.prompt_tokens,
@@ -378,6 +385,7 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       completion_tokens: 0,
       cache_read_tokens: summary.totals.cache_read_tokens,
       cache_write_tokens: 0,
+      reasoning_tokens: 0,
       total_tokens: summary.totals.cache_read_tokens,
       estimated_cost_usd: 0,
       standard_tokens: summary.totals.cache_read_tokens,
@@ -390,6 +398,7 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       completion_tokens: 0,
       cache_read_tokens: 0,
       cache_write_tokens: summary.totals.cache_write_tokens,
+      reasoning_tokens: 0,
       total_tokens: summary.totals.cache_write_tokens,
       estimated_cost_usd: 0,
       standard_tokens: summary.totals.cache_write_tokens,
@@ -661,9 +670,17 @@ function UsageBar({
 }
 
 function TokenSummary({ row }: { row: NamedUsagePoint }) {
+  const inputWithCache = row.prompt_tokens + row.cache_read_tokens + row.cache_write_tokens;
+  const generated = row.completion_tokens + row.reasoning_tokens;
   return (
     <small className="token-summary">
       <span>{compact(row.total_tokens)} tokens</span>
+      <span title={`${compact(inputWithCache)} input tokens including cached reads`}>
+        {compact(inputWithCache)} input
+      </span>
+      <span title={`${compact(generated)} output tokens`}>
+        {compact(generated)} output
+      </span>
       {row.priority_tokens > 0 ? (
         <span className="fast-label" title={`${compact(row.priority_tokens)} priority/fast tokens`}>
           {compact(row.priority_tokens)} fast

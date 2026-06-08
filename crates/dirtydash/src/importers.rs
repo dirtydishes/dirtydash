@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,7 +96,12 @@ struct ParsedFile {
 
 #[derive(Debug, Clone, Default)]
 struct CodexPriorityEvidence {
-    turn_ids: HashSet<String>,
+    turns: HashMap<String, CodexPriorityTurnEvidence>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexPriorityTurnEvidence {
+    model: Option<String>,
 }
 
 impl CodexPriorityEvidence {
@@ -105,15 +110,19 @@ impl CodexPriorityEvidence {
             if !candidate.exists() {
                 continue;
             }
-            if let Ok(turn_ids) = load_priority_turn_ids_from_trace_db(&candidate) {
-                return CodexPriorityEvidence { turn_ids };
+            if let Ok(turns) = load_priority_turns_from_trace_db(&candidate) {
+                return CodexPriorityEvidence { turns };
             }
         }
         CodexPriorityEvidence::default()
     }
 
     fn is_priority(&self, turn_id: &str) -> bool {
-        self.turn_ids.contains(turn_id)
+        self.turns.contains_key(turn_id)
+    }
+
+    fn pricing_model(&self, turn_id: &str) -> Option<&str> {
+        self.turns.get(turn_id)?.model.as_deref()
     }
 }
 
@@ -124,7 +133,7 @@ fn codex_trace_db_candidates(codex_source_path: &Path) -> Vec<PathBuf> {
             candidates.push(path.join("logs_2.sqlite"));
         }
     }
-    if codex_source_path.ends_with("sessions") {
+    if codex_source_path.ends_with("sessions") || codex_source_path.ends_with("archived_sessions") {
         if let Some(parent) = codex_source_path.parent() {
             candidates.push(parent.join("logs_2.sqlite"));
         }
@@ -140,7 +149,9 @@ fn codex_trace_db_candidates(codex_source_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn load_priority_turn_ids_from_trace_db(path: &Path) -> Result<HashSet<String>> {
+fn load_priority_turns_from_trace_db(
+    path: &Path,
+) -> Result<HashMap<String, CodexPriorityTurnEvidence>> {
     let conn = Connection::open(path)
         .with_context(|| format!("opening Codex trace DB {}", path.display()))?;
     let mut stmt = conn.prepare(
@@ -148,21 +159,33 @@ fn load_priority_turn_ids_from_trace_db(path: &Path) -> Result<HashSet<String>> 
         SELECT feedback_log_body
         FROM logs
         WHERE feedback_log_body LIKE '%websocket request:%'
-            AND feedback_log_body LIKE '%service_tier%'
+            OR feedback_log_body LIKE '%response.completed%'
         "#,
     )?;
     let rows = stmt
         .query_map([], |row| row.get::<_, Option<String>>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    Ok(rows
-        .into_iter()
-        .flatten()
-        .filter_map(|body| priority_turn_id_from_feedback_body(&body))
-        .collect())
+    let mut turns = HashMap::<String, CodexPriorityTurnEvidence>::new();
+    let mut completed_models = HashMap::<String, String>::new();
+    for body in rows.into_iter().flatten() {
+        if let Some((turn_id, model)) = priority_turn_from_feedback_body(&body) {
+            turns.insert(turn_id, CodexPriorityTurnEvidence { model });
+            continue;
+        }
+        if let Some((turn_id, model)) = completed_model_from_feedback_body(&body) {
+            completed_models.insert(turn_id, model);
+        }
+    }
+    for (turn_id, model) in completed_models {
+        if let Some(turn) = turns.get_mut(&turn_id) {
+            turn.model = Some(model);
+        }
+    }
+    Ok(turns)
 }
 
-fn priority_turn_id_from_feedback_body(body: &str) -> Option<String> {
+fn priority_turn_from_feedback_body(body: &str) -> Option<(String, Option<String>)> {
     let marker = "websocket request:";
     let request_json = body.get(body.find(marker)? + marker.len()..)?.trim_start();
     let mut stream = serde_json::Deserializer::from_str(request_json).into_iter::<Value>();
@@ -172,7 +195,34 @@ fn priority_turn_id_from_feedback_body(body: &str) -> Option<String> {
         return None;
     }
 
-    turn_id_from_codex_request(&request).or_else(|| span_value(body, "turn.id="))
+    let turn_id = turn_id_from_codex_request(&request)
+        .or_else(|| span_value(body, "turn.id="))
+        .or_else(|| span_value(body, "turn_id="))?;
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned);
+    Some((turn_id, model))
+}
+
+fn completed_model_from_feedback_body(body: &str) -> Option<(String, String)> {
+    let marker = "websocket event:";
+    let event_json = body.get(body.find(marker)? + marker.len()..)?.trim_start();
+    let mut stream = serde_json::Deserializer::from_str(event_json).into_iter::<Value>();
+    let event = stream.next()?.ok()?;
+    if event.get("type").and_then(Value::as_str)? != "response.completed" {
+        return None;
+    }
+    let model = event
+        .pointer("/response/model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())?
+        .to_string();
+    let turn_id = span_value(body, "turn.id=").or_else(|| span_value(body, "turn_id="))?;
+    Some((turn_id, model))
 }
 
 fn turn_id_from_codex_request(request: &Value) -> Option<String> {
@@ -192,7 +242,7 @@ fn span_value(body: &str, key: &str) -> Option<String> {
     let rest = body.get(start..)?;
     let value: String = rest
         .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .take_while(|ch| !ch.is_whitespace() && *ch != ',' && *ch != ']' && *ch != ')')
         .collect();
     if value.is_empty() {
         None
@@ -288,7 +338,7 @@ pub fn scan_sources(config: &Config) -> Result<Vec<DetectedSource>> {
     let mut candidates = default_candidates()?;
     for root in &config.source_roots {
         let kind: SourceKind = root.kind.parse()?;
-        candidates.push((kind, normalize_source_path(kind, root.path.clone())));
+        candidates.extend(normalize_source_paths(kind, root.path.clone()));
     }
 
     let mut seen = HashSet::new();
@@ -417,10 +467,7 @@ fn default_candidates() -> Result<Vec<(SourceKind, PathBuf)>> {
 
     let codex_roots = env_paths("CODEX_HOME").unwrap_or_else(|| vec![home.join(".codex")]);
     for root in codex_roots {
-        candidates.push((
-            SourceKind::Codex,
-            normalize_source_path(SourceKind::Codex, root),
-        ));
+        candidates.extend(normalize_source_paths(SourceKind::Codex, root));
     }
 
     let opencode_roots =
@@ -490,6 +537,38 @@ fn normalize_source_path(kind: SourceKind, path: PathBuf) -> PathBuf {
         }
         SourceKind::PiAgent => path,
     }
+}
+
+fn normalize_source_paths(kind: SourceKind, path: PathBuf) -> Vec<(SourceKind, PathBuf)> {
+    if kind != SourceKind::Codex {
+        return vec![(kind, normalize_source_path(kind, path))];
+    }
+
+    let mut paths = Vec::new();
+    if path.ends_with("sessions") {
+        paths.push(path.clone());
+        if let Some(parent) = path.parent() {
+            let archived = parent.join("archived_sessions");
+            if archived.exists() {
+                paths.push(archived);
+            }
+        }
+    } else if path.ends_with("archived_sessions") {
+        paths.push(path);
+    } else if path.join("sessions").exists() {
+        paths.push(path.join("sessions"));
+        let archived = path.join("archived_sessions");
+        if archived.exists() {
+            paths.push(archived);
+        }
+    } else {
+        paths.push(path);
+    }
+
+    paths
+        .into_iter()
+        .map(|path| (SourceKind::Codex, path))
+        .collect()
 }
 
 fn matching_files(kind: SourceKind, path: &Path) -> Result<Vec<PathBuf>> {
@@ -806,13 +885,23 @@ fn event_from_usage(
     } else {
         None
     };
+    let pricing_model = if requested_pricing_mode == Some(PricingMode::Priority) {
+        turn_id
+            .as_deref()
+            .and_then(|turn_id| {
+                priority_evidence.and_then(|evidence| evidence.pricing_model(turn_id))
+            })
+            .unwrap_or(model.as_str())
+    } else {
+        model.as_str()
+    };
     let cost = if reported_cost.is_some() {
         None
     } else {
         Some(pricing::estimate_cost(
             db,
             &provider,
-            &model,
+            pricing_model,
             &usage,
             requested_pricing_mode,
         )?)
@@ -1328,6 +1417,36 @@ mod tests {
     }
 
     #[test]
+    fn codex_scan_includes_archived_sessions_next_to_sessions() {
+        let dir = tempdir().unwrap();
+        let codex_home = dir.path().join("codex");
+        let sessions = codex_home.join("sessions/2026/06/07");
+        let archived = codex_home.join("archived_sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        fs::write(sessions.join("live.jsonl"), "{}\n").unwrap();
+        fs::write(archived.join("rollout-2026-06-07T12-00-00.jsonl"), "{}\n").unwrap();
+
+        let mut config = Config::default();
+        config.source_roots.push(crate::config::SourceRoot {
+            kind: "codex".to_string(),
+            path: codex_home,
+        });
+
+        let sources = scan_sources(&config).unwrap();
+        let codex_paths = sources
+            .into_iter()
+            .filter(|source| source.kind == SourceKind::Codex)
+            .map(|source| source.path)
+            .collect::<Vec<_>>();
+
+        assert!(codex_paths.iter().any(|path| path.ends_with("sessions")));
+        assert!(codex_paths
+            .iter()
+            .any(|path| path.ends_with("archived_sessions")));
+    }
+
+    #[test]
     fn codex_reasoning_effort_does_not_create_fast_model_slugs_without_trace_evidence() {
         let dir = tempdir().unwrap();
         let source_root = dir.path().join("codex/sessions");
@@ -1419,6 +1538,7 @@ mod tests {
         let metadata = serde_json::json!({"turn_id": "turn-priority"}).to_string();
         let request = serde_json::json!({
             "type": "response.create",
+            "model": "codex-auto-review",
             "service_tier": "priority",
             "client_metadata": {
                 "x-codex-turn-metadata": metadata
@@ -1429,6 +1549,21 @@ mod tests {
             .execute(
                 "INSERT INTO logs (feedback_log_body) VALUES (?1)",
                 rusqlite::params![format!("span:websocket request: {request}")],
+            )
+            .unwrap();
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "model": "gpt-5.4"
+            }
+        })
+        .to_string();
+        trace
+            .execute(
+                "INSERT INTO logs (feedback_log_body) VALUES (?1)",
+                rusqlite::params![format!(
+                    "span turn.id=turn-priority websocket event: {completed}"
+                )],
             )
             .unwrap();
         drop(trace);
@@ -1465,7 +1600,7 @@ mod tests {
         assert_eq!(row.0, "gpt-5.5");
         assert_eq!(row.1.as_deref(), Some("turn-priority"));
         assert_eq!(row.2, "priority");
-        assert!((row.3 - 0.015125).abs() < 0.000001);
+        assert!((row.3 - 0.00605).abs() < 0.000001);
     }
 
     #[test]

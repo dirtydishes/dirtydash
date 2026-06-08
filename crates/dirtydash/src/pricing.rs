@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use crate::db::Database;
 use crate::importers::UsageNumbers;
 
-pub const BUNDLED_PRICING_VERSION: &str = "2026-06-08-codexbar";
+pub const BUNDLED_PRICING_VERSION: &str = "2026-06-08-codexbar-priority";
 pub const CODEX_LONG_CONTEXT_THRESHOLD_TOKENS: u64 = 272_000;
-const CODEX_PRIORITY_TOTAL_MULTIPLIER: f64 = 2.5;
+pub const CODEX_PRIORITY_INPUT_TOKEN_LIMIT: u64 = 272_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingRecord {
@@ -241,24 +241,30 @@ struct RateSet {
 }
 
 fn codexbar_cost(record: &PricingRecord, usage: &UsageNumbers, mode: PricingMode) -> f64 {
-    let use_long_rates = matches!(mode, PricingMode::LongContext | PricingMode::Priority)
-        && codex_uses_long_context_rates(&record.provider, &record.model, record, usage);
+    if mode == PricingMode::Priority {
+        if let Some(rates) = codexbar_priority_rates(&record.model)
+            .filter(|_| codex_total_input_tokens(usage) <= CODEX_PRIORITY_INPUT_TOKEN_LIMIT)
+        {
+            return codex_cost_with_rates(usage, rates);
+        }
+    }
+
+    let use_long_rates =
+        codex_uses_long_context_rates(&record.provider, &record.model, record, usage);
     let rates = if use_long_rates {
         codexbar_long_rates(&record.model).unwrap_or_else(|| standard_rates(record))
     } else {
         standard_rates(record)
     };
+    codex_cost_with_rates(usage, rates)
+}
+
+fn codex_cost_with_rates(usage: &UsageNumbers, rates: RateSet) -> f64 {
     let output_tokens = usage.completion_tokens + usage.reasoning_tokens;
-    let base = per_million(usage.prompt_tokens, rates.input)
+    per_million(usage.prompt_tokens, rates.input)
         + per_million(output_tokens, rates.output)
         + per_million(usage.cache_read_tokens, rates.cache_read)
-        + per_million(usage.cache_write_tokens, rates.cache_write);
-
-    if mode == PricingMode::Priority {
-        base * CODEX_PRIORITY_TOTAL_MULTIPLIER
-    } else {
-        base
-    }
+        + per_million(usage.cache_write_tokens, rates.cache_write)
 }
 
 fn standard_rates(record: &PricingRecord) -> RateSet {
@@ -282,6 +288,30 @@ fn codexbar_long_rates(model: &str) -> Option<RateSet> {
             input: 5.0,
             output: 22.5,
             cache_read: 0.5,
+            cache_write: 0.0,
+        }),
+        _ => None,
+    }
+}
+
+fn codexbar_priority_rates(model: &str) -> Option<RateSet> {
+    match model {
+        "gpt-5.5" => Some(RateSet {
+            input: 12.50,
+            output: 75.0,
+            cache_read: 1.25,
+            cache_write: 0.0,
+        }),
+        "gpt-5.4" => Some(RateSet {
+            input: 5.0,
+            output: 30.0,
+            cache_read: 0.5,
+            cache_write: 0.0,
+        }),
+        "gpt-5.4-mini" => Some(RateSet {
+            input: 1.50,
+            output: 9.0,
+            cache_read: 0.15,
             cache_write: 0.0,
         }),
         _ => None,
@@ -595,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_priority_uses_priority_multiplier_only_when_requested() {
+    fn codex_priority_uses_codexbar_priority_rates_only_when_requested() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
         db.migrate().unwrap();
@@ -622,6 +652,63 @@ mod tests {
         assert_eq!(priority.pricing_mode, PricingMode::Priority);
         assert!((standard.estimated_cost_usd - 0.8).abs() < 0.0001);
         assert!((priority.estimated_cost_usd - 2.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn codex_priority_rates_are_not_a_blanket_multiplier() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+
+        let usage = UsageNumbers {
+            prompt_tokens: 100_000,
+            completion_tokens: 10_000,
+            cache_read_tokens: 10_000,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let standard = estimate_cost(&db, "openai-codex", "gpt-5.4", &usage, None).unwrap();
+        let priority = estimate_cost(
+            &db,
+            "openai-codex",
+            "gpt-5.4",
+            &usage,
+            Some(PricingMode::Priority),
+        )
+        .unwrap();
+
+        assert_eq!(standard.pricing_mode, PricingMode::Standard);
+        assert_eq!(priority.pricing_mode, PricingMode::Priority);
+        assert!((standard.estimated_cost_usd - 0.4025).abs() < 0.0001);
+        assert!((priority.estimated_cost_usd - 0.805).abs() < 0.0001);
+    }
+
+    #[test]
+    fn codex_priority_over_input_cap_falls_back_to_long_context_base_rates() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+
+        let usage = UsageNumbers {
+            prompt_tokens: 300_000,
+            completion_tokens: 20_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+        };
+        let estimate = estimate_cost(
+            &db,
+            "openai-codex",
+            "gpt-5.5",
+            &usage,
+            Some(PricingMode::Priority),
+        )
+        .unwrap();
+
+        assert_eq!(estimate.pricing_mode, PricingMode::Priority);
+        assert!((estimate.estimated_cost_usd - 3.9).abs() < 0.0001);
     }
 
     #[test]
