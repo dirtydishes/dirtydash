@@ -75,6 +75,7 @@ pub fn seed_bundled_pricing(db: &Database) -> Result<()> {
         db.upsert_pricing_record(&record, false)?;
     }
     reclassify_legacy_codex_usage(db)?;
+    crate::importers::reclassify_codex_priority_events_from_trace_db(db)?;
     db.delete_non_overridden_pricing_records(&[
         ("openai", "gpt-5.5-fast"),
         ("openai", "gpt-5.5-long"),
@@ -354,7 +355,9 @@ fn reclassify_legacy_codex_usage(db: &Database) -> Result<()> {
             .strip_suffix("-fast")
             .or_else(|| legacy_model.strip_suffix("-long"))
             .unwrap_or(&legacy_model);
-        let requested_mode = if legacy_model.ends_with("-long") {
+        let requested_mode = if legacy_model.ends_with("-fast") {
+            Some(PricingMode::Priority)
+        } else if legacy_model.ends_with("-long") {
             Some(PricingMode::LongContext)
         } else {
             None
@@ -541,6 +544,8 @@ fn rec(
 mod tests {
     use tempfile::tempdir;
 
+    use crate::importers::{SourceKind, UsageEvent};
+
     use super::*;
 
     #[test]
@@ -652,6 +657,62 @@ mod tests {
         assert_eq!(priority.pricing_mode, PricingMode::Priority);
         assert!((standard.estimated_cost_usd - 0.8).abs() < 0.0001);
         assert!((priority.estimated_cost_usd - 2.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn legacy_fast_model_rows_reclassify_as_priority_usage() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("pricing.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        db.upsert_usage_event(&UsageEvent {
+            machine: "test-machine".to_string(),
+            source: SourceKind::Codex,
+            project_path: "/repo".to_string(),
+            session_id: "legacy-fast".to_string(),
+            turn_id: Some("turn-legacy-fast".to_string()),
+            provider: "openai-codex".to_string(),
+            model: "gpt-5.5-fast".to_string(),
+            prompt_tokens: 100_000,
+            completion_tokens: 10_000,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 110_000,
+            estimated_cost_usd: 0.0,
+            confidence: 0.92,
+            event_timestamp: None,
+            raw_path: "/tmp/session.jsonl".to_string(),
+            raw_span: None,
+            parser_name: "test-parser".to_string(),
+            parser_version: "test".to_string(),
+            raw_event_hash: "legacy-fast-hash".to_string(),
+            imported_at: Utc::now().to_rfc3339(),
+            pricing_version: "2026-06-07-legacy-codexbar".to_string(),
+            pricing_mode: PricingMode::Standard,
+            metadata_only: true,
+        })
+        .unwrap();
+
+        seed_bundled_pricing(&db).unwrap();
+
+        let row = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT model, pricing_mode, estimated_cost_usd FROM usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "gpt-5.5");
+        assert_eq!(row.1, "priority");
+        assert!((row.2 - 2.0).abs() < 0.0001);
     }
 
     #[test]

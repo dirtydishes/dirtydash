@@ -102,6 +102,8 @@ type PricingRecord = {
   local_free_flag: boolean;
 };
 
+type UsageBarMetric = "tokens" | "cost";
+
 type DoctorReport = {
   event_count: number;
   pricing_count: number;
@@ -332,6 +334,7 @@ function Overview({
       <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub={`${compact(observedInput)} input incl. cache, ${compact(generatedTokens)} generated`} />
       <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.cache.cache_read_tokens)} observed reads`} />
       <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
+      <TrendPanel title="Token usage over time" rows={summary.daily} />
       <TrendPanel title="Usage by source" rows={summary.by_source} />
       <TrendPanel title="Usage by model" rows={summary.by_model} />
       <SessionsTable title="Top expensive sessions" sessions={sessions.slice(0, 8)} />
@@ -434,6 +437,7 @@ function BurnReport({ summary }: { summary: DashboardSummary }) {
       <Metric label="Biggest session" value={summary.expensive_sessions[0] ? money(summary.expensive_sessions[0].estimated_cost_usd) : "$0.00"} sub={summary.expensive_sessions[0]?.session_id ?? "no sessions yet"} />
       <Metric label="Biggest model" value={summary.by_model[0]?.name ?? "unknown"} sub={summary.by_model[0] ? money(summary.by_model[0].estimated_cost_usd) : "no spend"} />
       <Metric label="Unpriced tokens" value={compact(unpricedTokens)} sub={`${unpriced.length} model rows need pricing`} />
+      <TrendPanel title="Model spend" rows={summary.by_model} metric="cost" />
       <SessionsTable title="Sessions to inspect first" sessions={summary.expensive_sessions} />
     </div>
   );
@@ -492,6 +496,7 @@ function PricingPage({
     [usageRows]
   );
   const maxUsage = Math.max(1, ...usageRows.map((row) => row.total_tokens));
+  const maxCost = Math.max(0.01, ...usageRows.map((row) => row.estimated_cost_usd));
   return (
     <section className="panel wide">
       <div className="panel-header">
@@ -523,7 +528,9 @@ function PricingPage({
                     {usage ? (
                       <div className="pricing-usage">
                         <UsageBar row={usage} max={maxUsage} compactMode />
-                        <TokenSummary row={usage} />
+                        <UsageSummary row={usage} />
+                        <UsageBar row={usage} max={maxCost} metric="cost" compactMode />
+                        <UsageSummary row={usage} metric="cost" />
                       </div>
                     ) : (
                       <span className="raw-path">not imported</span>
@@ -613,13 +620,24 @@ function Breakdown({ title, rows }: { title: string; rows: NamedUsagePoint[] }) 
   return <TrendPanel title={title} rows={rows} className="wide" />;
 }
 
-function TrendPanel({ title, rows, className = "" }: { title: string; rows: NamedUsagePoint[]; className?: string }) {
-  const max = Math.max(1, ...rows.map((row) => row.total_tokens));
+function TrendPanel({
+  title,
+  rows,
+  className = "",
+  metric = "tokens"
+}: {
+  title: string;
+  rows: NamedUsagePoint[];
+  className?: string;
+  metric?: UsageBarMetric;
+}) {
+  const max = Math.max(metric === "cost" ? 0.01 : 1, ...rows.map((row) => barValue(row, metric)));
+  const hasPriority = rows.some((row) => priorityBarValue(row, metric) > 0);
   return (
     <section className={`panel ${className}`}>
       <div className="panel-header">
         <h2>{title}</h2>
-        <span>{rows.length} rows</span>
+        <span>{hasPriority ? `${rows.length} rows, yellow is fast/priority` : `${rows.length} rows`}</span>
       </div>
       <div className="bar-list">
         {rows.length === 0 ? <Empty text="No imported usage yet." /> : null}
@@ -629,8 +647,8 @@ function TrendPanel({ title, rows, className = "" }: { title: string; rows: Name
               <span>{row.name || "unknown"}</span>
               <small>{money(row.estimated_cost_usd)}</small>
             </div>
-            <UsageBar row={row} max={max} />
-            <TokenSummary row={row} />
+            <UsageBar row={row} max={max} metric={metric} />
+            <UsageSummary row={row} metric={metric} />
           </div>
         ))}
       </div>
@@ -641,25 +659,37 @@ function TrendPanel({ title, rows, className = "" }: { title: string; rows: Name
 function UsageBar({
   row,
   max,
+  metric = "tokens",
   compactMode = false
 }: {
   row: NamedUsagePoint;
   max: number;
+  metric?: UsageBarMetric;
   compactMode?: boolean;
 }) {
-  const fill = row.total_tokens > 0 ? Math.max(compactMode ? 3 : 4, (row.total_tokens / max) * 100) : 0;
-  const priorityWidth =
-    row.total_tokens > 0 ? Math.min(fill, fill * (row.priority_tokens / row.total_tokens)) : 0;
+  const value = barValue(row, metric);
+  const priorityValue = priorityBarValue(row, metric);
+  const fill = value > 0 ? Math.max(compactMode ? 3 : 4, (value / max) * 100) : 0;
+  const priorityWidth = value > 0 ? Math.min(fill, fill * (priorityValue / value)) : 0;
   const priorityLeft = Math.max(0, fill - priorityWidth);
+  const totalLabel = metric === "cost" ? money(value) : `${compact(value)} tokens`;
+  const priorityLabel =
+    metric === "cost" ? money(priorityValue) : `${compact(priorityValue)} priority/fast tokens`;
   const label =
-    row.priority_tokens > 0
-      ? `${row.name || "unknown"}: ${compact(row.total_tokens)} tokens, ${compact(row.priority_tokens)} priority/fast tokens`
-      : `${row.name || "unknown"}: ${compact(row.total_tokens)} tokens`;
+    priorityValue > 0
+      ? `${row.name || "unknown"}: ${totalLabel}, ${priorityLabel}`
+      : `${row.name || "unknown"}: ${totalLabel}`;
 
   return (
-    <div className={compactMode ? "bar-track compact" : "bar-track"} role="img" aria-label={label} title={label}>
+    <div
+      className={compactMode ? "bar-track compact" : "bar-track"}
+      data-metric={metric}
+      role="img"
+      aria-label={label}
+      title={label}
+    >
       <span className="bar-fill" style={{ width: `${fill}%` }} />
-      {row.priority_tokens > 0 ? (
+      {priorityValue > 0 ? (
         <span
           className="bar-priority"
           style={{ left: `${priorityLeft}%`, width: `${priorityWidth}%` }}
@@ -669,9 +699,21 @@ function UsageBar({
   );
 }
 
-function TokenSummary({ row }: { row: NamedUsagePoint }) {
+function UsageSummary({ row, metric = "tokens" }: { row: NamedUsagePoint; metric?: UsageBarMetric }) {
   const inputWithCache = row.prompt_tokens + row.cache_read_tokens + row.cache_write_tokens;
   const generated = row.completion_tokens + row.reasoning_tokens;
+  if (metric === "cost") {
+    return (
+      <small className="token-summary">
+        <span>{money(row.estimated_cost_usd)} total</span>
+        {row.priority_estimated_cost_usd > 0 ? (
+          <span className="fast-label" title={`${money(row.priority_estimated_cost_usd)} priority/fast spend`}>
+            {money(row.priority_estimated_cost_usd)} fast
+          </span>
+        ) : null}
+      </small>
+    );
+  }
   return (
     <small className="token-summary">
       <span>{compact(row.total_tokens)} tokens</span>
@@ -688,6 +730,14 @@ function TokenSummary({ row }: { row: NamedUsagePoint }) {
       ) : null}
     </small>
   );
+}
+
+function barValue(row: NamedUsagePoint, metric: UsageBarMetric) {
+  return metric === "cost" ? row.estimated_cost_usd : row.total_tokens;
+}
+
+function priorityBarValue(row: NamedUsagePoint, metric: UsageBarMetric) {
+  return metric === "cost" ? row.priority_estimated_cost_usd : row.priority_tokens;
 }
 
 function SessionsTable({ title, sessions }: { title: string; sessions: SessionSummary[] }) {
