@@ -407,6 +407,16 @@ function BurnReport({ summary }: { summary: DashboardSummary }) {
       <Metric label="Biggest session" value={summary.expensive_sessions[0] ? money(summary.expensive_sessions[0].estimated_cost_usd) : "$0.00"} sub={summary.expensive_sessions[0]?.session_id ?? "no sessions yet"} />
       <Metric label="Biggest model" value={summary.by_model[0]?.name ?? "unknown"} sub={summary.by_model[0] ? money(summary.by_model[0].estimated_cost_usd) : "no spend"} />
       <Metric label="Unpriced tokens" value={compact(unpricedTokens)} sub={`${unpriced.length} model rows need pricing`} />
+      <Metric label="Codex limit drain" value="not measured" sub="fast mode is not inferred from cache reads" />
+      <AccountingNote
+        title="Codex subscription accounting"
+        badge="separate ledger"
+      >
+        Dirtydash estimates tokenized API-style cost from imported logs. Codex subscription
+        limits can drain from a different fast-mode ledger, especially when xhigh sessions
+        produce uncached input, output, and reasoning tokens. A low cache-read dollar estimate
+        should not be read as total fast-mode consumption.
+      </AccountingNote>
       <SessionsTable title="Sessions to inspect first" sessions={summary.expensive_sessions} />
     </div>
   );
@@ -493,6 +503,10 @@ function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
           </tbody>
         </table>
       </div>
+      <p className="table-note">
+        Rates are per 1M tokens for cost estimation. Cache-read pricing is not the same thing as
+        Codex fast-mode subscription usage.
+      </p>
     </section>
   );
 }
@@ -635,6 +649,26 @@ function Metric({ label, value, sub }: { label: string; value: string; sub: stri
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{sub}</small>
+    </section>
+  );
+}
+
+function AccountingNote({
+  title,
+  badge,
+  children
+}: {
+  title: string;
+  badge: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="panel note-panel wide">
+      <div className="panel-header">
+        <h2>{title}</h2>
+        <span>{badge}</span>
+      </div>
+      <p>{children}</p>
     </section>
   );
 }

@@ -408,6 +408,14 @@ td {
   line-height: 1.5;
 }
 
+.table-note {
+  max-width: 74ch;
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .command-list {
   display: flex;
   flex-wrap: wrap;
