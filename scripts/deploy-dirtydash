@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE="${DIRTYDASH_DEPLOY_REMOTE:-di}"
+APP_DIR="${DIRTYDASH_DEPLOY_APP_DIR:-/home/delta/apps/dirtydash/app}"
+DATA_DIR="${DIRTYDASH_DEPLOY_DATA_DIR:-/home/delta/apps/dirtydash/data}"
+CONTAINER_NAME="${DIRTYDASH_DEPLOY_CONTAINER:-dirtydash}"
+DOCKER_NETWORK="${DIRTYDASH_DEPLOY_NETWORK:-npm-shared}"
+BASE_IMAGE="${DIRTYDASH_DEPLOY_IMAGE:-debian:trixie-slim}"
+PORT="${DIRTYDASH_DEPLOY_PORT:-4599}"
+BRANCH="${DIRTYDASH_DEPLOY_BRANCH:-main}"
+SKIP_PULL=0
+LOCAL_MODE=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/deploy-dirtydash [options]
+  scripts/deploy-dirtydash --local [options]
+
+Deploy dirtydash to the existing di/NPM Docker setup.
+
+Options:
+  --remote HOST       SSH target for remote deploy mode. Default: di
+  --app-dir PATH      Server checkout path. Default: /home/delta/apps/dirtydash/app
+  --data-dir PATH     Server data path. Default: /home/delta/apps/dirtydash/data
+  --branch NAME       Branch to deploy when pulling on server. Default: main
+  --skip-pull         Do not run git fetch/checkout/pull before building
+  --local             Run deploy steps in the current/server shell instead of SSH
+  -h, --help          Show this help
+
+Environment overrides:
+  DIRTYDASH_DEPLOY_REMOTE
+  DIRTYDASH_DEPLOY_APP_DIR
+  DIRTYDASH_DEPLOY_DATA_DIR
+  DIRTYDASH_DEPLOY_CONTAINER
+  DIRTYDASH_DEPLOY_NETWORK
+  DIRTYDASH_DEPLOY_IMAGE
+  DIRTYDASH_DEPLOY_PORT
+  DIRTYDASH_DEPLOY_BRANCH
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --remote)
+      REMOTE="${2:?missing value for --remote}"
+      shift 2
+      ;;
+    --app-dir)
+      APP_DIR="${2:?missing value for --app-dir}"
+      shift 2
+      ;;
+    --data-dir)
+      DATA_DIR="${2:?missing value for --data-dir}"
+      shift 2
+      ;;
+    --branch)
+      BRANCH="${2:?missing value for --branch}"
+      shift 2
+      ;;
+    --skip-pull)
+      SKIP_PULL=1
+      shift
+      ;;
+    --local)
+      LOCAL_MODE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+run_remote() {
+  ssh -o BatchMode=yes "$REMOTE" \
+    DIRTYDASH_DEPLOY_APP_DIR="$APP_DIR" \
+    DIRTYDASH_DEPLOY_DATA_DIR="$DATA_DIR" \
+    DIRTYDASH_DEPLOY_CONTAINER="$CONTAINER_NAME" \
+    DIRTYDASH_DEPLOY_NETWORK="$DOCKER_NETWORK" \
+    DIRTYDASH_DEPLOY_IMAGE="$BASE_IMAGE" \
+    DIRTYDASH_DEPLOY_PORT="$PORT" \
+    DIRTYDASH_DEPLOY_BRANCH="$BRANCH" \
+    DIRTYDASH_DEPLOY_SKIP_PULL="$SKIP_PULL" \
+    'bash -s' <<'REMOTE_SCRIPT'
+set -euo pipefail
+
+APP_DIR="${DIRTYDASH_DEPLOY_APP_DIR}"
+DATA_DIR="${DIRTYDASH_DEPLOY_DATA_DIR}"
+CONTAINER_NAME="${DIRTYDASH_DEPLOY_CONTAINER}"
+DOCKER_NETWORK="${DIRTYDASH_DEPLOY_NETWORK}"
+BASE_IMAGE="${DIRTYDASH_DEPLOY_IMAGE}"
+PORT="${DIRTYDASH_DEPLOY_PORT}"
+BRANCH="${DIRTYDASH_DEPLOY_BRANCH}"
+SKIP_PULL="${DIRTYDASH_DEPLOY_SKIP_PULL}"
+
+cd "$APP_DIR"
+
+if [[ "$SKIP_PULL" != "1" ]]; then
+  git fetch origin "$BRANCH"
+  git checkout "$BRANCH"
+  git pull --ff-only origin "$BRANCH"
+fi
+
+cd "$APP_DIR/dashboard"
+npm ci
+npm run build
+
+cd "$APP_DIR"
+"$HOME/.cargo/bin/cargo" build --release
+
+mkdir -p "$DATA_DIR"
+
+if ! docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
+  echo "docker network not found: $DOCKER_NETWORK" >&2
+  exit 1
+fi
+
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+docker run -d \
+  --name "$CONTAINER_NAME" \
+  --restart unless-stopped \
+  --network "$DOCKER_NETWORK" \
+  -v "$APP_DIR/target/release/dirtydash:/usr/local/bin/dirtydash:ro" \
+  -v "$DATA_DIR:/data" \
+  -w /data \
+  "$BASE_IMAGE" \
+  dirtydash --db /data/dirtydash.sqlite3 serve --host 0.0.0.0 --port "$PORT" >/dev/null
+
+docker exec "$CONTAINER_NAME" dirtydash --db /data/dirtydash.sqlite3 doctor --json >/dev/null
+docker exec nginx-proxy-manager curl -fsS "http://$CONTAINER_NAME:$PORT/api/summary" >/dev/null
+
+docker ps --filter "name=$CONTAINER_NAME" --format '{{.Names}} {{.Status}} {{.Networks}}'
+REMOTE_SCRIPT
+}
+
+run_local() {
+  cd "$APP_DIR"
+
+  if [[ "$SKIP_PULL" != "1" ]]; then
+    git fetch origin "$BRANCH"
+    git checkout "$BRANCH"
+    git pull --ff-only origin "$BRANCH"
+  fi
+
+  cd "$APP_DIR/dashboard"
+  npm ci
+  npm run build
+
+  cd "$APP_DIR"
+  "$HOME/.cargo/bin/cargo" build --release
+
+  mkdir -p "$DATA_DIR"
+
+  if ! docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1; then
+    echo "docker network not found: $DOCKER_NETWORK" >&2
+    exit 1
+  fi
+
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --network "$DOCKER_NETWORK" \
+    -v "$APP_DIR/target/release/dirtydash:/usr/local/bin/dirtydash:ro" \
+    -v "$DATA_DIR:/data" \
+    -w /data \
+    "$BASE_IMAGE" \
+    dirtydash --db /data/dirtydash.sqlite3 serve --host 0.0.0.0 --port "$PORT" >/dev/null
+
+  docker exec "$CONTAINER_NAME" dirtydash --db /data/dirtydash.sqlite3 doctor --json >/dev/null
+  docker exec nginx-proxy-manager curl -fsS "http://$CONTAINER_NAME:$PORT/api/summary" >/dev/null
+
+  docker ps --filter "name=$CONTAINER_NAME" --format '{{.Names}} {{.Status}} {{.Networks}}'
+}
+
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  run_local
+else
+  run_remote
+fi
