@@ -241,9 +241,8 @@ h2 {
 
 .bar-row {
   display: grid;
-  grid-template-columns: minmax(150px, 1.3fr) minmax(140px, 2fr) 90px;
-  align-items: center;
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
 }
 
 .bar-label {
@@ -260,17 +259,67 @@ h2 {
 }
 
 .bar-track {
+  position: relative;
   height: 8px;
   overflow: hidden;
   border-radius: 999px;
   background: oklch(0.26 0.028 270);
 }
 
-.bar-track span {
+.bar-track.compact {
+  width: min(170px, 100%);
+}
+
+.bar-fill,
+.bar-priority {
+  position: absolute;
+  top: 0;
+  bottom: 0;
   display: block;
   height: 100%;
   border-radius: inherit;
+}
+
+.bar-fill {
+  left: 0;
   background: var(--violet);
+}
+
+.bar-priority {
+  background: var(--yellow);
+  box-shadow: -1px 0 0 oklch(0.16 0.02 276);
+}
+
+.token-summary {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  text-align: right;
+}
+
+.fast-label {
+  color: var(--yellow);
+  white-space: nowrap;
+}
+
+.panel.wide .bar-row {
+  grid-template-columns: minmax(150px, 1.3fr) minmax(140px, 2fr) minmax(90px, auto);
+  align-items: center;
+  gap: 12px;
+}
+
+.pricing-usage {
+  display: grid;
+  gap: 6px;
+  min-width: 145px;
+}
+
+.pricing-usage .token-summary {
+  justify-content: flex-start;
+  text-align: left;
 }
 
 .table-wrap {
@@ -280,7 +329,7 @@ h2 {
 
 table {
   width: 100%;
-  min-width: 860px;
+  min-width: 980px;
   border-collapse: collapse;
 }
 

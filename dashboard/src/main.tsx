@@ -29,6 +29,9 @@ type UsageTotals = {
   reasoning_tokens: number;
   total_tokens: number;
   estimated_cost_usd: number;
+  standard_tokens: number;
+  priority_tokens: number;
+  priority_estimated_cost_usd: number;
 };
 
 type NamedUsagePoint = {
@@ -39,6 +42,9 @@ type NamedUsagePoint = {
   cache_write_tokens: number;
   total_tokens: number;
   estimated_cost_usd: number;
+  standard_tokens: number;
+  priority_tokens: number;
+  priority_estimated_cost_usd: number;
 };
 
 type SessionSummary = {
@@ -110,7 +116,10 @@ const emptySummary: DashboardSummary = {
     cache_write_tokens: 0,
     reasoning_tokens: 0,
     total_tokens: 0,
-    estimated_cost_usd: 0
+    estimated_cost_usd: 0,
+    standard_tokens: 0,
+    priority_tokens: 0,
+    priority_estimated_cost_usd: 0
   },
   cache: {
     cache_read_tokens: 0,
@@ -294,7 +303,7 @@ function Page({
   if (page === "Cache") return <CachePage summary={summary} />;
   if (page === "Burn Report") return <BurnReport summary={summary} />;
   if (page === "Import/Files") return <SourcesPage sources={sources} filesMode />;
-  if (page === "Pricing") return <PricingPage pricing={pricing} />;
+  if (page === "Pricing") return <PricingPage pricing={pricing} usageRows={summary.by_model} />;
   if (page === "Doctor") return <DoctorPage doctor={doctor} />;
   if (page === "Privacy") return <PrivacyPage />;
   if (page === "Settings") return <SettingsPage />;
@@ -313,7 +322,7 @@ function Overview({
 }) {
   return (
     <div className="page-grid">
-      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, bundled, manual pricing" />
+      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, manual, local CodexBar pricing" />
       <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub="prompt, output, cache, reasoning" />
       <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.cache.cache_read_tokens)} observed reads`} />
       <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
@@ -358,7 +367,10 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       cache_read_tokens: 0,
       cache_write_tokens: 0,
       total_tokens: summary.totals.prompt_tokens,
-      estimated_cost_usd: 0
+      estimated_cost_usd: 0,
+      standard_tokens: summary.totals.prompt_tokens,
+      priority_tokens: 0,
+      priority_estimated_cost_usd: 0
     },
     {
       name: "cache read",
@@ -367,7 +379,10 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       cache_read_tokens: summary.totals.cache_read_tokens,
       cache_write_tokens: 0,
       total_tokens: summary.totals.cache_read_tokens,
-      estimated_cost_usd: 0
+      estimated_cost_usd: 0,
+      standard_tokens: summary.totals.cache_read_tokens,
+      priority_tokens: 0,
+      priority_estimated_cost_usd: 0
     },
     {
       name: "cache write",
@@ -376,7 +391,10 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       cache_read_tokens: 0,
       cache_write_tokens: summary.totals.cache_write_tokens,
       total_tokens: summary.totals.cache_write_tokens,
-      estimated_cost_usd: 0
+      estimated_cost_usd: 0,
+      standard_tokens: summary.totals.cache_write_tokens,
+      priority_tokens: 0,
+      priority_estimated_cost_usd: 0
     }
   ];
   return (
@@ -453,7 +471,18 @@ function SessionsPage({ sessions }: { sessions: SessionSummary[] }) {
   return <SessionsTable title="Searchable sessions" sessions={sessions} />;
 }
 
-function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
+function PricingPage({
+  pricing,
+  usageRows
+}: {
+  pricing: PricingRecord[];
+  usageRows: NamedUsagePoint[];
+}) {
+  const usageByModel = useMemo(
+    () => new Map(usageRows.map((row) => [row.name, row])),
+    [usageRows]
+  );
+  const maxUsage = Math.max(1, ...usageRows.map((row) => row.total_tokens));
   return (
     <section className="panel wide">
       <div className="panel-header">
@@ -466,6 +495,7 @@ function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
             <tr>
               <th>Provider</th>
               <th>Model</th>
+              <th>Usage</th>
               <th>Input</th>
               <th>Output</th>
               <th>Cache read</th>
@@ -474,22 +504,38 @@ function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
             </tr>
           </thead>
           <tbody>
-            {pricing.map((row) => (
-              <tr key={`${row.provider}-${row.model}`}>
-                <td>{row.provider}</td>
-                <td>{row.model}</td>
-                <td>{money(row.input_rate)}</td>
-                <td>{money(row.output_rate)}</td>
-                <td>{money(row.cache_read_rate)}</td>
-                <td>{money(row.cache_write_rate)}</td>
-                <td>
-                  <Status
-                    value={row.local_free_flag ? "free" : row.override_flag ? "override" : row.snapshot_version}
-                    tone={row.override_flag || row.local_free_flag ? "info" : "neutral"}
-                  />
-                </td>
-              </tr>
-            ))}
+            {pricing.map((row) => {
+              const usage = usageByModel.get(row.model);
+              return (
+                <tr key={`${row.provider}-${row.model}`}>
+                  <td>{row.provider}</td>
+                  <td>{row.model}</td>
+                  <td>
+                    {usage ? (
+                      <div className="pricing-usage">
+                        <UsageBar row={usage} max={maxUsage} compactMode />
+                        <TokenSummary row={usage} />
+                      </div>
+                    ) : (
+                      <span className="raw-path">not imported</span>
+                    )}
+                  </td>
+                  <td>{money(row.input_rate)}</td>
+                  <td>{money(row.output_rate)}</td>
+                  <td>{money(row.cache_read_rate)}</td>
+                  <td>{money(row.cache_write_rate)}</td>
+                  <td>
+                    <Status
+                      value={row.local_free_flag ? "free" : row.override_flag ? "override" : "bundled"}
+                      tone={row.override_flag || row.local_free_flag ? "info" : "neutral"}
+                    />
+                    <span className="pricing-version">
+                      {row.source_label} / {row.provider}/{row.model} / {row.snapshot_version}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -574,14 +620,56 @@ function TrendPanel({ title, rows, className = "" }: { title: string; rows: Name
               <span>{row.name || "unknown"}</span>
               <small>{money(row.estimated_cost_usd)}</small>
             </div>
-            <div className="bar-track" aria-hidden="true">
-              <span style={{ width: `${Math.max(4, (row.total_tokens / max) * 100)}%` }} />
-            </div>
-            <small>{compact(row.total_tokens)} tokens</small>
+            <UsageBar row={row} max={max} />
+            <TokenSummary row={row} />
           </div>
         ))}
       </div>
     </section>
+  );
+}
+
+function UsageBar({
+  row,
+  max,
+  compactMode = false
+}: {
+  row: NamedUsagePoint;
+  max: number;
+  compactMode?: boolean;
+}) {
+  const fill = row.total_tokens > 0 ? Math.max(compactMode ? 3 : 4, (row.total_tokens / max) * 100) : 0;
+  const priorityWidth =
+    row.total_tokens > 0 ? Math.min(fill, fill * (row.priority_tokens / row.total_tokens)) : 0;
+  const priorityLeft = Math.max(0, fill - priorityWidth);
+  const label =
+    row.priority_tokens > 0
+      ? `${row.name || "unknown"}: ${compact(row.total_tokens)} tokens, ${compact(row.priority_tokens)} priority/fast tokens`
+      : `${row.name || "unknown"}: ${compact(row.total_tokens)} tokens`;
+
+  return (
+    <div className={compactMode ? "bar-track compact" : "bar-track"} role="img" aria-label={label} title={label}>
+      <span className="bar-fill" style={{ width: `${fill}%` }} />
+      {row.priority_tokens > 0 ? (
+        <span
+          className="bar-priority"
+          style={{ left: `${priorityLeft}%`, width: `${priorityWidth}%` }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function TokenSummary({ row }: { row: NamedUsagePoint }) {
+  return (
+    <small className="token-summary">
+      <span>{compact(row.total_tokens)} tokens</span>
+      {row.priority_tokens > 0 ? (
+        <span className="fast-label" title={`${compact(row.priority_tokens)} priority/fast tokens`}>
+          {compact(row.priority_tokens)} fast
+        </span>
+      ) : null}
+    </small>
   );
 }
 

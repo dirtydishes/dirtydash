@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use directories::BaseDirs;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,7 +14,7 @@ use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::db::{local_machine, Database, SourceFileRecord};
-use crate::pricing;
+use crate::pricing::{self, PricingMode};
 
 pub const PARSER_VERSION: &str = "dirtydash-v1.0.0";
 
@@ -64,6 +65,7 @@ pub struct UsageEvent {
     pub source: SourceKind,
     pub project_path: String,
     pub session_id: String,
+    pub turn_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub prompt_tokens: u64,
@@ -82,6 +84,7 @@ pub struct UsageEvent {
     pub raw_event_hash: String,
     pub imported_at: String,
     pub pricing_version: String,
+    pub pricing_mode: PricingMode,
     pub metadata_only: bool,
 }
 
@@ -89,6 +92,113 @@ pub struct UsageEvent {
 struct ParsedFile {
     events: Vec<UsageEvent>,
     parse_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CodexPriorityEvidence {
+    turn_ids: HashSet<String>,
+}
+
+impl CodexPriorityEvidence {
+    fn load(codex_source_path: &Path) -> Self {
+        for candidate in codex_trace_db_candidates(codex_source_path) {
+            if !candidate.exists() {
+                continue;
+            }
+            if let Ok(turn_ids) = load_priority_turn_ids_from_trace_db(&candidate) {
+                return CodexPriorityEvidence { turn_ids };
+            }
+        }
+        CodexPriorityEvidence::default()
+    }
+
+    fn is_priority(&self, turn_id: &str) -> bool {
+        self.turn_ids.contains(turn_id)
+    }
+}
+
+fn codex_trace_db_candidates(codex_source_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(paths) = env_paths("CODEX_HOME") {
+        for path in paths {
+            candidates.push(path.join("logs_2.sqlite"));
+        }
+    }
+    if codex_source_path.ends_with("sessions") {
+        if let Some(parent) = codex_source_path.parent() {
+            candidates.push(parent.join("logs_2.sqlite"));
+        }
+    }
+    if let Some(base_dirs) = BaseDirs::new() {
+        candidates.push(base_dirs.home_dir().join(".codex/logs_2.sqlite"));
+    }
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|path| seen.insert(path.display().to_string()))
+        .collect()
+}
+
+fn load_priority_turn_ids_from_trace_db(path: &Path) -> Result<HashSet<String>> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("opening Codex trace DB {}", path.display()))?;
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT feedback_log_body
+        FROM logs
+        WHERE feedback_log_body LIKE '%websocket request:%'
+            AND feedback_log_body LIKE '%service_tier%'
+        "#,
+    )?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Option<String>>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(rows
+        .into_iter()
+        .flatten()
+        .filter_map(|body| priority_turn_id_from_feedback_body(&body))
+        .collect())
+}
+
+fn priority_turn_id_from_feedback_body(body: &str) -> Option<String> {
+    let marker = "websocket request:";
+    let request_json = body.get(body.find(marker)? + marker.len()..)?.trim_start();
+    let mut stream = serde_json::Deserializer::from_str(request_json).into_iter::<Value>();
+    let request = stream.next()?.ok()?;
+    let service_tier = request.get("service_tier").and_then(Value::as_str)?;
+    if service_tier != "priority" {
+        return None;
+    }
+
+    turn_id_from_codex_request(&request).or_else(|| span_value(body, "turn.id="))
+}
+
+fn turn_id_from_codex_request(request: &Value) -> Option<String> {
+    if let Some(turn_id) = extract_string(request, TURN_ID_KEYS) {
+        return Some(turn_id);
+    }
+    let metadata = request
+        .pointer("/client_metadata/x-codex-turn-metadata")
+        .and_then(Value::as_str)?;
+    serde_json::from_str::<Value>(metadata)
+        .ok()
+        .and_then(|value| extract_string(&value, TURN_ID_KEYS))
+}
+
+fn span_value(body: &str, key: &str) -> Option<String> {
+    let start = body.find(key)? + key.len();
+    let rest = body.get(start..)?;
+    let value: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 impl SourceKind {
@@ -239,14 +349,27 @@ pub fn import_sources(
         if source.file_count == 0 {
             continue;
         }
+        let codex_priority_evidence = if source.kind == SourceKind::Codex {
+            CodexPriorityEvidence::load(&source.path)
+        } else {
+            CodexPriorityEvidence::default()
+        };
 
         for file in matching_files(source.kind, &source.path)? {
             report.files_seen += 1;
-            let parsed = parse_file(db, &source, &file, &machine, &imported_at, options)
-                .unwrap_or_else(|error| ParsedFile {
-                    events: Vec::new(),
-                    parse_error: Some(error.to_string()),
-                });
+            let parsed = parse_file(
+                db,
+                &source,
+                &file,
+                &machine,
+                &imported_at,
+                options,
+                Some(&codex_priority_evidence),
+            )
+            .unwrap_or_else(|error| ParsedFile {
+                events: Vec::new(),
+                parse_error: Some(error.to_string()),
+            });
 
             if parsed.parse_error.is_some() {
                 report.parse_errors += 1;
@@ -408,9 +531,18 @@ fn parse_file(
     machine: &str,
     imported_at: &str,
     options: ImportOptions,
+    codex_priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<ParsedFile> {
     match source.kind {
-        SourceKind::Codex => parse_codex_jsonl(db, source, file, machine, imported_at, options),
+        SourceKind::Codex => parse_codex_jsonl(
+            db,
+            source,
+            file,
+            machine,
+            imported_at,
+            options,
+            codex_priority_evidence,
+        ),
         SourceKind::ClaudeCode | SourceKind::PiAgent => {
             parse_generic_jsonl(db, source, file, machine, imported_at, options)
         }
@@ -445,6 +577,8 @@ fn parse_generic_jsonl(
                     machine,
                     imported_at,
                     options,
+                    None,
+                    None,
                     None,
                 )? {
                     events.push(event);
@@ -481,6 +615,8 @@ fn parse_generic_json(
         imported_at,
         options,
         None,
+        None,
+        None,
     )?;
 
     Ok(ParsedFile {
@@ -496,6 +632,7 @@ fn parse_codex_jsonl(
     machine: &str,
     imported_at: &str,
     options: ImportOptions,
+    priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<ParsedFile> {
     let raw = fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let mut parse_errors = Vec::new();
@@ -503,6 +640,7 @@ fn parse_codex_jsonl(
     let mut previous = UsageNumbers::default();
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
+    let mut current_turn_id: Option<String> = None;
 
     for (index, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -518,11 +656,13 @@ fn parse_codex_jsonl(
         };
 
         if let Some(model) = extract_string(&value, MODEL_KEYS) {
-            let effort = extract_string(&value, REASONING_EFFORT_KEYS);
-            current_model = Some(model_with_reasoning_effort(&model, effort.as_deref()));
+            current_model = Some(model);
         }
         if let Some(provider) = extract_string(&value, PROVIDER_KEYS) {
             current_provider = Some(provider);
+        }
+        if let Some(turn_id) = extract_string(&value, TURN_ID_KEYS) {
+            current_turn_id = Some(turn_id);
         }
 
         let payload_type = value
@@ -555,6 +695,8 @@ fn parse_codex_jsonl(
                 imported_at,
                 options,
                 Some(current_model.as_deref().unwrap_or("gpt-5.5")),
+                current_turn_id.as_deref(),
+                priority_evidence,
             )? {
                 event.provider = current_provider
                     .clone()
@@ -574,6 +716,8 @@ fn parse_codex_jsonl(
             imported_at,
             options,
             current_model.as_deref(),
+            current_turn_id.as_deref(),
+            priority_evidence,
         )? {
             events.push(event);
         }
@@ -596,6 +740,8 @@ fn event_from_value(
     imported_at: &str,
     options: ImportOptions,
     fallback_model: Option<&str>,
+    fallback_turn_id: Option<&str>,
+    priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
     let usage = extract_usage_numbers(value);
     if !usage.has_usage() {
@@ -612,6 +758,8 @@ fn event_from_value(
         imported_at,
         options,
         fallback_model,
+        fallback_turn_id,
+        priority_evidence,
     )
 }
 
@@ -627,6 +775,8 @@ fn event_from_usage(
     imported_at: &str,
     options: ImportOptions,
     fallback_model: Option<&str>,
+    fallback_turn_id: Option<&str>,
+    priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
     if !usage.has_usage() {
         return Ok(None);
@@ -635,10 +785,7 @@ fn event_from_usage(
     let provider = extract_string(value, PROVIDER_KEYS)
         .unwrap_or_else(|| source.kind.default_provider().to_string());
     let model = extract_string(value, MODEL_KEYS)
-        .map(|model| {
-            let effort = extract_string(value, REASONING_EFFORT_KEYS);
-            model_with_reasoning_effort(&model, effort.as_deref())
-        })
+        .map(|model| model.trim().to_string())
         .or_else(|| fallback_model.map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".to_string());
     let session_id = extract_string(value, SESSION_KEYS).unwrap_or_else(|| {
@@ -647,12 +794,28 @@ fn event_from_usage(
     });
     let project_path =
         extract_string(value, PROJECT_KEYS).unwrap_or_else(|| infer_project_path(source, file));
+    let turn_id =
+        extract_string(value, TURN_ID_KEYS).or_else(|| fallback_turn_id.map(ToOwned::to_owned));
     let event_timestamp = extract_timestamp(value).or_else(|| file_modified_at(file));
     let reported_cost = extract_reported_cost(value);
+    let requested_pricing_mode = if source.kind == SourceKind::Codex
+        && turn_id.as_deref().is_some_and(|turn_id| {
+            priority_evidence.is_some_and(|evidence| evidence.is_priority(turn_id))
+        }) {
+        Some(PricingMode::Priority)
+    } else {
+        None
+    };
     let cost = if reported_cost.is_some() {
         None
     } else {
-        Some(pricing::estimate_cost(db, &provider, &model, &usage)?)
+        Some(pricing::estimate_cost(
+            db,
+            &provider,
+            &model,
+            &usage,
+            requested_pricing_mode,
+        )?)
     };
     let confidence = if reported_cost.is_some() {
         0.98
@@ -668,6 +831,7 @@ fn event_from_usage(
         source: source.kind,
         project_path,
         session_id,
+        turn_id,
         provider,
         model,
         prompt_tokens: usage.prompt_tokens,
@@ -694,6 +858,13 @@ fn event_from_usage(
                     .map(|estimate| estimate.pricing_version.clone())
             })
             .unwrap_or_else(|| "unpriced".to_string()),
+        pricing_mode: if reported_cost.is_some() {
+            PricingMode::Reported
+        } else {
+            cost.as_ref()
+                .map(|estimate| estimate.pricing_mode)
+                .unwrap_or(PricingMode::Unpriced)
+        },
         metadata_only: options.metadata_only,
     }))
 }
@@ -855,14 +1026,6 @@ const REASONING_KEYS: &[&str] = &[
     "reasoningOutputTokens",
 ];
 const MODEL_KEYS: &[&str] = &["model", "model_id", "modelID", "modelId", "active_model"];
-const REASONING_EFFORT_KEYS: &[&str] = &[
-    "model_reasoning_effort",
-    "modelReasoningEffort",
-    "reasoning_effort",
-    "reasoningEffort",
-    "thinkingLevel",
-    "effort",
-];
 const PROVIDER_KEYS: &[&str] = &["provider", "provider_id", "providerID", "providerId"];
 const SESSION_KEYS: &[&str] = &[
     "session_id",
@@ -872,6 +1035,7 @@ const SESSION_KEYS: &[&str] = &[
     "thread_id",
     "threadId",
 ];
+const TURN_ID_KEYS: &[&str] = &["turn_id", "turnId"];
 const PROJECT_KEYS: &[&str] = &[
     "project_path",
     "projectPath",
@@ -972,21 +1136,6 @@ fn extract_string(value: &Value, keys: &[&str]) -> Option<String> {
         }
         Value::Array(items) => items.iter().find_map(|item| extract_string(item, keys)),
         _ => None,
-    }
-}
-
-fn model_with_reasoning_effort(model: &str, effort: Option<&str>) -> String {
-    let model = model.trim();
-    let Some(effort) = effort else {
-        return model.to_string();
-    };
-    let effort = effort.trim().to_ascii_lowercase();
-    if matches!(effort.as_str(), "fast" | "low" | "minimal" | "off" | "none")
-        && matches!(model, "gpt-5.5" | "gpt-5.4")
-    {
-        format!("{model}-fast")
-    } else {
-        model.to_string()
     }
 }
 
@@ -1179,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_low_effort_gpt_models_import_as_fast_pricing_slugs() {
+    fn codex_reasoning_effort_does_not_create_fast_model_slugs_without_trace_evidence() {
         let dir = tempdir().unwrap();
         let source_root = dir.path().join("codex/sessions");
         fs::create_dir_all(&source_root).unwrap();
@@ -1214,12 +1363,12 @@ mod tests {
         let sessions = db.sessions(10).unwrap();
         let gpt55 = sessions
             .iter()
-            .find(|session| session.model == "gpt-5.5-fast")
-            .expect("gpt-5.5 low effort should import as fast");
+            .find(|session| session.model == "gpt-5.5")
+            .expect("gpt-5.5 low effort should stay on the base model");
         let gpt54 = sessions
             .iter()
-            .find(|session| session.model == "gpt-5.4-fast")
-            .expect("gpt-5.4 minimal effort should import as fast");
+            .find(|session| session.model == "gpt-5.4")
+            .expect("gpt-5.4 minimal effort should stay on the base model");
         assert_eq!(
             gpt55.pricing_version,
             crate::pricing::BUNDLED_PRICING_VERSION
@@ -1228,8 +1377,95 @@ mod tests {
             gpt54.pricing_version,
             crate::pricing::BUNDLED_PRICING_VERSION
         );
-        assert!((gpt55.estimated_cost_usd - 0.015125).abs() < 0.000001);
-        assert!((gpt54.estimated_cost_usd - 0.00605).abs() < 0.000001);
+        assert!((gpt55.estimated_cost_usd - 0.00605).abs() < 0.000001);
+        assert!((gpt54.estimated_cost_usd - 0.003025).abs() < 0.000001);
+
+        let conn = db.connection().unwrap();
+        let modes = conn
+            .prepare("SELECT model, pricing_mode FROM usage_events ORDER BY model")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            modes,
+            vec![
+                ("gpt-5.4".to_string(), "standard".to_string()),
+                ("gpt-5.5".to_string(), "standard".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_logs_2_priority_rows_mark_matching_turn_events() {
+        let dir = tempdir().unwrap();
+        let codex_home = dir.path().join("codex");
+        let source_root = codex_home.join("sessions");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("session-priority.jsonl"),
+            r#"{"timestamp":"2026-06-07T12:00:00Z","type":"turn_context","payload":{"turn_id":"turn-priority","cwd":"/repo/fast","model":"gpt-5.5"}}
+{"timestamp":"2026-06-07T12:00:10Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":50}}}}"#,
+        )
+        .unwrap();
+
+        let trace = rusqlite::Connection::open(codex_home.join("logs_2.sqlite")).unwrap();
+        trace
+            .execute("CREATE TABLE logs (feedback_log_body TEXT)", [])
+            .unwrap();
+        let metadata = serde_json::json!({"turn_id": "turn-priority"}).to_string();
+        let request = serde_json::json!({
+            "type": "response.create",
+            "service_tier": "priority",
+            "client_metadata": {
+                "x-codex-turn-metadata": metadata
+            }
+        })
+        .to_string();
+        trace
+            .execute(
+                "INSERT INTO logs (feedback_log_body) VALUES (?1)",
+                rusqlite::params![format!("span:websocket request: {request}")],
+            )
+            .unwrap();
+        drop(trace);
+
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+        let report = import_sources(
+            &db,
+            vec![detected(SourceKind::Codex, source_root)],
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.inserted_events, 1);
+        let row = db
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT model, turn_id, pricing_mode, estimated_cost_usd FROM usage_events",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "gpt-5.5");
+        assert_eq!(row.1.as_deref(), Some("turn-priority"));
+        assert_eq!(row.2, "priority");
+        assert!((row.3 - 0.015125).abs() < 0.000001);
     }
 
     #[test]
@@ -1260,6 +1496,7 @@ mod tests {
             ImportOptions {
                 metadata_only: true,
             },
+            None,
         )
         .unwrap();
         let mut stale = parsed.events[0].clone();

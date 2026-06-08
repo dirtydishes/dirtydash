@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::importers::{self, DetectedSource, SourceKind, UsageEvent};
-use crate::pricing::PricingRecord;
+use crate::pricing::{PricingMode, PricingRecord};
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -52,6 +52,9 @@ pub struct UsageTotals {
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub estimated_cost_usd: f64,
+    pub standard_tokens: u64,
+    pub priority_tokens: u64,
+    pub priority_estimated_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -72,6 +75,9 @@ pub struct NamedUsagePoint {
     pub cache_write_tokens: u64,
     pub total_tokens: u64,
     pub estimated_cost_usd: f64,
+    pub standard_tokens: u64,
+    pub priority_tokens: u64,
+    pub priority_estimated_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +128,7 @@ pub enum UsageEventWrite {
 struct UsageEventPricingState {
     provider: String,
     model: String,
+    turn_id: Option<String>,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: u64,
@@ -131,6 +138,7 @@ struct UsageEventPricingState {
     estimated_cost_usd: f64,
     confidence: f64,
     pricing_version: String,
+    pricing_mode: String,
 }
 
 impl Database {
@@ -170,6 +178,7 @@ impl Database {
                 source TEXT NOT NULL,
                 project_path TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                turn_id TEXT,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
@@ -188,6 +197,7 @@ impl Database {
                 raw_event_hash TEXT NOT NULL UNIQUE,
                 imported_at TEXT NOT NULL,
                 pricing_version TEXT NOT NULL,
+                pricing_mode TEXT NOT NULL DEFAULT 'unpriced',
                 metadata_only INTEGER NOT NULL DEFAULT 1
             );
 
@@ -241,6 +251,29 @@ impl Database {
             "#,
         )
         .context("applying SQLite migrations")?;
+        self.ensure_usage_event_columns(&conn)?;
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_usage_events_turn
+                ON usage_events(turn_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_events_pricing_mode
+                ON usage_events(pricing_mode);
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_usage_event_columns(&self, conn: &Connection) -> Result<()> {
+        let columns = table_columns(conn, "usage_events")?;
+        if !columns.iter().any(|column| column == "turn_id") {
+            conn.execute("ALTER TABLE usage_events ADD COLUMN turn_id TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "pricing_mode") {
+            conn.execute(
+                "ALTER TABLE usage_events ADD COLUMN pricing_mode TEXT NOT NULL DEFAULT 'unpriced'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -249,9 +282,9 @@ impl Database {
         let existing = conn
             .query_row(
                 r#"
-                SELECT provider, model, prompt_tokens, completion_tokens, cache_read_tokens,
+                SELECT provider, model, turn_id, prompt_tokens, completion_tokens, cache_read_tokens,
                     cache_write_tokens, reasoning_tokens, total_tokens, estimated_cost_usd,
-                    confidence, pricing_version
+                    confidence, pricing_version, pricing_mode
                 FROM usage_events
                 WHERE raw_event_hash = ?1
                 "#,
@@ -260,15 +293,17 @@ impl Database {
                     Ok(UsageEventPricingState {
                         provider: row.get(0)?,
                         model: row.get(1)?,
-                        prompt_tokens: row.get::<_, i64>(2)? as u64,
-                        completion_tokens: row.get::<_, i64>(3)? as u64,
-                        cache_read_tokens: row.get::<_, i64>(4)? as u64,
-                        cache_write_tokens: row.get::<_, i64>(5)? as u64,
-                        reasoning_tokens: row.get::<_, i64>(6)? as u64,
-                        total_tokens: row.get::<_, i64>(7)? as u64,
-                        estimated_cost_usd: row.get(8)?,
-                        confidence: row.get(9)?,
-                        pricing_version: row.get(10)?,
+                        turn_id: row.get(2)?,
+                        prompt_tokens: row.get::<_, i64>(3)? as u64,
+                        completion_tokens: row.get::<_, i64>(4)? as u64,
+                        cache_read_tokens: row.get::<_, i64>(5)? as u64,
+                        cache_write_tokens: row.get::<_, i64>(6)? as u64,
+                        reasoning_tokens: row.get::<_, i64>(7)? as u64,
+                        total_tokens: row.get::<_, i64>(8)? as u64,
+                        estimated_cost_usd: row.get(9)?,
+                        confidence: row.get(10)?,
+                        pricing_version: row.get(11)?,
+                        pricing_mode: row.get(12)?,
                     })
                 },
             )
@@ -283,23 +318,26 @@ impl Database {
                 UPDATE usage_events
                 SET provider = ?1,
                     model = ?2,
-                    prompt_tokens = ?3,
-                    completion_tokens = ?4,
-                    cache_read_tokens = ?5,
-                    cache_write_tokens = ?6,
-                    reasoning_tokens = ?7,
-                    total_tokens = ?8,
-                    estimated_cost_usd = ?9,
-                    confidence = ?10,
-                    parser_version = ?11,
-                    imported_at = ?12,
-                    pricing_version = ?13,
-                    metadata_only = ?14
-                WHERE raw_event_hash = ?15
+                    turn_id = ?3,
+                    prompt_tokens = ?4,
+                    completion_tokens = ?5,
+                    cache_read_tokens = ?6,
+                    cache_write_tokens = ?7,
+                    reasoning_tokens = ?8,
+                    total_tokens = ?9,
+                    estimated_cost_usd = ?10,
+                    confidence = ?11,
+                    parser_version = ?12,
+                    imported_at = ?13,
+                    pricing_version = ?14,
+                    pricing_mode = ?15,
+                    metadata_only = ?16
+                WHERE raw_event_hash = ?17
                 "#,
                 params![
                     event.provider,
                     event.model,
+                    event.turn_id,
                     event.prompt_tokens,
                     event.completion_tokens,
                     event.cache_read_tokens,
@@ -311,6 +349,7 @@ impl Database {
                     event.parser_version,
                     event.imported_at,
                     event.pricing_version,
+                    event.pricing_mode.as_str(),
                     if event.metadata_only { 1 } else { 0 },
                     event.raw_event_hash,
                 ],
@@ -321,20 +360,21 @@ impl Database {
         let changed = conn.execute(
             r#"
             INSERT INTO usage_events (
-                machine, source, project_path, session_id, provider, model,
+                machine, source, project_path, session_id, turn_id, provider, model,
                 prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
                 reasoning_tokens, total_tokens, estimated_cost_usd, confidence,
                 event_timestamp, raw_path, raw_span, parser_name, parser_version,
-                raw_event_hash, imported_at, pricing_version, metadata_only
+                raw_event_hash, imported_at, pricing_version, pricing_mode, metadata_only
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             "#,
             params![
                 event.machine,
                 event.source.as_str(),
                 event.project_path,
                 event.session_id,
+                event.turn_id,
                 event.provider,
                 event.model,
                 event.prompt_tokens,
@@ -353,6 +393,7 @@ impl Database {
                 event.raw_event_hash,
                 event.imported_at,
                 event.pricing_version,
+                event.pricing_mode.as_str(),
                 if event.metadata_only { 1 } else { 0 },
             ],
         )?;
@@ -361,6 +402,23 @@ impl Database {
         } else {
             UsageEventWrite::Skipped
         })
+    }
+
+    pub fn delete_non_overridden_pricing_records(&self, records: &[(&str, &str)]) -> Result<()> {
+        let conn = self.connection()?;
+        for (provider, model) in records {
+            conn.execute(
+                r#"
+                DELETE FROM pricing_records
+                WHERE provider = ?1
+                    AND model = ?2
+                    AND override_flag = 0
+                    AND local_free_flag = 0
+                "#,
+                params![provider, model],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn upsert_source_file(&self, record: &SourceFileRecord) -> Result<()> {
@@ -718,7 +776,10 @@ impl Database {
                 COALESCE(SUM(cache_write_tokens), 0),
                 COALESCE(SUM(reasoning_tokens), 0),
                 COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(estimated_cost_usd), 0)
+                COALESCE(SUM(estimated_cost_usd), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN 0 ELSE total_tokens END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN total_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN estimated_cost_usd ELSE 0 END), 0)
             FROM usage_events
             "#,
             [],
@@ -731,6 +792,9 @@ impl Database {
                     reasoning_tokens: row.get::<_, i64>(4)? as u64,
                     total_tokens: row.get::<_, i64>(5)? as u64,
                     estimated_cost_usd: row.get(6)?,
+                    standard_tokens: row.get::<_, i64>(7)? as u64,
+                    priority_tokens: row.get::<_, i64>(8)? as u64,
+                    priority_estimated_cost_usd: row.get(9)?,
                 })
             },
         )
@@ -765,7 +829,10 @@ impl Database {
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0),
                 COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(estimated_cost_usd), 0)
+                COALESCE(SUM(estimated_cost_usd), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN 0 ELSE total_tokens END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN total_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN estimated_cost_usd ELSE 0 END), 0)
             FROM usage_events
             GROUP BY name
             ORDER BY estimated_cost_usd DESC, total_tokens DESC
@@ -783,6 +850,9 @@ impl Database {
                     cache_write_tokens: row.get::<_, i64>(4)? as u64,
                     total_tokens: row.get::<_, i64>(5)? as u64,
                     estimated_cost_usd: row.get(6)?,
+                    standard_tokens: row.get::<_, i64>(7)? as u64,
+                    priority_tokens: row.get::<_, i64>(8)? as u64,
+                    priority_estimated_cost_usd: row.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -800,7 +870,10 @@ impl Database {
                 COALESCE(SUM(cache_read_tokens), 0),
                 COALESCE(SUM(cache_write_tokens), 0),
                 COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(estimated_cost_usd), 0)
+                COALESCE(SUM(estimated_cost_usd), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN 0 ELSE total_tokens END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN total_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN estimated_cost_usd ELSE 0 END), 0)
             FROM usage_events
             GROUP BY provider, model
             "#,
@@ -815,6 +888,9 @@ impl Database {
                     cache_write_tokens: row.get::<_, i64>(5)? as u64,
                     total_tokens: row.get::<_, i64>(6)? as u64,
                     estimated_cost_usd: row.get(7)?,
+                    standard_tokens: row.get::<_, i64>(8)? as u64,
+                    priority_tokens: row.get::<_, i64>(9)? as u64,
+                    priority_estimated_cost_usd: row.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -828,6 +904,9 @@ impl Database {
                 existing.cache_write_tokens += row.cache_write_tokens;
                 existing.total_tokens += row.total_tokens;
                 existing.estimated_cost_usd += row.estimated_cost_usd;
+                existing.standard_tokens += row.standard_tokens;
+                existing.priority_tokens += row.priority_tokens;
+                existing.priority_estimated_cost_usd += row.priority_estimated_cost_usd;
             } else {
                 merged.push(row);
             }
@@ -849,6 +928,7 @@ impl UsageEventPricingState {
     fn matches(&self, event: &UsageEvent) -> bool {
         self.provider == event.provider
             && self.model == event.model
+            && self.turn_id == event.turn_id
             && self.prompt_tokens == event.prompt_tokens
             && self.completion_tokens == event.completion_tokens
             && self.cache_read_tokens == event.cache_read_tokens
@@ -858,6 +938,7 @@ impl UsageEventPricingState {
             && (self.estimated_cost_usd - event.estimated_cost_usd).abs() < 0.0000001
             && (self.confidence - event.confidence).abs() < 0.0000001
             && self.pricing_version == event.pricing_version
+            && PricingMode::from_db(&self.pricing_mode) == event.pricing_mode
     }
 }
 
@@ -927,6 +1008,14 @@ fn count_row(conn: &Connection, sql: &str) -> Result<u64> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))? as u64)
 }
 
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns)
+}
+
 pub fn local_machine() -> String {
     hostname::get()
         .ok()
@@ -990,41 +1079,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_summary_hides_provider_and_keeps_fast_slugs_separate() {
+    fn model_summary_hides_provider_and_exposes_priority_split() {
         let dir = tempdir().unwrap();
         let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
         db.migrate().unwrap();
 
-        db.upsert_usage_event(&event("openai", "gpt-5.5", 1_000, "hash-1"))
-            .unwrap();
-        db.upsert_usage_event(&event("openai-codex", "gpt-5.5", 2_000, "hash-2"))
-            .unwrap();
-        db.upsert_usage_event(&event("openai", "gpt-5.5-fast", 3_000, "hash-3"))
-            .unwrap();
+        db.upsert_usage_event(&event(
+            "openai",
+            "gpt-5.5",
+            1_000,
+            "hash-1",
+            PricingMode::Standard,
+        ))
+        .unwrap();
+        db.upsert_usage_event(&event(
+            "openai-codex",
+            "gpt-5.5",
+            2_000,
+            "hash-2",
+            PricingMode::Standard,
+        ))
+        .unwrap();
+        db.upsert_usage_event(&event(
+            "openai",
+            "gpt-5.5",
+            3_000,
+            "hash-3",
+            PricingMode::Priority,
+        ))
+        .unwrap();
 
         let summary = db.dashboard_summary().unwrap();
-        let standard = summary
+        let model = summary
             .by_model
             .iter()
             .find(|row| row.name == "gpt-5.5")
-            .expect("standard model row should be present");
-        let fast = summary
-            .by_model
-            .iter()
-            .find(|row| row.name == "gpt-5.5-fast")
             .expect("fast model row should be present");
 
-        assert_eq!(standard.total_tokens, 3_000);
-        assert_eq!(fast.total_tokens, 3_000);
+        assert_eq!(model.total_tokens, 6_000);
+        assert_eq!(model.standard_tokens, 3_000);
+        assert_eq!(model.priority_tokens, 3_000);
+        assert_eq!(model.priority_estimated_cost_usd, 0.003);
         assert!(summary.by_model.iter().all(|row| !row.name.contains('/')));
     }
 
-    fn event(provider: &str, model: &str, tokens: u64, hash: &str) -> UsageEvent {
+    fn event(
+        provider: &str,
+        model: &str,
+        tokens: u64,
+        hash: &str,
+        pricing_mode: PricingMode,
+    ) -> UsageEvent {
         UsageEvent {
             machine: "test-machine".to_string(),
             source: importers::SourceKind::Codex,
             project_path: "/repo".to_string(),
             session_id: format!("session-{hash}"),
+            turn_id: Some(format!("turn-{hash}")),
             provider: provider.to_string(),
             model: model.to_string(),
             prompt_tokens: tokens,
@@ -1043,6 +1154,7 @@ mod tests {
             raw_event_hash: hash.to_string(),
             imported_at: Utc::now().to_rfc3339(),
             pricing_version: "test-pricing".to_string(),
+            pricing_mode,
             metadata_only: true,
         }
     }
