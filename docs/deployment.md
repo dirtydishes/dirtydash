@@ -39,7 +39,19 @@ From the repository root:
 scripts/deploy-dirtydash
 ```
 
-By default this SSHes to `di`, pulls `main`, rebuilds dashboard assets, rebuilds the Rust release binary, recreates the private `dirtydash` container, and smoke-tests the NPM upstream.
+The script asks where to deploy:
+
+```text
+Deploy dirtydash where? [R]emote via ssh di / [l]ocal server shell:
+```
+
+Press Enter for the default remote deploy to `di`. Remote mode SSHes to `di`, pulls `main`, rebuilds dashboard assets, rebuilds the Rust release binary, recreates the private `dirtydash` container, and smoke-tests the NPM upstream.
+
+Run remote mode without the prompt, useful for automation:
+
+```bash
+scripts/deploy-dirtydash --remote-mode
+```
 
 Deploy a different branch:
 
@@ -65,6 +77,12 @@ SSH to `di`, then run:
 
 ```bash
 cd /home/delta/apps/dirtydash/app
+scripts/deploy-dirtydash
+```
+
+Answer `local` at the prompt. You can also skip the prompt:
+
+```bash
 scripts/deploy-dirtydash --local
 ```
 

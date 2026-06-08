@@ -11,12 +11,14 @@ PORT="${DIRTYDASH_DEPLOY_PORT:-4599}"
 BRANCH="${DIRTYDASH_DEPLOY_BRANCH:-main}"
 SKIP_PULL=0
 LOCAL_MODE=0
+REMOTE_MODE=0
 
 usage() {
   cat <<'USAGE'
 Usage:
   scripts/deploy-dirtydash [options]
   scripts/deploy-dirtydash --local [options]
+  scripts/deploy-dirtydash --remote-mode [options]
 
 Deploy dirtydash to the existing di/NPM Docker setup.
 
@@ -27,6 +29,7 @@ Options:
   --branch NAME       Branch to deploy when pulling on server. Default: main
   --skip-pull         Do not run git fetch/checkout/pull before building
   --local             Run deploy steps in the current/server shell instead of SSH
+  --remote-mode       Run remote deploy mode without prompting
   -h, --help          Show this help
 
 Environment overrides:
@@ -67,6 +70,10 @@ while (($#)); do
       LOCAL_MODE=1
       shift
       ;;
+    --remote-mode)
+      REMOTE_MODE=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -78,6 +85,34 @@ while (($#)); do
       ;;
   esac
 done
+
+choose_mode() {
+  if [[ "$LOCAL_MODE" == "1" || "$REMOTE_MODE" == "1" ]]; then
+    return
+  fi
+
+  if [[ ! -t 0 ]]; then
+    echo "deploy mode is required when stdin is not interactive; pass --remote-mode or --local" >&2
+    exit 2
+  fi
+
+  local answer
+  printf "Deploy dirtydash where? [R]emote via ssh %s / [l]ocal server shell: " "$REMOTE" >&2
+  read -r answer
+
+  case "${answer:-r}" in
+    r|R|remote|Remote|REMOTE)
+      REMOTE_MODE=1
+      ;;
+    l|L|local|Local|LOCAL)
+      LOCAL_MODE=1
+      ;;
+    *)
+      echo "please answer remote or local" >&2
+      exit 2
+      ;;
+  esac
+}
 
 run_remote() {
   ssh -o BatchMode=yes "$REMOTE" \
@@ -180,6 +215,8 @@ run_local() {
 
   docker ps --filter "name=$CONTAINER_NAME" --format '{{.Names}} {{.Status}} {{.Networks}}'
 }
+
+choose_mode
 
 if [[ "$LOCAL_MODE" == "1" ]]; then
   run_local
