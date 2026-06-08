@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deploy dirtydash to di</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #120f1d;
+      --panel: #1d172d;
+      --panel-2: #261d3a;
+      --text: #f5efff;
+      --muted: #c9b9dc;
+      --line: #47365f;
+      --lilac: #d8b4fe;
+      --lavender: #a78bfa;
+      --pink: #f0abfc;
+      --good: #8ee6bf;
+      --warn: #ffd38a;
+      --code: #0c0914;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(167, 139, 250, 0.18), transparent 34rem),
+        radial-gradient(circle at bottom right, rgba(240, 171, 252, 0.12), transparent 34rem),
+        var(--bg);
+      color: var(--text);
+      font-family: "IBM Plex Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.6;
+    }
+
+    main {
+      width: min(980px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 64px;
+    }
+
+    header {
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(38, 29, 58, 0.96), rgba(29, 23, 45, 0.92));
+      border-radius: 18px;
+      padding: 28px;
+      margin-bottom: 22px;
+    }
+
+    h1, h2, h3, code, pre {
+      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      color: var(--lilac);
+      font-size: 1.1rem;
+    }
+
+    p { margin: 0 0 12px; }
+
+    section {
+      border: 1px solid var(--line);
+      background: rgba(29, 23, 45, 0.82);
+      border-radius: 14px;
+      padding: 22px;
+      margin: 16px 0;
+    }
+
+    ul { margin: 0; padding-left: 1.2rem; }
+    li + li { margin-top: 6px; }
+
+    a { color: var(--pink); }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .pill {
+      border: 1px solid rgba(216, 180, 254, 0.38);
+      background: rgba(216, 180, 254, 0.08);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 0.9rem;
+    }
+
+    code {
+      background: rgba(12, 9, 20, 0.72);
+      border: 1px solid rgba(167, 139, 250, 0.24);
+      border-radius: 6px;
+      padding: 0.1rem 0.32rem;
+      color: #f8e8ff;
+    }
+
+    pre {
+      margin: 14px 0 0;
+      overflow-x: auto;
+      background: var(--code);
+      border: 1px solid rgba(167, 139, 250, 0.28);
+      border-radius: 12px;
+      padding: 14px;
+      color: #f7edff;
+      line-height: 1.45;
+    }
+
+    pre code {
+      border: 0;
+      background: transparent;
+      padding: 0;
+    }
+
+    .ok { color: var(--good); }
+    .warn { color: var(--warn); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>dirtydash is deployed on di</h1>
+      <p>dirtydash now runs as a private Docker container on <code>di</code>, is proxied through Nginx Proxy Manager at <code>dirtydash.dirtydishes.dev</code>, and has a local manual sync command for copying the Mac SQLite database to the server.</p>
+      <div class="meta">
+        <span class="pill">Completed: 2026-06-08 09:24 EDT</span>
+        <span class="pill">Server: di / deltaisland.io</span>
+        <span class="pill">Proxy: Nginx Proxy Manager</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>Deployed dirtydash from <code>origin/main</code>, seeded the server with the local SQLite database, created an NPM proxy host for <code>dirtydash.dirtydishes.dev</code>, issued a Let’s Encrypt certificate, and protected the route with NPM Basic Auth.</p>
+    </section>
+
+    <section>
+      <h2>What Changed</h2>
+      <ul>
+        <li>Installed a user-local Rust toolchain on <code>di</code> under <code>/home/delta/.cargo</code>.</li>
+        <li>Cloned the repo to <code>/home/delta/apps/dirtydash/app</code>.</li>
+        <li>Built the Vite dashboard and Rust release binary on the server.</li>
+        <li>Created <code>/home/delta/apps/dirtydash/data/dirtydash.sqlite3</code> as the synced server database path.</li>
+        <li>Started a private Docker container named <code>dirtydash</code> on the <code>npm-shared</code> network.</li>
+        <li>Created an NPM proxy host for <code>dirtydash.dirtydishes.dev</code> pointing to <code>dirtydash:4599</code>.</li>
+        <li>Created an NPM Basic Auth access list named <code>dirtydash basic auth</code>.</li>
+        <li>Created <code>~/bin/dirtydash-sync-db</code> on this Mac for manual database syncs.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Why This Was Done</h2>
+      <p>The goal was to get dirtydash online quickly while keeping the app private enough for usage and cost data. Running it as a Docker container on NPM’s shared network avoids exposing port <code>4599</code> publicly and gives NPM a stable upstream name.</p>
+    </section>
+
+    <section>
+      <h2>How to Use It</h2>
+      <p>Open <a href="https://dirtydash.dirtydishes.dev">https://dirtydash.dirtydishes.dev</a>. The browser should ask for Basic Auth.</p>
+      <p>The username is <code>kell</code>. The generated password is stored locally in:</p>
+      <pre><code>/Users/kell/docs/turns/dirtydash-npm-basic-auth-2026-06-08-092305.txt</code></pre>
+      <p>To manually sync the latest local database to the server, run:</p>
+      <pre><code>dirtydash-sync-db</code></pre>
+    </section>
+
+    <section>
+      <h2>Important Details</h2>
+      <ul>
+        <li>The server dashboard shows the SQLite database last copied from this Mac, not live local files from the Mac.</li>
+        <li>The dirtydash container uses the host-mounted data directory <code>/home/delta/apps/dirtydash/data</code>.</li>
+        <li>The container is private to Docker networking and has no published host port.</li>
+        <li>A first attempt used a user systemd service bound to Docker’s bridge gateway, but Docker network policy blocked NPM from reaching that host-bound service. It was disabled and replaced by the private container.</li>
+        <li>NPM certificate ID <code>26</code> was issued for <code>dirtydash.dirtydishes.dev</code> and expires on <code>2026-09-06</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Commands, Settings, or Files Changed</h2>
+      <p>Key server paths and objects:</p>
+      <pre><code>/home/delta/apps/dirtydash/app
+/home/delta/apps/dirtydash/data/dirtydash.sqlite3
+Docker container: dirtydash
+Docker network: npm-shared
+NPM proxy host ID: 15
+NPM access list ID: 2
+NPM upstream: http://dirtydash:4599</code></pre>
+      <p>Manual sync command created locally:</p>
+      <pre><code>/Users/kell/bin/dirtydash-sync-db</code></pre>
+      <p>Useful server checks:</p>
+      <pre><code>ssh di 'docker ps --filter name=dirtydash'
+ssh di 'docker logs --tail 50 dirtydash'
+ssh di 'docker exec nginx-proxy-manager curl -fsS http://dirtydash:4599/api/summary &gt;/dev/null'</code></pre>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li class="ok">Local SQLite database passed <code>PRAGMA integrity_check</code>.</li>
+        <li class="ok">Dashboard assets built with <code>npm run build</code>.</li>
+        <li class="ok">Rust release binary built with <code>cargo build --release</code>.</li>
+        <li class="ok">The <code>dirtydash</code> Docker container started and logged <code>dirtydash dashboard: http://0.0.0.0:4599</code>.</li>
+        <li class="ok">NPM generated valid nginx config and <code>nginx -t</code> passed.</li>
+        <li class="ok">Let’s Encrypt certificate request succeeded for <code>dirtydash.dirtydishes.dev</code>.</li>
+        <li class="ok">Unauthenticated public request returned <code>401 Authorization Required</code>.</li>
+        <li class="ok">Authenticated public request to <code>/api/summary</code> returned <code>200 OK</code>.</li>
+        <li class="ok"><code>dirtydash-sync-db</code> completed successfully after the Docker validation update.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Risks</h2>
+      <ul>
+        <li>The dashboard is protected by NPM Basic Auth, not app-native dirtydash auth.</li>
+        <li>Manual sync replaces the server SQLite file with a backup copy from this Mac. It does not merge multiple machines.</li>
+        <li>The dirtydash container mounts the compiled binary from the host. Rebuilding the app on the server updates the mounted binary path, but the container may need a restart to pick up a new binary.</li>
+        <li>A disabled user service file remains at <code>/home/delta/.config/systemd/user/dirtydash.service</code>. It is not enabled or running.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Rollback or Recovery</h2>
+      <p>To stop and remove the deployed container:</p>
+      <pre><code>ssh di 'docker rm -f dirtydash'</code></pre>
+      <p>To remove the local sync command:</p>
+      <pre><code>rm -f ~/bin/dirtydash-sync-db</code></pre>
+      <p>To remove the NPM route, delete proxy host ID <code>15</code> and access list ID <code>2</code> in Nginx Proxy Manager. If doing it from the UI, remove the proxy host first, then the access list.</p>
+      <p>To redeploy after a repo update:</p>
+      <pre><code>ssh di 'cd ~/apps/dirtydash/app &amp;&amp; git pull --ff-only &amp;&amp; cd dashboard &amp;&amp; npm ci &amp;&amp; npm run build &amp;&amp; cd .. &amp;&amp; ~/.cargo/bin/cargo build --release &amp;&amp; docker restart dirtydash'</code></pre>
+    </section>
+
+    <section>
+      <h2>Follow-up Ideas</h2>
+      <ul>
+        <li>Add an app-native auth layer to dirtydash so it is not dependent on NPM Basic Auth.</li>
+        <li>Add a small deploy script on <code>di</code> for pull, build, and restart.</li>
+        <li>Add an automated sync option, such as a launchd job, if manual sync starts feeling tedious.</li>
+        <li>Move the container image build into a proper Dockerfile once dirtydash deployment stabilizes.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Helpful Links</h2>
+      <ul>
+        <li><a href="https://nginxproxymanager.com/guide/">Nginx Proxy Manager guide</a></li>
+        <li><a href="https://docs.docker.com/reference/cli/docker/container/run/">Docker run reference</a></li>
+        <li><a href="https://www.sqlite.org/backup.html">SQLite backup API documentation</a></li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
