@@ -29,6 +29,9 @@ type UsageTotals = {
   reasoning_tokens: number;
   total_tokens: number;
   estimated_cost_usd: number;
+  standard_tokens: number;
+  priority_tokens: number;
+  priority_estimated_cost_usd: number;
 };
 
 type NamedUsagePoint = {
@@ -37,8 +40,12 @@ type NamedUsagePoint = {
   completion_tokens: number;
   cache_read_tokens: number;
   cache_write_tokens: number;
+  reasoning_tokens: number;
   total_tokens: number;
   estimated_cost_usd: number;
+  standard_tokens: number;
+  priority_tokens: number;
+  priority_estimated_cost_usd: number;
 };
 
 type SessionSummary = {
@@ -95,6 +102,8 @@ type PricingRecord = {
   local_free_flag: boolean;
 };
 
+type UsageBarMetric = "tokens" | "cost";
+
 type DoctorReport = {
   event_count: number;
   pricing_count: number;
@@ -110,7 +119,10 @@ const emptySummary: DashboardSummary = {
     cache_write_tokens: 0,
     reasoning_tokens: 0,
     total_tokens: 0,
-    estimated_cost_usd: 0
+    estimated_cost_usd: 0,
+    standard_tokens: 0,
+    priority_tokens: 0,
+    priority_estimated_cost_usd: 0
   },
   cache: {
     cache_read_tokens: 0,
@@ -294,7 +306,7 @@ function Page({
   if (page === "Cache") return <CachePage summary={summary} />;
   if (page === "Burn Report") return <BurnReport summary={summary} />;
   if (page === "Import/Files") return <SourcesPage sources={sources} filesMode />;
-  if (page === "Pricing") return <PricingPage pricing={pricing} />;
+  if (page === "Pricing") return <PricingPage pricing={pricing} usageRows={summary.by_model} />;
   if (page === "Doctor") return <DoctorPage doctor={doctor} />;
   if (page === "Privacy") return <PrivacyPage />;
   if (page === "Settings") return <SettingsPage />;
@@ -311,12 +323,18 @@ function Overview({
   sessions: SessionSummary[];
   sources: SourceSummary[];
 }) {
+  const observedInput =
+    summary.totals.prompt_tokens +
+    summary.totals.cache_read_tokens +
+    summary.totals.cache_write_tokens;
+  const generatedTokens = summary.totals.completion_tokens + summary.totals.reasoning_tokens;
   return (
     <div className="page-grid">
-      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, bundled, manual pricing" />
-      <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub="prompt, output, cache, reasoning" />
+      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, manual, local CodexBar pricing" />
+      <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub={`${compact(observedInput)} input incl. cache, ${compact(generatedTokens)} generated`} />
       <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.cache.cache_read_tokens)} observed reads`} />
       <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
+      <TrendPanel title="Token usage over time" rows={summary.daily} />
       <TrendPanel title="Usage by source" rows={summary.by_source} />
       <TrendPanel title="Usage by model" rows={summary.by_model} />
       <SessionsTable title="Top expensive sessions" sessions={sessions.slice(0, 8)} />
@@ -357,8 +375,12 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       completion_tokens: 0,
       cache_read_tokens: 0,
       cache_write_tokens: 0,
+      reasoning_tokens: 0,
       total_tokens: summary.totals.prompt_tokens,
-      estimated_cost_usd: 0
+      estimated_cost_usd: 0,
+      standard_tokens: summary.totals.prompt_tokens,
+      priority_tokens: 0,
+      priority_estimated_cost_usd: 0
     },
     {
       name: "cache read",
@@ -366,8 +388,12 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       completion_tokens: 0,
       cache_read_tokens: summary.totals.cache_read_tokens,
       cache_write_tokens: 0,
+      reasoning_tokens: 0,
       total_tokens: summary.totals.cache_read_tokens,
-      estimated_cost_usd: 0
+      estimated_cost_usd: 0,
+      standard_tokens: summary.totals.cache_read_tokens,
+      priority_tokens: 0,
+      priority_estimated_cost_usd: 0
     },
     {
       name: "cache write",
@@ -375,8 +401,12 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       completion_tokens: 0,
       cache_read_tokens: 0,
       cache_write_tokens: summary.totals.cache_write_tokens,
+      reasoning_tokens: 0,
       total_tokens: summary.totals.cache_write_tokens,
-      estimated_cost_usd: 0
+      estimated_cost_usd: 0,
+      standard_tokens: summary.totals.cache_write_tokens,
+      priority_tokens: 0,
+      priority_estimated_cost_usd: 0
     }
   ];
   return (
@@ -407,6 +437,17 @@ function BurnReport({ summary }: { summary: DashboardSummary }) {
       <Metric label="Biggest session" value={summary.expensive_sessions[0] ? money(summary.expensive_sessions[0].estimated_cost_usd) : "$0.00"} sub={summary.expensive_sessions[0]?.session_id ?? "no sessions yet"} />
       <Metric label="Biggest model" value={summary.by_model[0]?.name ?? "unknown"} sub={summary.by_model[0] ? money(summary.by_model[0].estimated_cost_usd) : "no spend"} />
       <Metric label="Unpriced tokens" value={compact(unpricedTokens)} sub={`${unpriced.length} model rows need pricing`} />
+      <Metric label="Codex limit drain" value="not measured" sub="fast mode is not inferred from cache reads" />
+      <TrendPanel title="Model spend" rows={summary.by_model} metric="cost" />
+      <AccountingNote
+        title="Codex subscription accounting"
+        badge="separate ledger"
+      >
+        Dirtydash estimates tokenized API-style cost from imported logs. Codex subscription
+        limits can drain from a different fast-mode ledger, especially when xhigh sessions
+        produce uncached input, output, and reasoning tokens. A low cache-read dollar estimate
+        should not be read as total fast-mode consumption.
+      </AccountingNote>
       <SessionsTable title="Sessions to inspect first" sessions={summary.expensive_sessions} />
     </div>
   );
@@ -453,7 +494,19 @@ function SessionsPage({ sessions }: { sessions: SessionSummary[] }) {
   return <SessionsTable title="Searchable sessions" sessions={sessions} />;
 }
 
-function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
+function PricingPage({
+  pricing,
+  usageRows
+}: {
+  pricing: PricingRecord[];
+  usageRows: NamedUsagePoint[];
+}) {
+  const usageByModel = useMemo(
+    () => new Map(usageRows.map((row) => [row.name, row])),
+    [usageRows]
+  );
+  const maxUsage = Math.max(1, ...usageRows.map((row) => row.total_tokens));
+  const maxCost = Math.max(0.01, ...usageRows.map((row) => row.estimated_cost_usd));
   return (
     <section className="panel wide">
       <div className="panel-header">
@@ -466,6 +519,7 @@ function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
             <tr>
               <th>Provider</th>
               <th>Model</th>
+              <th>Usage</th>
               <th>Input</th>
               <th>Output</th>
               <th>Cache read</th>
@@ -474,25 +528,47 @@ function PricingPage({ pricing }: { pricing: PricingRecord[] }) {
             </tr>
           </thead>
           <tbody>
-            {pricing.map((row) => (
-              <tr key={`${row.provider}-${row.model}`}>
-                <td>{row.provider}</td>
-                <td>{row.model}</td>
-                <td>{money(row.input_rate)}</td>
-                <td>{money(row.output_rate)}</td>
-                <td>{money(row.cache_read_rate)}</td>
-                <td>{money(row.cache_write_rate)}</td>
-                <td>
-                  <Status
-                    value={row.local_free_flag ? "free" : row.override_flag ? "override" : row.snapshot_version}
-                    tone={row.override_flag || row.local_free_flag ? "info" : "neutral"}
-                  />
-                </td>
-              </tr>
-            ))}
+            {pricing.map((row) => {
+              const usage = usageByModel.get(row.model);
+              return (
+                <tr key={`${row.provider}-${row.model}`}>
+                  <td>{row.provider}</td>
+                  <td>{row.model}</td>
+                  <td>
+                    {usage ? (
+                      <div className="pricing-usage">
+                        <UsageBar row={usage} max={maxUsage} compactMode />
+                        <UsageSummary row={usage} />
+                        <UsageBar row={usage} max={maxCost} metric="cost" compactMode />
+                        <UsageSummary row={usage} metric="cost" />
+                      </div>
+                    ) : (
+                      <span className="raw-path">not imported</span>
+                    )}
+                  </td>
+                  <td>{money(row.input_rate)}</td>
+                  <td>{money(row.output_rate)}</td>
+                  <td>{money(row.cache_read_rate)}</td>
+                  <td>{money(row.cache_write_rate)}</td>
+                  <td>
+                    <Status
+                      value={row.local_free_flag ? "free" : row.override_flag ? "override" : "bundled"}
+                      tone={row.override_flag || row.local_free_flag ? "info" : "neutral"}
+                    />
+                    <span className="pricing-version">
+                      {row.source_label} / {row.provider}/{row.model} / {row.snapshot_version}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
+      <p className="table-note">
+        Rates are per 1M tokens for cost estimation. Cache-read pricing is not the same thing as
+        Codex fast-mode subscription usage.
+      </p>
     </section>
   );
 }
@@ -558,13 +634,24 @@ function Breakdown({ title, rows }: { title: string; rows: NamedUsagePoint[] }) 
   return <TrendPanel title={title} rows={rows} className="wide" />;
 }
 
-function TrendPanel({ title, rows, className = "" }: { title: string; rows: NamedUsagePoint[]; className?: string }) {
-  const max = Math.max(1, ...rows.map((row) => row.total_tokens));
+function TrendPanel({
+  title,
+  rows,
+  className = "",
+  metric = "tokens"
+}: {
+  title: string;
+  rows: NamedUsagePoint[];
+  className?: string;
+  metric?: UsageBarMetric;
+}) {
+  const max = Math.max(metric === "cost" ? 0.01 : 1, ...rows.map((row) => barValue(row, metric)));
+  const hasPriority = rows.some((row) => priorityBarValue(row, metric) > 0);
   return (
     <section className={`panel ${className}`}>
       <div className="panel-header">
         <h2>{title}</h2>
-        <span>{rows.length} rows</span>
+        <span>{hasPriority ? `${rows.length} rows, yellow is fast/priority` : `${rows.length} rows`}</span>
       </div>
       <div className="bar-list">
         {rows.length === 0 ? <Empty text="No imported usage yet." /> : null}
@@ -574,15 +661,97 @@ function TrendPanel({ title, rows, className = "" }: { title: string; rows: Name
               <span>{row.name || "unknown"}</span>
               <small>{money(row.estimated_cost_usd)}</small>
             </div>
-            <div className="bar-track" aria-hidden="true">
-              <span style={{ width: `${Math.max(4, (row.total_tokens / max) * 100)}%` }} />
-            </div>
-            <small>{compact(row.total_tokens)} tokens</small>
+            <UsageBar row={row} max={max} metric={metric} />
+            <UsageSummary row={row} metric={metric} />
           </div>
         ))}
       </div>
     </section>
   );
+}
+
+function UsageBar({
+  row,
+  max,
+  metric = "tokens",
+  compactMode = false
+}: {
+  row: NamedUsagePoint;
+  max: number;
+  metric?: UsageBarMetric;
+  compactMode?: boolean;
+}) {
+  const value = barValue(row, metric);
+  const priorityValue = priorityBarValue(row, metric);
+  const fill = value > 0 ? Math.max(compactMode ? 3 : 4, (value / max) * 100) : 0;
+  const priorityWidth = value > 0 ? Math.min(fill, fill * (priorityValue / value)) : 0;
+  const priorityLeft = Math.max(0, fill - priorityWidth);
+  const totalLabel = metric === "cost" ? money(value) : `${compact(value)} tokens`;
+  const priorityLabel =
+    metric === "cost" ? money(priorityValue) : `${compact(priorityValue)} priority/fast tokens`;
+  const label =
+    priorityValue > 0
+      ? `${row.name || "unknown"}: ${totalLabel}, ${priorityLabel}`
+      : `${row.name || "unknown"}: ${totalLabel}`;
+
+  return (
+    <div
+      className={compactMode ? "bar-track compact" : "bar-track"}
+      data-metric={metric}
+      role="img"
+      aria-label={label}
+      title={label}
+    >
+      <span className="bar-fill" style={{ width: `${fill}%` }} />
+      {priorityValue > 0 ? (
+        <span
+          className="bar-priority"
+          style={{ left: `${priorityLeft}%`, width: `${priorityWidth}%` }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function UsageSummary({ row, metric = "tokens" }: { row: NamedUsagePoint; metric?: UsageBarMetric }) {
+  const inputWithCache = row.prompt_tokens + row.cache_read_tokens + row.cache_write_tokens;
+  const generated = row.completion_tokens + row.reasoning_tokens;
+  if (metric === "cost") {
+    return (
+      <small className="token-summary">
+        <span>{money(row.estimated_cost_usd)} total</span>
+        {row.priority_estimated_cost_usd > 0 ? (
+          <span className="fast-label" title={`${money(row.priority_estimated_cost_usd)} priority/fast spend`}>
+            {money(row.priority_estimated_cost_usd)} fast
+          </span>
+        ) : null}
+      </small>
+    );
+  }
+  return (
+    <small className="token-summary">
+      <span>{compact(row.total_tokens)} tokens</span>
+      <span title={`${compact(inputWithCache)} input tokens including cached reads`}>
+        {compact(inputWithCache)} input
+      </span>
+      <span title={`${compact(generated)} output tokens`}>
+        {compact(generated)} output
+      </span>
+      {row.priority_tokens > 0 ? (
+        <span className="fast-label" title={`${compact(row.priority_tokens)} priority/fast tokens`}>
+          {compact(row.priority_tokens)} fast
+        </span>
+      ) : null}
+    </small>
+  );
+}
+
+function barValue(row: NamedUsagePoint, metric: UsageBarMetric) {
+  return metric === "cost" ? row.estimated_cost_usd : row.total_tokens;
+}
+
+function priorityBarValue(row: NamedUsagePoint, metric: UsageBarMetric) {
+  return metric === "cost" ? row.priority_estimated_cost_usd : row.priority_tokens;
 }
 
 function SessionsTable({ title, sessions }: { title: string; sessions: SessionSummary[] }) {
@@ -635,6 +804,26 @@ function Metric({ label, value, sub }: { label: string; value: string; sub: stri
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{sub}</small>
+    </section>
+  );
+}
+
+function AccountingNote({
+  title,
+  badge,
+  children
+}: {
+  title: string;
+  badge: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="panel note-panel wide">
+      <div className="panel-header">
+        <h2>{title}</h2>
+        <span>{badge}</span>
+      </div>
+      <p>{children}</p>
     </section>
   );
 }
