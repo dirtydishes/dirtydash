@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TUI-inspired mockup routes</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.105 0.023 276);
+      --surface: oklch(0.145 0.026 276);
+      --surface-2: oklch(0.18 0.034 276);
+      --line: oklch(0.335 0.047 269);
+      --text: oklch(0.91 0.025 262);
+      --muted: oklch(0.7 0.04 264);
+      --soft: oklch(0.58 0.045 264);
+      --cyan: oklch(0.78 0.15 206);
+      --green: oklch(0.74 0.15 151);
+      --yellow: oklch(0.82 0.14 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        linear-gradient(90deg, oklch(0.128 0.026 274) 0 1px, transparent 1px 100%),
+        linear-gradient(180deg, oklch(0.128 0.026 274) 0 1px, transparent 1px 100%),
+        var(--bg);
+      background-size: 44px 44px;
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.58;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 68px;
+    }
+
+    header {
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 16px;
+    }
+
+    h1, h2, code, pre, .meta span {
+      font-family: var(--mono);
+      letter-spacing: 0;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 2rem;
+      line-height: 1.15;
+    }
+
+    h2 {
+      margin: 0 0 10px;
+      color: var(--cyan);
+      font-size: 1rem;
+    }
+
+    p { max-width: 76ch; margin: 0 0 12px; color: var(--muted); }
+    ul { margin: 0; padding-left: 1.15rem; color: var(--muted); }
+    li + li { margin-top: 6px; }
+    section {
+      padding: 20px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    code {
+      color: var(--cyan);
+      background: oklch(0.12 0.02 276);
+      border: 1px solid oklch(0.32 0.044 269);
+      padding: 0.08rem 0.28rem;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .meta span {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--muted);
+      padding: 5px 8px;
+      font-size: 0.82rem;
+    }
+
+    .diff {
+      margin: 12px 0 0;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.09 0.018 276);
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      color: oklch(0.86 0.026 262);
+      font-size: 0.86rem;
+      line-height: 1.5;
+      white-space: pre;
+    }
+
+    .file { color: var(--cyan); }
+    .hunk { color: var(--yellow); }
+    .add { color: var(--green); }
+    .del { color: var(--red); }
+    .note { color: var(--soft); }
+    .ok { color: var(--green); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TUI-inspired mockup routes</h1>
+      <p>Added four standalone Dirtydash design mockups at <code>/mock1</code>, <code>/mock2</code>, <code>/mock3</code>, and <code>/mock4</code>. They lean toward an enhanced TUI workflow with panes, command context, keyboard shortcuts, dense rows, and inline inspectors instead of conventional dashboard cards.</p>
+      <div class="meta">
+        <span>Issue: dirtydash-0g1</span>
+        <span>Date: 2026-06-18</span>
+        <span>Scope: React mock routes, CSS, bundled dashboard build</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The dashboard now has four visual studies for a developer-focused Dirtydash interface: Run Ledger, Source Matrix, Session Inspector, and Local Ops. Each route works without backend API data, supports shared hotkeys, and keeps the current product’s local-first usage/cost/provenance domain visible.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Added route detection for <code>/mock1</code> through <code>/mock4</code> before the normal API-backed dashboard renders.</li>
+        <li>Built mock datasets for sessions, sources, and models so the mockups can run from the Vite dev server or bundled static app without API responses.</li>
+        <li>Added a shared mock shell with route shortcuts, command context, sort controls, view controls, active-row cursor state, and an inspector rail.</li>
+        <li>Added route-specific surfaces for ledger review, source/model matrix inspection, session search/provenance, and local ops/runbook workflows.</li>
+        <li>Regenerated the bundled dashboard assets under <code>dashboard/dist/</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>Dirtydash is for technical developers who already trust terminal workflows, but the requested direction was not a literal terminal clone. The mockups use terminal-native concepts like command buffers, cursors, panes, and key hints while preserving web strengths: responsive layout, clickable controls, readable inspectors, sticky structure, and safe horizontal scrolling for dense data.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <ul>
+        <li><code>s</code> cycles sorting by cost, tokens, and cache; <code>v</code> cycles view modes; <code>j/k</code> move the active session; number keys jump between mock routes.</li>
+        <li>The normal app still fetches live API data on existing routes. Mock routes skip that loading path so they remain stable design artifacts.</li>
+        <li>The Rust server already falls back to <code>index.html</code>, so direct static requests for <code>/mock1</code> and friends resolve to the React app.</li>
+        <li>Responsive fixes keep the page itself from horizontally overflowing while preserving internal scroll for dense table panes.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p class="note">Focused unified diff excerpts are shown here. The full generated dashboard bundle diff is intentionally omitted because it is build output.</p>
+      <div class="diff">
+        <pre><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="hunk">@@ -154,7 +154,22 @@ const navItems = [</span>
+   ["Doctor", ListChecks]
+ ] as const;
+
+<span class="add">+type MockRoute = "mock1" | "mock2" | "mock3" | "mock4";</span>
+<span class="add">+</span>
+<span class="add">+const mockNavItems: { route: MockRoute; href: string; label: string; note: string }[] = [</span>
+<span class="add">+  { route: "mock1", href: "/mock1", label: "Run Ledger", note: "cost + cache spine" },</span>
+<span class="add">+  { route: "mock2", href: "/mock2", label: "Source Matrix", note: "machines x models" },</span>
+<span class="add">+  { route: "mock3", href: "/mock3", label: "Session Inspector", note: "search + provenance" },</span>
+<span class="add">+  { route: "mock4", href: "/mock4", label: "Local Ops", note: "import, pricing, doctor" }</span>
+<span class="add">+];</span>
+
+ function App() {
+<span class="add">+  const mockRoute = getMockRoute(window.location.pathname);</span>
+   const [page, setPage] = useState("Overview");
+
+<span class="hunk">@@ -166,6 +233,11 @@ function App() {</span>
+   const [error, setError] = useState&lt;string | null&gt;(null);
+
+   useEffect(() =&gt; {
+<span class="add">+    if (mockRoute) {</span>
+<span class="add">+      setLoading(false);</span>
+<span class="add">+      setError(null);</span>
+<span class="add">+      return;</span>
+<span class="add">+    }</span>
+     let active = true;
+
+<span class="hunk">@@ -215,6 +287,8 @@ function App() {</span>
+     );
+   }, [query, sessions]);
+
+<span class="add">+  if (mockRoute) return &lt;MockRoutePage route={mockRoute} /&gt;;</span>
+<span class="add">+</span>
+   return (
+     &lt;main className="app-shell"&gt;</code></pre>
+      </div>
+
+      <div class="diff">
+        <pre><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="hunk">@@ -352,6 +430,43 @@ async function fetchJson&lt;T&gt;(url: string): Promise&lt;T&gt; {</span>
+<span class="add">+type MockSort = "cost" | "tokens" | "cache";</span>
+<span class="add">+type MockView = "inspect" | "trace" | "compare";</span>
+<span class="add">+</span>
+<span class="add">+function MockRoutePage({ route }: { route: MockRoute }) {</span>
+<span class="add">+  const [sort, setSort] = useState&lt;MockSort&gt;("cost");</span>
+<span class="add">+  const [view, setView] = useState&lt;MockView&gt;("inspect");</span>
+<span class="add">+  const [activeIndex, setActiveIndex] = useState(0);</span>
+<span class="add">+  const sortedSessions = useMemo(() =&gt; {</span>
+<span class="add">+    const key =</span>
+<span class="add">+      sort === "cost"</span>
+<span class="add">+        ? (session: (typeof mockSessions)[number]) =&gt; session.cost</span>
+<span class="add">+        : sort === "tokens"</span>
+<span class="add">+          ? (session: (typeof mockSessions)[number]) =&gt; session.tokens</span>
+<span class="add">+          : (session: (typeof mockSessions)[number]) =&gt; session.cache;</span>
+<span class="add">+    return [...mockSessions].sort((a, b) =&gt; key(b) - key(a));</span>
+<span class="add">+  }, [sort]);</span>
+<span class="add">+</span>
+<span class="add">+  useEffect(() =&gt; {</span>
+<span class="add">+    function onKeyDown(event: KeyboardEvent) {</span>
+<span class="add">+      if (event.metaKey || event.ctrlKey || event.altKey) return;</span>
+<span class="add">+      if (event.key &gt;= "1" &amp;&amp; event.key &lt;= "4") {</span>
+<span class="add">+        const target = mockNavItems[Number(event.key) - 1];</span>
+<span class="add">+        if (target) window.location.href = target.href;</span>
+<span class="add">+      }</span>
+<span class="add">+      if (event.key.toLowerCase() === "s") setSort((current) =&gt; cycleValue(mockSorts, current));</span>
+<span class="add">+      if (event.key.toLowerCase() === "v") setView((current) =&gt; cycleValue(mockViews, current));</span>
+<span class="add">+      if (event.key.toLowerCase() === "j") setActiveIndex((current) =&gt; Math.min(sortedSessions.length - 1, current + 1));</span>
+<span class="add">+      if (event.key.toLowerCase() === "k") setActiveIndex((current) =&gt; Math.max(0, current - 1));</span>
+<span class="add">+    }</span>
+<span class="add">+    window.addEventListener("keydown", onKeyDown);</span>
+<span class="add">+    return () =&gt; window.removeEventListener("keydown", onKeyDown);</span>
+<span class="add">+  }, [sortedSessions.length]);</span></code></pre>
+      </div>
+
+      <div class="diff">
+        <pre><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="hunk">@@ -555,3 +555,43 @@ code {</span>
+<span class="add">+.mock-shell {</span>
+<span class="add">+  min-height: 100vh;</span>
+<span class="add">+  display: grid;</span>
+<span class="add">+  grid-template-columns: 252px minmax(0, 1fr);</span>
+<span class="add">+  overflow-x: clip;</span>
+<span class="add">+  background:</span>
+<span class="add">+    linear-gradient(90deg, oklch(0.128 0.026 274) 0 1px, transparent 1px 100%),</span>
+<span class="add">+    linear-gradient(180deg, oklch(0.128 0.026 274) 0 1px, transparent 1px 100%),</span>
+<span class="add">+    oklch(0.105 0.023 276);</span>
+<span class="add">+  background-size: 42px 42px;</span>
+<span class="add">+  color: var(--ink);</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.mock-layout {</span>
+<span class="add">+  min-height: 0;</span>
+<span class="add">+  min-width: 0;</span>
+<span class="add">+  display: grid;</span>
+<span class="add">+  grid-template-columns: minmax(0, 1fr) 330px;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.mock-primary-pane {</span>
+<span class="add">+  display: grid;</span>
+<span class="add">+  grid-template-columns: minmax(0, 1fr);</span>
+<span class="add">+  align-content: start;</span>
+<span class="add">+  gap: 18px;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.mock-ledger,</span>
+<span class="add">+.mock-matrix,</span>
+<span class="add">+.mock-session-list {</span>
+<span class="add">+  border: 1px solid oklch(0.335 0.047 269);</span>
+<span class="add">+  background: oklch(0.128 0.026 276);</span>
+<span class="add">+  overflow: auto;</span>
+<span class="add">+}</span></code></pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>Users and reviewers can now compare four concrete directions for the next Dirtydash UI without disturbing the existing dashboard. The strongest ideas are the persistent inspector, visible hotkey model, dense pane layout, and provenance-first session handling.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li class="ok">Ran <code>npm run build</code> in <code>dashboard/</code>.</li>
+        <li class="ok">Opened <code>/mock1</code>, <code>/mock2</code>, <code>/mock3</code>, and <code>/mock4</code> through local Chrome automation.</li>
+        <li class="ok">Verified desktop headings and text did not overflow on all four routes.</li>
+        <li class="ok">Verified hotkeys changed state: <code>s</code> switched sort, <code>v</code> switched view, and <code>j</code> moved the selected session.</li>
+        <li class="ok">Verified mobile page width on <code>/mock3</code> stayed contained at 390px while the session pane retained internal horizontal scrolling.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>The mockups use static sample data by design. This keeps the routes deterministic, but the next implementation pass would need to bind these layouts to real dashboard data.</li>
+        <li>The visual direction intentionally uses dense panes and horizontal data scrolling. Mobile containment was validated, but a production version should decide which tables become condensed summaries on very small screens.</li>
+        <li>The root <code>package-lock.json</code> file was already untracked and was not included in this work.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <ul>
+        <li>Choose the preferred direction or combine the best pieces into one production route.</li>
+        <li>Wire hotkeys to a real command/search model, including <code>/</code> focus and accessible shortcut documentation.</li>
+        <li>Move mock-only data into fixtures if these routes stay around as a design lab.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

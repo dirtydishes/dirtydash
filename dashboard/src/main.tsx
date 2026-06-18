@@ -154,7 +154,74 @@ const navItems = [
   ["Doctor", ListChecks]
 ] as const;
 
+type MockRoute = "mock1" | "mock2" | "mock3" | "mock4";
+
+const mockNavItems: { route: MockRoute; href: string; label: string; note: string }[] = [
+  { route: "mock1", href: "/mock1", label: "Run Ledger", note: "cost + cache spine" },
+  { route: "mock2", href: "/mock2", label: "Source Matrix", note: "machines x models" },
+  { route: "mock3", href: "/mock3", label: "Session Inspector", note: "search + provenance" },
+  { route: "mock4", href: "/mock4", label: "Local Ops", note: "import, pricing, doctor" }
+];
+
+const mockSessions = [
+  {
+    id: "sess_07f4a9",
+    project: "~/dev/dirtydash",
+    source: "codex",
+    model: "gpt-5-codex",
+    tokens: 1849200,
+    cost: 42.18,
+    cache: 0.63,
+    status: "priced"
+  },
+  {
+    id: "sess_91dd20",
+    project: "~/work/ledgerctl",
+    source: "claude-code",
+    model: "opus-4.1",
+    tokens: 1102400,
+    cost: 31.92,
+    cache: 0.41,
+    status: "needs review"
+  },
+  {
+    id: "sess_c8b73e",
+    project: "~/dev/dirtydash",
+    source: "codex",
+    model: "gpt-5-mini",
+    tokens: 722800,
+    cost: 5.77,
+    cache: 0.78,
+    status: "priced"
+  },
+  {
+    id: "sess_448af1",
+    project: "~/lab/parser-fixtures",
+    source: "cursor",
+    model: "gpt-4.1",
+    tokens: 391400,
+    cost: 7.64,
+    cache: 0.18,
+    status: "partial"
+  }
+];
+
+const mockSources = [
+  { name: "local-mbp", tool: "codex", files: 348, errors: 0, freshness: "41s", tokens: 2920000 },
+  { name: "rack-mini", tool: "claude-code", files: 112, errors: 2, freshness: "9m", tokens: 1040000 },
+  { name: "studio-linux", tool: "cursor", files: 64, errors: 1, freshness: "22m", tokens: 580000 },
+  { name: "archive", tool: "codexbar", files: 19, errors: 0, freshness: "2h", tokens: 210000 }
+];
+
+const mockModels = [
+  { name: "gpt-5-codex", tokens: 1849200, cost: 42.18, cache: 0.63 },
+  { name: "opus-4.1", tokens: 1102400, cost: 31.92, cache: 0.41 },
+  { name: "gpt-5-mini", tokens: 722800, cost: 5.77, cache: 0.78 },
+  { name: "gpt-4.1", tokens: 391400, cost: 7.64, cache: 0.18 }
+];
+
 function App() {
+  const mockRoute = getMockRoute(window.location.pathname);
   const [page, setPage] = useState("Overview");
   const [summary, setSummary] = useState<DashboardSummary>(emptySummary);
   const [sources, setSources] = useState<SourceSummary[]>([]);
@@ -166,6 +233,11 @@ function App() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (mockRoute) {
+      setLoading(false);
+      setError(null);
+      return;
+    }
     let active = true;
     async function load() {
       setLoading(true);
@@ -195,7 +267,7 @@ function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [mockRoute]);
 
   const filteredSessions = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -214,6 +286,8 @@ function App() {
         .includes(normalized)
     );
   }, [query, sessions]);
+
+  if (mockRoute) return <MockRoutePage route={mockRoute} />;
 
   return (
     <main className="app-shell">
@@ -278,10 +352,489 @@ function App() {
   );
 }
 
+function getMockRoute(pathname: string): MockRoute | null {
+  const route = pathname.replace(/^\/+/, "").split("/")[0];
+  return route === "mock1" || route === "mock2" || route === "mock3" || route === "mock4"
+    ? route
+    : null;
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url} returned ${response.status}`);
   return (await response.json()) as T;
+}
+
+type MockSort = "cost" | "tokens" | "cache";
+type MockView = "inspect" | "trace" | "compare";
+
+const mockSorts: MockSort[] = ["cost", "tokens", "cache"];
+const mockViews: MockView[] = ["inspect", "trace", "compare"];
+
+function MockRoutePage({ route }: { route: MockRoute }) {
+  const [sort, setSort] = useState<MockSort>("cost");
+  const [view, setView] = useState<MockView>("inspect");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const routeIndex = mockNavItems.findIndex((item) => item.route === route);
+  const sortedSessions = useMemo(() => {
+    const key =
+      sort === "cost"
+        ? (session: (typeof mockSessions)[number]) => session.cost
+        : sort === "tokens"
+          ? (session: (typeof mockSessions)[number]) => session.tokens
+          : (session: (typeof mockSessions)[number]) => session.cache;
+    return [...mockSessions].sort((a, b) => key(b) - key(a));
+  }, [sort]);
+  const activeSession = sortedSessions[Math.min(activeIndex, sortedSessions.length - 1)];
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key >= "1" && event.key <= "4") {
+        const target = mockNavItems[Number(event.key) - 1];
+        if (target) window.location.href = target.href;
+      }
+      if (event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        setSort((current) => cycleValue(mockSorts, current));
+      }
+      if (event.key.toLowerCase() === "v") {
+        event.preventDefault();
+        setView((current) => cycleValue(mockViews, current));
+      }
+      if (event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        setActiveIndex((current) => Math.min(sortedSessions.length - 1, current + 1));
+      }
+      if (event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setActiveIndex((current) => Math.max(0, current - 1));
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [sortedSessions.length]);
+
+  useEffect(() => {
+    setActiveIndex((current) => Math.min(current, sortedSessions.length - 1));
+  }, [sortedSessions.length]);
+
+  return (
+    <main className={`mock-shell mock-${route}`}>
+      <aside className="mock-rail" aria-label="Mockup routes">
+        <a className="mock-brand" href="/">
+          <Terminal size={18} aria-hidden="true" />
+          <span>dirtydash</span>
+          <code>mock/{routeIndex + 1}</code>
+        </a>
+        <nav className="mock-route-list">
+          {mockNavItems.map((item, index) => (
+            <a
+              key={item.route}
+              className={item.route === route ? "mock-route active" : "mock-route"}
+              href={item.href}
+            >
+              <kbd>{index + 1}</kbd>
+              <span>{item.label}</span>
+              <small>{item.note}</small>
+            </a>
+          ))}
+        </nav>
+        <div className="mock-hotkeys">
+          <span>hotkeys</span>
+          <dl>
+            <div>
+              <dt>s</dt>
+              <dd>sort {sort}</dd>
+            </div>
+            <div>
+              <dt>v</dt>
+              <dd>view {view}</dd>
+            </div>
+            <div>
+              <dt>j/k</dt>
+              <dd>move cursor</dd>
+            </div>
+          </dl>
+        </div>
+      </aside>
+
+      <section className="mock-workspace">
+        <MockCommandBar route={route} sort={sort} view={view} setSort={setSort} setView={setView} />
+        {route === "mock1" ? (
+          <MockRunLedger sessions={sortedSessions} activeSession={activeSession} activeIndex={activeIndex} sort={sort} view={view} />
+        ) : null}
+        {route === "mock2" ? (
+          <MockSourceMatrix sessions={sortedSessions} activeSession={activeSession} activeIndex={activeIndex} sort={sort} view={view} />
+        ) : null}
+        {route === "mock3" ? (
+          <MockSessionInspector sessions={sortedSessions} activeSession={activeSession} activeIndex={activeIndex} sort={sort} view={view} />
+        ) : null}
+        {route === "mock4" ? (
+          <MockLocalOps sessions={sortedSessions} activeSession={activeSession} sort={sort} view={view} />
+        ) : null}
+      </section>
+    </main>
+  );
+}
+
+function MockCommandBar({
+  route,
+  sort,
+  view,
+  setSort,
+  setView
+}: {
+  route: MockRoute;
+  sort: MockSort;
+  view: MockView;
+  setSort: React.Dispatch<React.SetStateAction<MockSort>>;
+  setView: React.Dispatch<React.SetStateAction<MockView>>;
+}) {
+  const title = mockNavItems.find((item) => item.route === route)?.label ?? "Mockup";
+  return (
+    <header className="mock-command">
+      <div className="mock-prompt" aria-label="Current command context">
+        <span>dirtydash</span>
+        <code>{title.toLowerCase().replace(/\s+/g, "-")}</code>
+        <span>--sort</span>
+        <code>{sort}</code>
+        <span>--view</span>
+        <code>{view}</code>
+      </div>
+      <div className="mock-controls" aria-label="Mockup controls">
+        {mockSorts.map((value) => (
+          <button
+            key={value}
+            type="button"
+            className={value === sort ? "active" : ""}
+            onClick={() => setSort(value)}
+          >
+            sort:{value}
+          </button>
+        ))}
+        {mockViews.map((value) => (
+          <button
+            key={value}
+            type="button"
+            className={value === view ? "active" : ""}
+            onClick={() => setView(value)}
+          >
+            view:{value}
+          </button>
+        ))}
+      </div>
+    </header>
+  );
+}
+
+function MockRunLedger({
+  sessions,
+  activeSession,
+  activeIndex,
+  sort,
+  view
+}: {
+  sessions: typeof mockSessions;
+  activeSession: (typeof mockSessions)[number];
+  activeIndex: number;
+  sort: MockSort;
+  view: MockView;
+}) {
+  return (
+    <div className="mock-layout ledger-layout">
+      <section className="mock-primary-pane">
+        <MockHeadline
+          title="Run ledger"
+          text="A cost-and-cache spine for developers who want the interesting rows first, with keyboard sorting and a cursor that never hides provenance."
+        />
+        <div className="mock-stat-strip">
+          <MockStat label="observed spend" value="$87.51" detail="4 priced tools" />
+          <MockStat label="cache read" value="61%" detail="input incl. reads" />
+          <MockStat label="unpriced" value="2 rows" detail="parser needs price" />
+          <MockStat label="freshness" value="41s" detail="local-mbp import" />
+        </div>
+        <div className="mock-ledger" role="table" aria-label="Run ledger sorted sessions">
+          <div className="mock-ledger-head" role="row">
+            <span>cursor</span>
+            <span>session</span>
+            <span>model</span>
+            <span>tokens</span>
+            <span>cost</span>
+            <span>cache</span>
+            <span>status</span>
+          </div>
+          {sessions.map((session, index) => (
+            <div
+              key={session.id}
+              className={index === activeIndex ? "mock-ledger-row active" : "mock-ledger-row"}
+              role="row"
+            >
+              <span aria-label={index === activeIndex ? "selected" : "not selected"}>
+                {index === activeIndex ? ">" : " "}
+              </span>
+              <code>{session.id}</code>
+              <span>{session.model}</span>
+              <span>{compact(session.tokens)}</span>
+              <span>{money(session.cost)}</span>
+              <MockInlineMeter value={session.cache} label={`${percent(session.cache)} cache read`} />
+              <span>{session.status}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+      <MockInspector activeSession={activeSession} sort={sort} view={view} />
+    </div>
+  );
+}
+
+function MockSourceMatrix({
+  sessions,
+  activeSession,
+  activeIndex,
+  sort,
+  view
+}: {
+  sessions: typeof mockSessions;
+  activeSession: (typeof mockSessions)[number];
+  activeIndex: number;
+  sort: MockSort;
+  view: MockView;
+}) {
+  return (
+    <div className="mock-layout matrix-layout">
+      <section className="mock-primary-pane">
+        <MockHeadline
+          title="Source matrix"
+          text="Machines, tools, and models share one dense surface: the user can see which importer is stale, which model is expensive, and where cache behavior is trustworthy."
+        />
+        <div className="mock-matrix" role="table" aria-label="Source and model usage matrix">
+          <div className="mock-matrix-head" role="row">
+            <span>source</span>
+            {mockModels.map((model) => (
+              <span key={model.name}>{model.name}</span>
+            ))}
+            <span>fresh</span>
+          </div>
+          {mockSources.map((source, sourceIndex) => (
+            <div key={source.name} className="mock-matrix-row" role="row">
+              <span>
+                <code>{source.name}</code>
+                <small>{source.tool} / {source.files} files</small>
+              </span>
+              {mockModels.map((model, modelIndex) => {
+                const weight = ((sourceIndex + 2) * (modelIndex + 3)) % 10;
+                return (
+                  <span key={model.name} className="mock-cell" data-weight={weight}>
+                    {weight > 2 ? compact(Math.round((source.tokens * (weight + 2)) / 18)) : "-"}
+                  </span>
+                );
+              })}
+              <span className={source.errors > 0 ? "mock-warn-text" : "mock-good-text"}>
+                {source.errors > 0 ? `${source.errors} err` : source.freshness}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div className="mock-log-pane" aria-label="Import log excerpt">
+          <p><code>import</code> local-mbp/codex parsed 348 files, 0 errors, 41s ago</p>
+          <p><code>price</code> gpt-5-codex mapped to bundled snapshot 2026-06</p>
+          <p><code>warn</code> rack-mini/claude-code has 2 records without final stop timestamp</p>
+        </div>
+      </section>
+      <MockInspector activeSession={activeSession ?? sessions[activeIndex]} sort={sort} view={view} />
+    </div>
+  );
+}
+
+function MockSessionInspector({
+  sessions,
+  activeSession,
+  activeIndex,
+  sort,
+  view
+}: {
+  sessions: typeof mockSessions;
+  activeSession: (typeof mockSessions)[number];
+  activeIndex: number;
+  sort: MockSort;
+  view: MockView;
+}) {
+  return (
+    <div className="mock-layout inspector-layout">
+      <section className="mock-primary-pane">
+        <MockHeadline
+          title="Session inspector"
+          text="Search behaves like a command buffer, but the result surface stays web-native: sticky columns, readable provenance, and fast sort pivots."
+        />
+        <div className="mock-command-line" aria-label="Mock search command">
+          <Search size={15} aria-hidden="true" />
+          <span>session where project:dirtydash sort:{sort} view:{view}</span>
+          <kbd>/</kbd>
+        </div>
+        <div className="mock-session-list">
+          {sessions.map((session, index) => (
+            <div key={session.id} className={index === activeIndex ? "mock-session-row active" : "mock-session-row"}>
+              <span>{index === activeIndex ? ">" : " "}</span>
+              <code>{session.id}</code>
+              <span>{session.project}</span>
+              <span>{session.source}</span>
+              <span>{compact(session.tokens)}</span>
+              <span>{money(session.cost)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="mock-trace">
+          <span>trace</span>
+          <ol>
+            <li>raw span located in <code>~/.codex/sessions/2026/06/18/{activeSession.id}.jsonl</code></li>
+            <li>parser normalized prompt, cache read, output, and reasoning tokens</li>
+            <li>pricing snapshot attached before rollup so cost remains auditable</li>
+          </ol>
+        </div>
+      </section>
+      <MockInspector activeSession={activeSession} sort={sort} view={view} />
+    </div>
+  );
+}
+
+function MockLocalOps({
+  sessions,
+  activeSession,
+  sort,
+  view
+}: {
+  sessions: typeof mockSessions;
+  activeSession: (typeof mockSessions)[number];
+  sort: MockSort;
+  view: MockView;
+}) {
+  return (
+    <div className="mock-layout ops-layout">
+      <section className="mock-primary-pane">
+        <MockHeadline
+          title="Local ops"
+          text="A durable control surface for imports, doctor checks, and pricing overrides. It keeps commands visible but gives users web-grade scanning and safer state changes."
+        />
+        <div className="mock-ops-grid">
+          <MockOpsLane title="import queue" rows={["codex local ready", "rack-mini ssh stale", "cursor archive paused"]} />
+          <MockOpsLane title="doctor" rows={["0 schema drift", "2 parse warnings", "pricing snapshot current"]} />
+          <MockOpsLane title="privacy" rows={["metadata-only default", "no remote agent install", "raw previews disabled"]} />
+        </div>
+        <div className="mock-runbook">
+          <span>next commands</span>
+          <code>dirtydash import --metadata-only --source codex</code>
+          <code>dirtydash doctor --explain</code>
+          <code>dirtydash pricing list --overrides</code>
+        </div>
+      </section>
+      <MockInspector activeSession={activeSession ?? sessions[0]} sort={sort} view={view} />
+    </div>
+  );
+}
+
+function MockHeadline({ title, text }: { title: string; text: string }) {
+  return (
+    <div className="mock-headline">
+      <div>
+        <h1>{title}</h1>
+        <p>{text}</p>
+      </div>
+      <div className="mock-status-line">
+        <Status value="local" tone="good" />
+        <Status value="no cards" tone="info" />
+        <Status value="keyboard-first" tone="neutral" />
+      </div>
+    </div>
+  );
+}
+
+function MockStat({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <div className="mock-stat">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  );
+}
+
+function MockInspector({
+  activeSession,
+  sort,
+  view
+}: {
+  activeSession: (typeof mockSessions)[number];
+  sort: MockSort;
+  view: MockView;
+}) {
+  return (
+    <aside className="mock-inspector" aria-label="Selected session inspector">
+      <div className="mock-inspector-title">
+        <span>selected</span>
+        <code>{activeSession.id}</code>
+      </div>
+      <dl className="mock-detail-list">
+        <div>
+          <dt>project</dt>
+          <dd>{activeSession.project}</dd>
+        </div>
+        <div>
+          <dt>model</dt>
+          <dd>{activeSession.model}</dd>
+        </div>
+        <div>
+          <dt>tokens</dt>
+          <dd>{compact(activeSession.tokens)}</dd>
+        </div>
+        <div>
+          <dt>cost</dt>
+          <dd>{money(activeSession.cost)}</dd>
+        </div>
+        <div>
+          <dt>cache read</dt>
+          <dd>{percent(activeSession.cache)}</dd>
+        </div>
+        <div>
+          <dt>mode</dt>
+          <dd>{view} / sort:{sort}</dd>
+        </div>
+      </dl>
+      <div className="mock-provenance">
+        <span>provenance</span>
+        <code>parser=codex-jsonl</code>
+        <code>pricing=bundled-2026-06</code>
+        <code>raw=~/.codex/sessions/.../{activeSession.id}.jsonl</code>
+      </div>
+    </aside>
+  );
+}
+
+function MockInlineMeter({ value, label }: { value: number; label: string }) {
+  return (
+    <span className="mock-inline-meter" role="img" aria-label={label} title={label}>
+      <span style={{ width: `${Math.round(value * 100)}%` }} />
+    </span>
+  );
+}
+
+function MockOpsLane({ title, rows }: { title: string; rows: string[] }) {
+  return (
+    <div className="mock-ops-lane">
+      <h2>{title}</h2>
+      {rows.map((row) => (
+        <p key={row}>
+          <span aria-hidden="true">::</span>
+          {row}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+function cycleValue<T>(values: T[], current: T): T {
+  const index = values.indexOf(current);
+  return values[(index + 1) % values.length];
 }
 
 function Page({
