@@ -65,6 +65,7 @@ type DashboardSummary = {
   daily: NamedUsagePoint[];
   by_source: NamedUsagePoint[];
   by_model: NamedUsagePoint[];
+  by_reasoning_effort: NamedUsagePoint[];
   by_project: NamedUsagePoint[];
   expensive_sessions: SessionSummary[];
 };
@@ -99,7 +100,7 @@ type DoctorReport = {
 
 type WorkspaceId = "ledger" | "sources" | "sessions" | "ops";
 type LedgerPaneId = "daily" | "chart" | "sessions" | "inspector";
-type SortMode = "cost" | "tokens" | "cache";
+type SortMode = "day" | "cost" | "tokens";
 type ViewMode = "inspect" | "trace" | "compare";
 type ChartType = "bar" | "line" | "histogram";
 type Tone = "good" | "warn" | "danger" | "info" | "neutral";
@@ -127,25 +128,25 @@ const emptySummary: DashboardSummary = {
   daily: [],
   by_source: [],
   by_model: [],
+  by_reasoning_effort: [],
   by_project: [],
   expensive_sessions: []
 };
 
 const workspaces: {
   id: WorkspaceId;
-  number: number;
   label: string;
   command: string;
   tabs: string[];
   icon: React.ComponentType<{ size?: number; "aria-hidden"?: string | boolean }>;
 }[] = [
-  { id: "ledger", number: 1, label: "Ledger", command: "daily", tabs: ["daily", "sessions", "inspector"], icon: Gauge },
-  { id: "sources", number: 2, label: "Sources", command: "matrix", tabs: ["matrix", "imports", "freshness"], icon: HardDrive },
-  { id: "sessions", number: 3, label: "Sessions", command: "search", tabs: ["search", "provenance", "trace"], icon: Terminal },
-  { id: "ops", number: 4, label: "Ops", command: "doctor", tabs: ["import", "pricing", "privacy", "settings", "doctor"], icon: Settings }
+  { id: "ledger", label: "Ledger", command: "daily", tabs: ["daily", "sessions", "inspector"], icon: Gauge },
+  { id: "sources", label: "Sources", command: "matrix", tabs: ["matrix", "imports", "freshness"], icon: HardDrive },
+  { id: "sessions", label: "Sessions", command: "search", tabs: ["search", "provenance", "trace"], icon: Terminal },
+  { id: "ops", label: "Ops", command: "doctor", tabs: ["import", "pricing", "privacy", "settings", "doctor"], icon: Settings }
 ];
 
-const sortModes: SortMode[] = ["cost", "tokens", "cache"];
+const sortModes: SortMode[] = ["day", "cost", "tokens"];
 const viewModes: ViewMode[] = ["inspect", "trace", "compare"];
 const chartTypes: ChartType[] = ["bar", "line", "histogram"];
 const ledgerPaneOrder: LedgerPaneId[] = ["daily", "chart", "sessions", "inspector"];
@@ -167,7 +168,7 @@ function App() {
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
   const [selectedSessionCursor, setSelectedSessionCursor] = useState(0);
   const [activePane, setActivePane] = useState<LedgerPaneId>("daily");
-  const [sortMode, setSortMode] = useState<SortMode>("cost");
+  const [sortMode, setSortMode] = useState<SortMode>("day");
   const [viewMode, setViewMode] = useState<ViewMode>("inspect");
   const [chartType, setChartType] = useState<ChartType>("bar");
   const [query, setQuery] = useState("");
@@ -249,7 +250,7 @@ function App() {
   }, [selectedDay]);
 
   const normalizedQuery = query.trim().toLowerCase();
-  const ledgerRows = summary.daily;
+  const ledgerRows = useMemo(() => sortDailyRows(summary.daily, sortMode), [summary.daily, sortMode]);
   const selectedDayIndex = Math.max(
     0,
     ledgerRows.findIndex((row) => row.name === selectedDay)
@@ -347,9 +348,10 @@ function App() {
 
     function onKeyDown(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.key === "Tab" && activeWorkspace === "ledger" && !shortcutsOpen) {
+      if (event.key === "Tab" && !shortcutsOpen) {
         event.preventDefault();
-        movePane(event.shiftKey ? -1 : 1);
+        if (activeWorkspace === "ledger") movePane(event.shiftKey ? -1 : 1);
+        else moveTab(event.shiftKey ? -1 : 1);
         return;
       }
       if (isTypingTarget(event.target)) return;
@@ -462,9 +464,10 @@ function App() {
           <span>dirtydash</span>
         </a>
         <nav className="workspace-rail">
-          {workspaces.map((workspace) => {
+          {workspaces.map((workspace, index) => {
             const Icon = workspace.icon;
             const active = activeWorkspace === workspace.id;
+            const shortcut = String(index + 1);
             return (
               <button
                 key={workspace.id}
@@ -472,8 +475,9 @@ function App() {
                 className={active ? "rail-button active" : "rail-button"}
                 onClick={() => setActiveWorkspace(workspace.id)}
                 aria-current={active ? "page" : undefined}
+                title={`${workspace.label}. Shortcut: ${shortcut}`}
               >
-                <kbd>{workspace.number}</kbd>
+                <kbd>{shortcut}</kbd>
                 <Icon size={16} aria-hidden="true" />
                 <span>{workspace.label}</span>
               </button>
@@ -500,6 +504,7 @@ function App() {
               onChange={(event) => setQuery(event.target.value)}
               placeholder="search sessions, projects, paths"
               aria-label="Search sessions, projects, paths"
+              title="Search. Shortcut: /"
             />
             <kbd>/</kbd>
           </label>
@@ -508,6 +513,7 @@ function App() {
             type="button"
             onClick={() => setShortcutsOpen(true)}
             aria-label="Show shortcuts"
+            title="Show shortcuts. Shortcut: ?"
           >
             <Keyboard size={17} aria-hidden="true" />
           </button>
@@ -515,11 +521,11 @@ function App() {
 
         <div className="workspace-header">
           <div>
-            <h1>{activeConfig.number} {activeConfig.label}</h1>
+            <h1>{activeConfig.label}</h1>
             <div className="mode-strip" aria-label="Dashboard state">
-              <ModePill label="sort" value={sortMode} />
-              <ModePill label="view" value={viewMode} />
-              <ModePill label="chart" value={chartType} />
+              <ModePill label="sort" value={sortMode} shortcut="s" />
+              <ModePill label="view" value={viewMode} shortcut="v" />
+              <ModePill label="chart" value={chartType} shortcut="g" />
               <ModePill label="rows" value={String(ledgerRows.length)} />
             </div>
           </div>
@@ -626,85 +632,85 @@ function LedgerWorkspace({
   onSelectSession: (index: number) => void;
   onSelectPane: (pane: LedgerPaneId) => void;
 }) {
-  const selectedDayIndex = Math.max(
-    0,
-    summary.daily.findIndex((row) => row.name === selectedDay)
-  );
-  const chartRows = useMemo(() => [...summary.daily].reverse(), [summary.daily]);
+  const sortedDays = useMemo(() => sortDailyRows(summary.daily, sortMode), [summary.daily, sortMode]);
+  const chartRows = useMemo(() => [...sortedDays].reverse(), [sortedDays]);
   const selectedChartIndex = Math.max(
     0,
     chartRows.findIndex((row) => row.name === selectedDay)
   );
 
   return (
-    <div className="ledger-grid">
-      <section
-        className={paneClassName("ledger-pane", activePane === "daily")}
-        aria-label="Daily usage ledger"
-        data-pane="daily"
-        tabIndex={0}
-        onFocus={() => onSelectPane("daily")}
-      >
-        <PaneTitle
-          title="daily usage"
-          meta={summary.daily.length ? `newest first, ${summary.daily.length} days` : "no days"}
-        />
-        <DailyLedger
-          rows={summary.daily}
-          selectedDay={selectedDay}
+    <div className="ledger-workspace">
+      <UsageGlance summary={summary} />
+      <div className="ledger-grid">
+        <section
+          className={paneClassName("ledger-pane", activePane === "daily")}
+          aria-label="Daily usage ledger"
+          data-pane="daily"
+          tabIndex={0}
+          onFocus={() => onSelectPane("daily")}
+        >
+          <PaneTitle
+            title="daily usage"
+            meta={summary.daily.length ? `${sortMode} sort, ${summary.daily.length} days` : "no days"}
+          />
+          <DailyLedger
+            rows={sortedDays}
+            selectedDay={selectedDay}
+            sortMode={sortMode}
+            onSelectDay={onSelectDay}
+          />
+        </section>
+
+        <section
+          className={paneClassName("chart-pane", activePane === "chart")}
+          aria-label="Usage chart"
+          data-pane="chart"
+          tabIndex={0}
+          onFocus={() => onSelectPane("chart")}
+        >
+          <PaneTitle
+            title={`${chartType} chart`}
+            meta={selectedDayRow ? selectedDayRow.name : "waiting"}
+          />
+          <UsageChart
+            rows={chartRows}
+            selectedIndex={selectedChartIndex}
+            chartType={chartType}
+            sortMode={sortMode}
+            onSelect={onSelectDay}
+          />
+        </section>
+
+        <section
+          className={paneClassName("sessions-pane", activePane === "sessions")}
+          aria-label="Selected day sessions"
+          data-pane="sessions"
+          tabIndex={0}
+          onFocus={() => onSelectPane("sessions")}
+        >
+          <PaneTitle
+            title="selected-day sessions"
+            meta={dayLoading ? "loading" : `${daySessions.length} rows`}
+          />
+          <SessionRows
+            sessions={sortSessions(daySessions, sortMode)}
+            cursor={selectedSessionCursor}
+            onSelect={onSelectSession}
+            compact
+          />
+        </section>
+
+        <Inspector
+          day={selectedDayRow}
+          session={selectedSession}
+          viewMode={viewMode}
           sortMode={sortMode}
-          onSelectDay={onSelectDay}
+          active={activePane === "inspector"}
+          paneId="inspector"
+          onFocusPane={() => onSelectPane("inspector")}
         />
-      </section>
-
-      <section
-        className={paneClassName("chart-pane", activePane === "chart")}
-        aria-label="Usage chart"
-        data-pane="chart"
-        tabIndex={0}
-        onFocus={() => onSelectPane("chart")}
-      >
-        <PaneTitle
-          title={`${chartType} chart`}
-          meta={selectedDayRow ? selectedDayRow.name : "waiting"}
-        />
-        <UsageChart
-          rows={chartRows}
-          selectedIndex={selectedChartIndex}
-          chartType={chartType}
-          sortMode={sortMode}
-          onSelect={onSelectDay}
-        />
-      </section>
-
-      <section
-        className={paneClassName("sessions-pane", activePane === "sessions")}
-        aria-label="Selected day sessions"
-        data-pane="sessions"
-        tabIndex={0}
-        onFocus={() => onSelectPane("sessions")}
-      >
-        <PaneTitle
-          title="selected-day sessions"
-          meta={dayLoading ? "loading" : `${daySessions.length} rows`}
-        />
-        <SessionRows
-          sessions={sortSessions(daySessions, sortMode)}
-          cursor={selectedSessionCursor}
-          onSelect={onSelectSession}
-          compact
-        />
-      </section>
-
-      <Inspector
-        day={selectedDayRow}
-        session={selectedSession}
-        viewMode={viewMode}
-        sortMode={sortMode}
-        active={activePane === "inspector"}
-        paneId="inspector"
-        onFocusPane={() => onSelectPane("inspector")}
-      />
+      </div>
     </div>
   );
 }
@@ -790,7 +796,7 @@ function SessionsWorkspace({
     return (
       <div className="split-grid">
         <section className="pane">
-          <PaneTitle title="trace details" meta={selectedSession?.session_id ?? "none"} />
+          <PaneTitle title="trace details" meta={selectedSession ? sessionLabel(selectedSession) : "none"} />
           <TracePanel session={selectedSession} viewMode={viewMode} />
         </section>
         <Inspector session={selectedSession} viewMode={viewMode} sortMode={sortMode} />
@@ -847,6 +853,35 @@ function OpsWorkspace({
         />
       </section>
     </div>
+  );
+}
+
+function UsageGlance({ summary }: { summary: DashboardSummary }) {
+  const topModel = topUsageShare(summary.by_model, summary.totals.total_tokens);
+  const topEffort = topUsageShare(summary.by_reasoning_effort, summary.totals.total_tokens);
+  return (
+    <section className="usage-glance" aria-label="Ledger usage summary">
+      <div className="glance-primary">
+        <span>cumulative</span>
+        <strong>{money(summary.totals.estimated_cost_usd)}</strong>
+        <small>{compact(summary.totals.total_tokens)} tokens</small>
+      </div>
+      <div>
+        <span>model</span>
+        <strong>{topModel?.name ?? "unknown"}</strong>
+        <small>{topModel ? percent(topModel.share) : "0%"}</small>
+      </div>
+      <div>
+        <span>reasoning</span>
+        <strong>{topEffort?.name ?? "unknown"}</strong>
+        <small>{topEffort ? percent(topEffort.share) : "0%"}</small>
+      </div>
+      <div>
+        <span>cache</span>
+        <strong>{percent(summary.cache.cache_read_share)}</strong>
+        <small>{compact(summary.cache.cache_read_tokens)} read</small>
+      </div>
+    </section>
   );
 }
 
@@ -1106,9 +1141,10 @@ function SessionRows({
             className={active ? "session-row active" : "session-row"}
             role="row"
             onClick={() => onSelect(index)}
+            title={`Session ${session.session_id}`}
           >
             <span aria-hidden="true">{active ? ">" : ""}</span>
-            <code>{session.session_id}</code>
+            <code>{sessionLabel(session)}</code>
             <span>{session.source}</span>
             <span>{session.project_path}</span>
             <span>{session.model}</span>
@@ -1160,13 +1196,14 @@ function Inspector({
       {session ? (
         <>
           <dl className="detail-list">
-            <DetailRow label="session" value={session.session_id} />
+            <DetailRow label="session" value={sessionLabel(session)} />
             <DetailRow label="project" value={session.project_path} />
             <DetailRow label="model" value={session.model} />
             <DetailRow label="source" value={`${session.machine}/${session.source}`} />
             <DetailRow label="confidence" value={percent(session.confidence)} />
           </dl>
           <div className="provenance-stack">
+            <code>id={session.session_id}</code>
             <code>parser={session.parser_name}</code>
             <code>pricing={session.pricing_version}</code>
             <code>raw={session.raw_path}</code>
@@ -1206,7 +1243,7 @@ function ProvenanceTable({ sessions }: { sessions: SessionSummary[] }) {
         <tbody>
           {sessions.map((session) => (
             <tr key={`${session.session_id}-${session.raw_path}`}>
-              <td>{session.session_id}</td>
+              <td title={session.session_id}>{sessionLabel(session)}</td>
               <td>{session.parser_name}</td>
               <td>{session.pricing_version}</td>
               <td><code>{session.raw_path}</code></td>
@@ -1396,19 +1433,23 @@ function Tabs({
   onSelect: (tab: string) => void;
 }) {
   return (
-    <div className="tabs" role="tablist">
-      {tabs.map((tab) => (
-        <button
-          key={tab}
-          type="button"
-          role="tab"
-          aria-selected={activeTab === tab}
-          className={activeTab === tab ? "active" : ""}
-          onClick={() => onSelect(tab)}
-        >
-          {tab}
-        </button>
-      ))}
+    <div className="tabs-wrap">
+      <div className="tabs" role="tablist" aria-label="Workspace views" title="Cycle views with Tab">
+        {tabs.map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === tab}
+            className={activeTab === tab ? "active" : ""}
+            onClick={() => onSelect(tab)}
+            title={`${tab}. Shortcut: Tab`}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+      <span className="tab-hint"><kbd>Tab</kbd> cycles views</span>
     </div>
   );
 }
@@ -1426,9 +1467,9 @@ function paneClassName(className: string, active: boolean) {
   return active ? `pane ${className} active-pane` : `pane ${className}`;
 }
 
-function ModePill({ label, value }: { label: string; value: string }) {
+function ModePill({ label, value, shortcut }: { label: string; value: string; shortcut?: string }) {
   return (
-    <span className="mode-pill">
+    <span className="mode-pill" title={shortcut ? `${label}. Shortcut: ${shortcut}` : undefined}>
       <span>{label}</span>
       <code>{value}</code>
     </span>
@@ -1567,18 +1608,21 @@ function filterSessions(sessions: SessionSummary[], query: string) {
 function sortSessions(sessions: SessionSummary[], mode: SortMode) {
   return [...sessions].sort((a, b) => {
     if (mode === "tokens") return b.total_tokens - a.total_tokens;
-    if (mode === "cache") return sessionCacheProxy(b) - sessionCacheProxy(a);
+    if (mode === "day") return sessionTime(b) - sessionTime(a);
     return b.estimated_cost_usd - a.estimated_cost_usd;
   });
 }
 
-function sessionCacheProxy(session: SessionSummary) {
-  return session.total_tokens === 0 ? 0 : session.confidence * session.total_tokens;
+function sortDailyRows(rows: NamedUsagePoint[], mode: SortMode) {
+  return [...rows].sort((a, b) => {
+    if (mode === "tokens") return b.total_tokens - a.total_tokens;
+    if (mode === "cost") return b.estimated_cost_usd - a.estimated_cost_usd;
+    return b.name.localeCompare(a.name);
+  });
 }
 
 function metricValue(row: NamedUsagePoint, mode: SortMode) {
   if (mode === "cost") return row.estimated_cost_usd;
-  if (mode === "cache") return row.cache_read_tokens;
   return row.total_tokens;
 }
 
@@ -1588,7 +1632,7 @@ function axisValue(value: number, mode: SortMode) {
 }
 
 function chartLabel(row: NamedUsagePoint, mode: SortMode) {
-  return `${row.name}: ${money(row.estimated_cost_usd)}, ${compact(row.total_tokens)} tokens, ${compact(row.cache_read_tokens)} cache, ${compact(row.priority_tokens)} fast, metric ${mode}`;
+  return `${row.name}: ${money(row.estimated_cost_usd)}, ${compact(row.total_tokens)} tokens, ${compact(row.cache_read_tokens)} cache, ${compact(row.priority_tokens)} fast, sort ${mode}`;
 }
 
 function cacheShare(row: NamedUsagePoint) {
@@ -1604,6 +1648,27 @@ function cycleValue<T>(values: T[], current: T): T {
 function cycleValueBy<T>(values: T[], current: T, delta: number): T {
   const index = Math.max(0, values.indexOf(current));
   return values[(index + delta + values.length) % values.length];
+}
+
+function topUsageShare(rows: NamedUsagePoint[], totalTokens: number) {
+  const row = [...rows].sort((a, b) => b.total_tokens - a.total_tokens)[0];
+  if (!row || totalTokens <= 0) return null;
+  return {
+    name: row.name,
+    share: row.total_tokens / totalTokens
+  };
+}
+
+function sessionTime(session: SessionSummary) {
+  const timestamp = session.last_seen ?? session.first_seen;
+  if (!timestamp) return 0;
+  const value = new Date(timestamp).getTime();
+  return Number.isFinite(value) ? value : 0;
+}
+
+function sessionLabel(session: SessionSummary) {
+  const timestamp = session.first_seen ?? session.last_seen;
+  return timestamp ? sessionDate(timestamp) : "unknown time";
 }
 
 function isTypingTarget(target: EventTarget | null) {
@@ -1633,6 +1698,15 @@ function percent(value: number) {
 }
 
 function shortDate(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function sessionDate(value: string) {
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",

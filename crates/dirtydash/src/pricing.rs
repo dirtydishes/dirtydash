@@ -672,6 +672,7 @@ mod tests {
             turn_id: Some("turn-legacy-fast".to_string()),
             provider: "openai-codex".to_string(),
             model: "gpt-5.5-fast".to_string(),
+            reasoning_effort: None,
             prompt_tokens: 100_000,
             completion_tokens: 10_000,
             cache_read_tokens: 0,

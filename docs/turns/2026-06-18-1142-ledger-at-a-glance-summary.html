@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ledger At-A-Glance Summary</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.112 0.021 276);
+      --panel: oklch(0.166 0.03 274);
+      --panel-2: oklch(0.205 0.035 272);
+      --line: oklch(0.34 0.046 270);
+      --ink: oklch(0.92 0.027 262);
+      --muted: oklch(0.7 0.041 264);
+      --cyan: oklch(0.78 0.14 205);
+      --green: oklch(0.75 0.15 151);
+      --yellow: oklch(0.83 0.15 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    header {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2, code, pre, .meta, .tag { font-family: var(--mono); }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 30px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { max-width: 78ch; color: var(--muted); }
+    ul { padding-left: 22px; color: var(--muted); }
+    li + li { margin-top: 7px; }
+    code {
+      color: var(--cyan);
+      background: oklch(0.13 0.024 276);
+      padding: 2px 5px;
+      border: 1px solid oklch(0.28 0.035 270);
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      padding: 4px 7px;
+      color: var(--yellow);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    section { padding: 0 4px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .cell {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .cell strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-family: var(--mono);
+    }
+    pre {
+      margin: 12px 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.095 0.018 276);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .diff code {
+      display: block;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      white-space: pre;
+    }
+    .file { color: var(--yellow); }
+    .ctx { color: var(--muted); }
+    .add { color: var(--green); }
+    .del { color: var(--red); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Ledger At-A-Glance Summary</h1>
+      <p>Added a compact cumulative usage strip above Ledger, backed it with reasoning-effort aggregation, and tightened the dashboard's sort, session naming, and keyboard hints.</p>
+      <div class="meta">
+        <span class="tag">2026-06-18 11:42</span>
+        <span class="tag">dirtydash-ute</span>
+        <span class="tag">dashboard</span>
+        <span class="tag">usage summary</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The Ledger page now leads with the numbers users check first: cumulative cost, cumulative tokens, the most-used model share, reasoning-effort share, and cache read share. The summary is compact, visible before the trace/detail work area, and uses real imported usage data.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Added <code>reasoning_effort</code> to imported usage events, SQLite migration, upsert comparison, and dashboard summary aggregation.</li>
+        <li>Carried Codex reasoning effort from <code>turn_context</code> rows onto later token-count usage rows.</li>
+        <li>Added a Ledger <code>usage-glance</code> strip for cumulative cost, tokens, top model percentage, top reasoning-effort percentage, and cache read share.</li>
+        <li>Changed sort modes to <code>day</code>, <code>cost</code>, and <code>tokens</code>, with day descending as the default.</li>
+        <li>Made session rows use human-readable date/time labels while preserving raw session IDs in hover and provenance details.</li>
+        <li>Added hover shortcut hints and made <code>Tab</code> cycle workspace views outside Ledger.</li>
+        <li>Removed numbered page labels from the top page title.</li>
+        <li>Rebuilt <code>dashboard/dist</code> for the embedded Rust dashboard.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>Dirtydash is a local-first usage instrument. The Ledger page needs to answer "what did this cost and what used the tokens?" immediately, before the user drills into rows, traces, pricing, or provenance. The previous layout had the data available, but the most important cumulative numbers were not promoted as a first-read surface.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <div class="grid">
+        <div class="cell">
+          <strong>Reasoning effort is stored</strong>
+          Imported events now persist normalized effort values: <code>minimal</code>, <code>low</code>, <code>medium</code>, or <code>high</code>.
+        </div>
+        <div class="cell">
+          <strong>Codex context carries forward</strong>
+          Codex token rows inherit effort from the latest <code>turn_context</code>, matching the existing model and turn-id parser behavior.
+        </div>
+        <div class="cell">
+          <strong>Percentages are token shares</strong>
+          The top model and top reasoning effort percentages are calculated against cumulative imported tokens.
+        </div>
+        <div class="cell">
+          <strong>Tab is view navigation</strong>
+          On Sources, Sessions, and Ops, <code>Tab</code> and <code>Shift+Tab</code> cycle the active view instead of walking every focusable control.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p>Focused unified diff excerpts. Generated bundle filenames and large build output are intentionally omitted.</p>
+      <pre class="diff"><code><span class="file">diff --git a/crates/dirtydash/src/db.rs b/crates/dirtydash/src/db.rs</span>
+<span class="ctx">@@ -39,6 +39,7 @@ pub struct DashboardSummary {</span>
+<span class="ctx">     pub by_source: Vec&lt;NamedUsagePoint&gt;,</span>
+<span class="ctx">     pub by_model: Vec&lt;NamedUsagePoint&gt;,</span>
+<span class="add">+    pub by_reasoning_effort: Vec&lt;NamedUsagePoint&gt;,</span>
+<span class="ctx">     pub by_project: Vec&lt;NamedUsagePoint&gt;,</span>
+<span class="ctx">@@ -182,6 +184,7 @@ impl Database {</span>
+<span class="ctx">                 provider TEXT NOT NULL,</span>
+<span class="ctx">                 model TEXT NOT NULL,</span>
+<span class="add">+                reasoning_effort TEXT,</span>
+<span class="ctx">                 prompt_tokens INTEGER NOT NULL DEFAULT 0,</span>
+<span class="ctx">@@ -615,6 +625,7 @@ impl Database {</span>
+<span class="ctx">             by_source: self.grouped_usage("source", 20)?,</span>
+<span class="ctx">             by_model: self.grouped_model_usage(20)?,</span>
+<span class="add">+            by_reasoning_effort: self.grouped_usage("COALESCE(reasoning_effort, 'unknown')", 8)?,</span>
+<span class="ctx">             by_project: self.grouped_usage("project_path", 20)?,</span>
+
+<span class="file">diff --git a/crates/dirtydash/src/importers.rs b/crates/dirtydash/src/importers.rs</span>
+<span class="ctx">@@ -814,6 +817,7 @@ fn parse_codex_jsonl(</span>
+<span class="ctx">     let mut current_model: Option&lt;String&gt; = None;</span>
+<span class="ctx">     let mut current_provider: Option&lt;String&gt; = None;</span>
+<span class="ctx">     let mut current_turn_id: Option&lt;String&gt; = None;</span>
+<span class="add">+    let mut current_reasoning_effort: Option&lt;String&gt; = None;</span>
+<span class="ctx">@@ -837,6 +841,9 @@ fn parse_codex_jsonl(</span>
+<span class="ctx">         if let Some(turn_id) = extract_string(&amp;value, TURN_ID_KEYS) {</span>
+<span class="ctx">             current_turn_id = Some(turn_id);</span>
+<span class="ctx">         }</span>
+<span class="add">+        if let Some(reasoning_effort) = extract_reasoning_effort(&amp;value) {</span>
+<span class="add">+            current_reasoning_effort = Some(reasoning_effort);</span>
+<span class="add">+        }</span>
+
+<span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -149,7 +149,7 @@ const workspaces = [</span>
+<span class="del">-const sortModes: SortMode[] = ["cost", "tokens", "cache"];</span>
+<span class="add">+const sortModes: SortMode[] = ["day", "cost", "tokens"];</span>
+<span class="ctx">@@ -860,6 +860,28 @@ function OpsWorkspace({</span>
+<span class="add">+function UsageGlance({ summary }: { summary: DashboardSummary }) {</span>
+<span class="add">+  const topModel = topUsageShare(summary.by_model, summary.totals.total_tokens);</span>
+<span class="add">+  const topEffort = topUsageShare(summary.by_reasoning_effort, summary.totals.total_tokens);</span>
+<span class="add">+  return (</span>
+<span class="add">+    &lt;section className="usage-glance" aria-label="Ledger usage summary"&gt;</span>
+<span class="add">+      &lt;div className="glance-primary"&gt;</span>
+<span class="add">+        &lt;span&gt;cumulative&lt;/span&gt;</span>
+<span class="add">+        &lt;strong&gt;{money(summary.totals.estimated_cost_usd)}&lt;/strong&gt;</span>
+<span class="add">+        &lt;small&gt;{compact(summary.totals.total_tokens)} tokens&lt;/small&gt;</span>
+<span class="add">+      &lt;/div&gt;</span>
+<span class="add">+      ...</span>
+<span class="add">+    &lt;/section&gt;</span>
+<span class="add">+  );</span>
+<span class="add">+}</span>
+
+<span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -354,6 +354,48 @@ .tabs button.active {</span>
+<span class="add">+.usage-glance {</span>
+<span class="add">+  min-width: 0;</span>
+<span class="add">+  display: grid;</span>
+<span class="add">+  grid-template-columns: minmax(230px, 1.25fr) repeat(3, minmax(150px, 1fr));</span>
+<span class="add">+  border-bottom: 1px solid var(--line);</span>
+<span class="add">+  background: oklch(0.145 0.027 276);</span>
+<span class="add">+}</span></code></pre>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>Users can now land on Ledger and immediately see cumulative spend and token volume, plus the dominant model and reasoning-effort mix. Navigation should also feel calmer because page titles are cleaner, session names scan as timestamps, and tabbing moves between views instead of bouncing through every row and button.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li>Ran <code>npm run build</code> in <code>dashboard/</code>.</li>
+        <li>Ran <code>cargo test</code>; all 22 Rust tests passed.</li>
+        <li>Served the real embedded dashboard with <code>cargo run -- serve --port 0</code>.</li>
+        <li>Used Playwright with system Chrome to capture desktop and mobile screenshots.</li>
+        <li>Verified <code>Tab</code> cycles Ops from <code>import</code> to <code>pricing</code> and <code>Shift+Tab</code> returns to <code>import</code>.</li>
+        <li>Verified the mobile viewport reported no document-level horizontal overflow.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>Existing imported rows will show <code>unknown</code> reasoning effort until the user reimports sources that contain effort metadata.</li>
+        <li>The top model and reasoning percentages are token-share percentages, not event-count percentages. This is intentional because the Ledger is usage-centered.</li>
+        <li>The bundled dashboard assets changed filenames as part of the production build. The document omits those generated hunks to keep review focused.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <ul>
+        <li>No new follow-up issue was filed. A useful later improvement would be a small import hint when reasoning effort is mostly <code>unknown</code>.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
