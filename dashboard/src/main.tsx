@@ -516,6 +516,11 @@ function LedgerWorkspace({
     0,
     summary.daily.findIndex((row) => row.name === selectedDay)
   );
+  const chartRows = useMemo(() => [...summary.daily].reverse(), [summary.daily]);
+  const selectedChartIndex = Math.max(
+    0,
+    chartRows.findIndex((row) => row.name === selectedDay)
+  );
 
   return (
     <div className="ledger-grid">
@@ -538,8 +543,8 @@ function LedgerWorkspace({
           meta={selectedDayRow ? selectedDayRow.name : "waiting"}
         />
         <UsageChart
-          rows={summary.daily}
-          selectedIndex={selectedDayIndex}
+          rows={chartRows}
+          selectedIndex={selectedChartIndex}
           chartType={chartType}
           sortMode={sortMode}
           onSelect={onSelectDay}
@@ -776,13 +781,13 @@ function UsageChart({
   const chartWidth = width - pad.left - pad.right;
   const chartHeight = height - pad.top - pad.bottom;
   const max = Math.max(1, ...rows.map((row) => metricValue(row, sortMode)));
+  const yTicks = [1, 2 / 3, 1 / 3, 0];
   const points = rows.map((row, index) => {
     const x = pad.left + (rows.length <= 1 ? chartWidth / 2 : (index / (rows.length - 1)) * chartWidth);
     const y = pad.top + chartHeight - (metricValue(row, sortMode) / max) * chartHeight;
     return { row, x, y };
   });
-  const activeTooltip = hovered ?? selectedIndex;
-  const tooltipPoint = points[activeTooltip] ?? null;
+  const tooltipPoint = hovered === null ? null : points[hovered] ?? null;
   const linePath = points
     .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`)
     .join(" ");
@@ -791,9 +796,16 @@ function UsageChart({
     <div className="chart-wrap">
       <svg className="usage-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${chartType} usage chart`}>
         <g className="chart-grid">
-          {[0, 1, 2, 3].map((tick) => {
-            const y = pad.top + (chartHeight / 3) * tick;
-            return <line key={tick} x1={pad.left} x2={width - pad.right} y1={y} y2={y} />;
+          {yTicks.map((tick) => {
+            const y = pad.top + chartHeight - chartHeight * tick;
+            return (
+              <React.Fragment key={tick}>
+                <text x={pad.left - 8} y={y + 4} textAnchor="end">
+                  {axisValue(max * tick, sortMode)}
+                </text>
+                <line x1={pad.left} x2={width - pad.right} y1={y} y2={y} />
+              </React.Fragment>
+            );
           })}
         </g>
         {chartType === "line" ? (
@@ -809,8 +821,6 @@ function UsageChart({
           const sharedProps = {
             onMouseEnter: () => setHovered(index),
             onMouseLeave: () => setHovered(null),
-            onFocus: () => setHovered(index),
-            onBlur: () => setHovered(null),
             onClick: () => onSelect(point.row.name),
             tabIndex: 0,
             role: "button",
@@ -859,8 +869,9 @@ function UsageChart({
         })}
         <g className="chart-axis">
           <line x1={pad.left} x2={width - pad.right} y1={pad.top + chartHeight} y2={pad.top + chartHeight} />
-          <text x={pad.left} y={height - 8}>{sortMode}</text>
-          <text x={width - pad.right} y={height - 8} textAnchor="end">{rows[selectedIndex]?.name ?? "no data"}</text>
+          <text x={pad.left} y={height - 8}>{rows[0]?.name ?? "no data"}</text>
+          <text x={(pad.left + width - pad.right) / 2} y={height - 8} textAnchor="middle">{sortMode}</text>
+          <text x={width - pad.right} y={height - 8} textAnchor="end">{rows[rows.length - 1]?.name ?? "no data"}</text>
         </g>
       </svg>
       {tooltipPoint ? (
@@ -1414,6 +1425,11 @@ function metricValue(row: NamedUsagePoint, mode: SortMode) {
   if (mode === "cost") return row.estimated_cost_usd;
   if (mode === "cache") return row.cache_read_tokens;
   return row.total_tokens;
+}
+
+function axisValue(value: number, mode: SortMode) {
+  if (mode === "cost") return money(value);
+  return compact(Math.round(value));
 }
 
 function chartLabel(row: NamedUsagePoint, mode: SortMode) {

@@ -375,6 +375,10 @@ h2 {
   background: oklch(0.145 0.027 276);
 }
 
+.sessions-pane .pane-title {
+  margin-bottom: 16px;
+}
+
 .pane-title {
   position: sticky;
   top: -14px;
@@ -514,6 +518,7 @@ h2 {
   stroke-width: 1;
 }
 
+.chart-grid text,
 .chart-axis text {
   fill: var(--soft);
   font-family: var(--mono);
