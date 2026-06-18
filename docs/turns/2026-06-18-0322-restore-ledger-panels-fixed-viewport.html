@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Restore Ledger Panels Inside Fixed Viewport</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.112 0.021 276);
+      --panel: oklch(0.166 0.03 274);
+      --panel-2: oklch(0.205 0.035 272);
+      --line: oklch(0.34 0.046 270);
+      --ink: oklch(0.92 0.027 262);
+      --muted: oklch(0.7 0.041 264);
+      --cyan: oklch(0.78 0.14 205);
+      --green: oklch(0.75 0.15 151);
+      --yellow: oklch(0.83 0.15 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    header {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2, code, pre, .meta, .tag { font-family: var(--mono); }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 30px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { max-width: 78ch; color: var(--muted); }
+    ul { padding-left: 22px; color: var(--muted); }
+    li + li { margin-top: 7px; }
+    code {
+      color: var(--cyan);
+      background: oklch(0.13 0.024 276);
+      padding: 2px 5px;
+      border: 1px solid oklch(0.28 0.035 270);
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      padding: 4px 7px;
+      color: var(--yellow);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    section { padding: 0 4px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .cell {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .cell strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-family: var(--mono);
+    }
+    .note {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+    pre {
+      margin: 12px 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.095 0.018 276);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .diff code {
+      display: block;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+    }
+    .file { color: var(--yellow); }
+    .ctx { color: var(--muted); }
+    .add { color: var(--green); }
+    .del { color: var(--red); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Restore Ledger Panels Inside Fixed Viewport</h1>
+      <p>Fixed the regression where the Ledger view could collapse into a session-only surface after the viewport lock. The old four-panel Ledger composition is back, while document scrolling stays disabled.</p>
+      <div class="meta">
+        <span class="tag">2026-06-18 03:22</span>
+        <span class="tag">dirtydash-16d</span>
+        <span class="tag">dashboard</span>
+        <span class="tag">regression fix</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The Ledger page now explicitly places its four panes inside the fixed viewport: daily ledger and graph on top, selected-day sessions below them, and the inspector on the right. Medium and narrow breakpoints also receive explicit placements so panels are not auto-placed out of view.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Restored meaningful Ledger row proportions with <code>minmax(300px, 1fr)</code> and <code>minmax(220px, 0.68fr)</code>.</li>
+        <li>Changed <code>.sessions-pane</code> from a global full-span rule to a Ledger-specific placement.</li>
+        <li>Placed <code>.ledger-pane</code>, <code>.chart-pane</code>, <code>.sessions-pane</code>, and <code>.inspector-pane</code> explicitly in the Ledger grid.</li>
+        <li>Adjusted the <code>1180px</code> breakpoint so Ledger uses a two-by-two panel grid instead of hiding later panels.</li>
+        <li>Adjusted the <code>820px</code> breakpoint so all four panels remain visible in one fixed-height column.</li>
+        <li>Rebuilt <code>dashboard/dist</code> so the embedded Rust-served dashboard uses the fixed CSS.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>The previous viewport fix correctly stopped page scrolling, but it changed the Ledger grid from an old scroll-tolerant layout into a clipped fixed-height layout. Auto-placement was too implicit for that constraint. The correction keeps the fixed app shell but makes Ledger panel placement deterministic.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <div class="grid">
+        <div class="cell">
+          <strong>Ledger owns session placement</strong>
+          <code>.sessions-pane</code> no longer globally spans all columns. Inside Ledger it spans columns one and two, leaving the inspector column intact.
+        </div>
+        <div class="cell">
+          <strong>Desktop keeps the old shape</strong>
+          The graph is back beside the ledger table, sessions are below them, and inspector fills the right side.
+        </div>
+        <div class="cell">
+          <strong>Medium widths show all panels</strong>
+          Below <code>1180px</code>, Ledger becomes a two-by-two grid: ledger, chart, sessions, inspector.
+        </div>
+        <div class="cell">
+          <strong>Viewport lock remains</strong>
+          The outer shell still measures to the viewport, and arrow-key navigation does not scroll the document.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p class="note">Focused unified diff excerpts are shown below. The local project does not include <code>@pierre/diffs</code>, so this document uses the styled fallback. Generated bundle hash changes are intentionally omitted.</p>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -352,7 +352,7 @@ h2 {</span>
+<span class="ctx"> .ledger-grid {</span>
+<span class="ctx">   grid-template-columns: minmax(360px, 0.95fr) minmax(360px, 1.15fr) 360px;</span>
+<span class="del">-  grid-template-rows: minmax(0, 1fr) minmax(0, 0.72fr);</span>
+<span class="add">+  grid-template-rows: minmax(300px, 1fr) minmax(220px, 0.68fr);</span>
+<span class="ctx">   align-items: stretch;</span>
+<span class="ctx"> }</span>
+<span class="ctx">@@ -360,11 +360,25 @@ h2 {</span>
+<span class="del">-.full-span,</span>
+<span class="del">-.sessions-pane {</span>
+<span class="add">+.full-span {</span>
+<span class="ctx">   grid-column: 1 / -1;</span>
+<span class="ctx"> }</span>
+<span class="add">+</span>
+<span class="add">+.ledger-grid .ledger-pane {</span>
+<span class="add">+  grid-column: 1;</span>
+<span class="add">+  grid-row: 1;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.ledger-grid .chart-pane {</span>
+<span class="add">+  grid-column: 2;</span>
+<span class="add">+  grid-row: 1;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.ledger-grid .sessions-pane {</span>
+<span class="add">+  grid-column: 1 / 3;</span>
+<span class="add">+  grid-row: 2;</span>
+<span class="add">+}</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -961,19 +975,29 @@ td {</span>
+<span class="del">-  .inspector-pane {</span>
+<span class="del">-    grid-column: 1 / -1;</span>
+<span class="del">-    grid-row: auto;</span>
+<span class="add">+  .ledger-grid .ledger-pane {</span>
+<span class="add">+    grid-column: 1;</span>
+<span class="add">+    grid-row: 1;</span>
+<span class="ctx">   }</span>
+<span class="add">+</span>
+<span class="add">+  .ledger-grid .chart-pane {</span>
+<span class="add">+    grid-column: 2;</span>
+<span class="add">+    grid-row: 1;</span>
+<span class="add">+  }</span>
+<span class="add">+</span>
+<span class="add">+  .ledger-grid .sessions-pane {</span>
+<span class="add">+    grid-column: 1;</span>
+<span class="add">+    grid-row: 2;</span>
+<span class="add">+  }</span>
+<span class="add">+</span>
+<span class="add">+  .ledger-grid .inspector-pane {</span>
+<span class="add">+    grid-column: 2;</span>
+<span class="add">+    grid-row: 2;</span>
+<span class="ctx">   }</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -1027,12 +1051,24 @@ td {</span>
+<span class="ctx">   .ledger-grid,</span>
+<span class="ctx">   .split-grid {</span>
+<span class="ctx">     grid-template-columns: 1fr;</span>
+<span class="ctx">   }</span>
+<span class="add">+</span>
+<span class="add">+  .ledger-grid {</span>
+<span class="add">+    grid-template-rows: repeat(4, minmax(0, 1fr));</span>
+<span class="add">+  }</span>
+<span class="ctx">@@ -1039,6 +1075,14 @@ td {</span>
+<span class="ctx">   .full-span {</span>
+<span class="ctx">     grid-column: 1;</span>
+<span class="ctx">   }</span>
+<span class="add">+</span>
+<span class="add">+  .ledger-grid .ledger-pane,</span>
+<span class="add">+  .ledger-grid .chart-pane,</span>
+<span class="add">+  .ledger-grid .sessions-pane,</span>
+<span class="add">+  .ledger-grid .inspector-pane {</span>
+<span class="add">+    grid-column: 1;</span>
+<span class="add">+    grid-row: auto;</span>
+<span class="add">+  }</span></code></pre>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>The Ledger page once again looks like the Ledger page: graph, daily table, selected-day sessions, and inspector are all visible. Users still get the intended fixed-screen behavior, so arrow keys can navigate selection without browser page movement.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li>Ran <code>npm run build</code> in <code>dashboard/</code>. Vite completed successfully.</li>
+        <li>Ran <code>cargo test</code>. All 21 Rust tests passed.</li>
+        <li>Served the embedded dashboard with <code>cargo run -p dirtydash -- serve --port 4609</code>.</li>
+        <li>Used headless Chrome DevTools checks at <code>1280x720</code>, <code>1100x720</code>, and <code>390x844</code>.</li>
+        <li>Confirmed all four Ledger panels reported visible bounding boxes at each viewport.</li>
+        <li>Confirmed <code>documentElement.scrollHeight</code> and <code>body.scrollHeight</code> matched viewport height at each checked size.</li>
+        <li>Confirmed <code>window.scrollY</code> remained <code>0</code> after pressing <code>ArrowDown</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>The narrow one-column layout necessarily gives each panel less height, but all four panels stay visible inside the fixed frame.</li>
+        <li>Dense table content still scrolls inside panes. That is intentional and avoids returning to document-level page scrolling.</li>
+        <li>The browser verification used Chrome DevTools directly because this repository does not have Playwright installed.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <ul>
+        <li>No follow-up is required for <code>dirtydash-16d</code>.</li>
+        <li>A later polish pass could tune the exact narrow-screen panel heights after hands-on use.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

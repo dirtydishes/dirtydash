@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Single-Screen Keyboard Selection</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.112 0.021 276);
+      --panel: oklch(0.166 0.03 274);
+      --panel-2: oklch(0.205 0.035 272);
+      --line: oklch(0.34 0.046 270);
+      --line-soft: oklch(0.27 0.038 270);
+      --ink: oklch(0.92 0.027 262);
+      --muted: oklch(0.7 0.041 264);
+      --soft: oklch(0.58 0.045 264);
+      --cyan: oklch(0.78 0.14 205);
+      --green: oklch(0.75 0.15 151);
+      --yellow: oklch(0.83 0.15 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    header {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2, h3, code, pre, .meta, .tag {
+      font-family: var(--mono);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 30px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { max-width: 78ch; color: var(--muted); }
+    ul { padding-left: 22px; color: var(--muted); }
+    li + li { margin-top: 7px; }
+    code {
+      color: var(--cyan);
+      background: oklch(0.13 0.024 276);
+      padding: 2px 5px;
+      border: 1px solid oklch(0.28 0.035 270);
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      padding: 4px 7px;
+      color: var(--yellow);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    section { padding: 0 4px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .cell {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .cell strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-family: var(--mono);
+    }
+    .note {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+    pre {
+      margin: 12px 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.095 0.018 276);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .diff code {
+      display: block;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+    }
+    .file { color: var(--yellow); }
+    .ctx { color: var(--muted); }
+    .add { color: var(--green); }
+    .del { color: var(--red); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Single-Screen Keyboard Selection</h1>
+      <p>Locked the Dirtydash dashboard into a single viewport and changed arrow-key behavior so the keys move interface selection instead of scrolling the document.</p>
+      <div class="meta">
+        <span class="tag">2026-06-18 03:13</span>
+        <span class="tag">dirtydash-zv9</span>
+        <span class="tag">dashboard</span>
+        <span class="tag">keyboard ux</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The app shell now fills the viewport and hides document-level overflow. The dashboard content area remains inside that fixed frame, while panes handle their own overflow. Arrow keys are reserved for moving the row cursor, day context, or active tab, so the page does not jump while navigating sessions.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Added sorted session collections in <code>dashboard/src/main.tsx</code> so the selected session, highlighted row, and inspector all follow the same display order.</li>
+        <li>Mapped <code>ArrowUp</code> and <code>ArrowDown</code> to the row cursor, with <code>j</code> and <code>k</code> kept as matching shortcuts.</li>
+        <li>Mapped <code>ArrowLeft</code> and <code>ArrowRight</code> to day changes on Ledger and tab changes elsewhere.</li>
+        <li>Updated the shortcut overlay to document the new arrow-key behavior.</li>
+        <li>Changed <code>dashboard/src/styles.css</code> so <code>html</code>, <code>body</code>, <code>#root</code>, <code>.tui-shell</code>, and <code>.dashboard</code> use a fixed viewport-height frame with hidden document overflow.</li>
+        <li>Rebuilt <code>dashboard/dist</code> so the Rust-embedded dashboard bundle matches the source changes.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>Dirtydash is meant to feel like a compact local instrument for terminal-heavy users. In that context, arrow keys should operate the dashboard selection model. Browser page scrolling makes the interface feel less like a TUI and also means the user can lose the active session area while trying to inspect rows.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <div class="grid">
+        <div class="cell">
+          <strong>Selection follows visible order</strong>
+          The app sorts session arrays before using them as the keyboard cursor source, so the inspector does not drift away from the row that appears selected.
+        </div>
+        <div class="cell">
+          <strong>Document scroll is disabled</strong>
+          The page-level containers use fixed height and hidden overflow. Individual panes retain <code>overflow: auto</code> for dense tables and long paths.
+        </div>
+        <div class="cell">
+          <strong>Arrow keys are consumed</strong>
+          The keyboard handler calls <code>preventDefault()</code> for arrow navigation outside text inputs, which stops the browser from scrolling the page.
+        </div>
+        <div class="cell">
+          <strong>Mobile stays framed</strong>
+          The narrow layout keeps the rail above a fixed-height dashboard area, preserving the no-document-scroll rule.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p class="note">Focused unified diff excerpts are shown below. The project does not include <code>@pierre/diffs</code>, so this document uses the styled fallback. Generated bundle hash changes are intentionally omitted from the snippets.</p>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -256,12 +256,22 @@ function App() {</span>
+<span class="del">-  const selectedSessionSource = activeWorkspace === "ledger" ? daySessions : filteredSessions;</span>
+<span class="add">+  const sortedDaySessions = useMemo(</span>
+<span class="add">+    () =&gt; sortSessions(daySessions, sortMode),</span>
+<span class="add">+    [daySessions, sortMode]</span>
+<span class="add">+  );</span>
+<span class="add">+  const sortedFilteredSessions = useMemo(</span>
+<span class="add">+    () =&gt; sortSessions(filteredSessions, sortMode),</span>
+<span class="add">+    [filteredSessions, sortMode]</span>
+<span class="add">+  );</span>
+<span class="add">+  const selectedSessionSource = activeWorkspace === "ledger" ? sortedDaySessions : sortedFilteredSessions;</span>
+<span class="ctx">   const selectedSession =</span>
+<span class="ctx">     selectedSessionSource[Math.min(selectedSessionCursor, Math.max(0, selectedSessionSource.length - 1))] ??</span>
+<span class="del">-    daySessions[0] ??</span>
+<span class="del">-    filteredSessions[0] ??</span>
+<span class="add">+    sortedDaySessions[0] ??</span>
+<span class="add">+    sortedFilteredSessions[0] ??</span>
+<span class="ctx">     null;</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -310,26 +345,26 @@ function App() {</span>
+<span class="del">-      if (event.key.toLowerCase() === "j") {</span>
+<span class="add">+      if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {</span>
+<span class="ctx">         event.preventDefault();</span>
+<span class="del">-        if (activeWorkspace === "ledger" &amp;&amp; ledgerRows.length) {</span>
+<span class="del">-          const next = Math.min(ledgerRows.length - 1, selectedDayIndex + 1);</span>
+<span class="del">-          setSelectedDay(ledgerRows[next]?.name ?? null);</span>
+<span class="del">-        } else {</span>
+<span class="del">-          setSelectedSessionCursor((current) =&gt;</span>
+<span class="del">-            Math.min(Math.max(0, selectedSessionSource.length - 1), current + 1)</span>
+<span class="del">-          );</span>
+<span class="del">-        }</span>
+<span class="add">+        moveSession(1);</span>
+<span class="ctx">         return;</span>
+<span class="ctx">       }</span>
+<span class="del">-      if (event.key.toLowerCase() === "k") {</span>
+<span class="add">+      if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") {</span>
+<span class="ctx">         event.preventDefault();</span>
+<span class="add">+        moveSession(-1);</span>
+<span class="add">+        return;</span>
+<span class="add">+      }</span>
+<span class="add">+      if (event.key === "ArrowLeft") {</span>
+<span class="add">+        event.preventDefault();</span>
+<span class="add">+        if (activeWorkspace === "ledger") moveDay(-1);</span>
+<span class="add">+        else moveTab(-1);</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -27,7 +27,9 @@</span>
+<span class="ctx"> html,</span>
+<span class="ctx"> body,</span>
+<span class="ctx"> #root {</span>
+<span class="del">-  min-height: 100%;</span>
+<span class="add">+  height: 100%;</span>
+<span class="add">+  min-height: 0;</span>
+<span class="add">+  overflow: hidden;</span>
+<span class="ctx"> }</span>
+<span class="ctx">@@ -78,9 +80,11 @@ code {</span>
+<span class="ctx"> .tui-shell {</span>
+<span class="del">-  min-height: 100vh;</span>
+<span class="add">+  height: 100dvh;</span>
+<span class="add">+  min-height: 0;</span>
+<span class="ctx">   display: grid;</span>
+<span class="ctx">   grid-template-columns: 78px minmax(0, 1fr);</span>
+<span class="add">+  overflow: hidden;</span></code></pre>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>Users can keep their eyes on the dashboard while moving through sessions with the arrow keys. The app no longer behaves like a web page that scrolls away from the active row; it behaves more like the compact local dashboard the product is aiming for.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li>Ran <code>npm run build</code> in <code>dashboard/</code>. Vite completed successfully.</li>
+        <li>Ran <code>cargo test</code>. All 21 Rust tests passed, including CLI tests.</li>
+        <li>Started <code>cargo run -p dirtydash -- serve --port 4609</code> and inspected the embedded app in headless Chrome through the DevTools protocol.</li>
+        <li>At <code>1280x720</code>, Chrome measured <code>documentElement.scrollHeight=720</code>, <code>body.scrollHeight=720</code>, <code>.tui-shell=720</code>, and <code>.dashboard=720</code>.</li>
+        <li>At <code>1280x720</code>, pressing <code>ArrowDown</code> moved the active session index from <code>0</code> to <code>1</code> while <code>window.scrollY</code> stayed <code>0</code>.</li>
+        <li>At <code>390x844</code>, Chrome measured document height equal to viewport height and reported no console, runtime, or network errors.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>Dense panes can still scroll internally. That is intentional, because tables and long paths can exceed the available panel area while the app shell itself stays fixed.</li>
+        <li>On narrow screens, the app preserves the single-screen constraint, but some panes may feel compressed. The mitigation is pane-level overflow rather than document scrolling.</li>
+        <li>The browser smoke test used Chrome headless through the DevTools protocol because Playwright is not installed in this repository.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <ul>
+        <li>No required follow-up remains for <code>dirtydash-zv9</code>.</li>
+        <li>A future pass could add a dedicated keyboard focus model for choosing which pane owns row navigation when multiple panes contain selectable rows.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

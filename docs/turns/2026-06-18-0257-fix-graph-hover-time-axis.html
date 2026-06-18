@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fix Graph Hover, Time Direction, and Axis Scale</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.112 0.021 276);
+      --panel: oklch(0.166 0.03 274);
+      --panel-2: oklch(0.205 0.035 272);
+      --line: oklch(0.34 0.046 270);
+      --line-soft: oklch(0.27 0.038 270);
+      --ink: oklch(0.92 0.027 262);
+      --muted: oklch(0.7 0.041 264);
+      --soft: oklch(0.58 0.045 264);
+      --cyan: oklch(0.78 0.14 205);
+      --green: oklch(0.75 0.15 151);
+      --yellow: oklch(0.83 0.15 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    header {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2, h3, code, pre, .meta, .tag {
+      font-family: var(--mono);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 30px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { max-width: 78ch; color: var(--muted); }
+    ul { padding-left: 22px; color: var(--muted); }
+    li + li { margin-top: 7px; }
+    code {
+      color: var(--cyan);
+      background: oklch(0.13 0.024 276);
+      padding: 2px 5px;
+      border: 1px solid oklch(0.28 0.035 270);
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      padding: 4px 7px;
+      color: var(--yellow);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    section { padding: 0 4px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .cell {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .cell strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-family: var(--mono);
+    }
+    .note {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+    pre {
+      margin: 12px 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.095 0.018 276);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .diff code {
+      display: block;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+    }
+    .file { color: var(--yellow); }
+    .ctx { color: var(--muted); }
+    .add { color: var(--green); }
+    .del { color: var(--red); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Fix Graph Hover, Time Direction, and Axis Scale</h1>
+      <p>Adjusted the dashboard graph so hover details appear only while hovering, time reads left to right with the newest day on the right, and the y-axis shows a visible metric basis.</p>
+      <div class="meta">
+        <span class="tag">2026-06-18 02:57</span>
+        <span class="tag">dirtydash-2n0</span>
+        <span class="tag">dashboard</span>
+        <span class="tag">chart ux</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The ledger still lists daily rows newest first for fast scanning, but the graph now renders those same days chronologically so the current day lands on the right. The tooltip no longer shows by default on the selected day. The selected-day sessions panel also has a little more top breathing room.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Created a chart-only chronological copy of the daily rows with <code>[...summary.daily].reverse()</code>.</li>
+        <li>Mapped the selected day against the chart row order so the active bar or point still follows selection correctly.</li>
+        <li>Changed the chart tooltip so it renders only when <code>hovered</code> has a concrete row index.</li>
+        <li>Added y-axis tick labels derived from the active metric, with compact token values in token and cache modes.</li>
+        <li>Changed the x-axis labels to show the first and last chart days around the active metric name.</li>
+        <li>Added targeted spacing under <code>.sessions-pane .pane-title</code>.</li>
+        <li>Rebuilt <code>dashboard/dist</code> so the embedded static app matches the source.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>The previous chart used the same newest-first row order as the ledger. That made the latest day sit on the left, which fought the usual mental model of time moving forward left to right. The previous tooltip also fell back to the selected day when nothing was hovered, so it looked permanently active.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <div class="grid">
+        <div class="cell">
+          <strong>Ledger order is preserved</strong>
+          The table remains newest first, because that order is useful for scanning recent usage.
+        </div>
+        <div class="cell">
+          <strong>Graph order is visual</strong>
+          Only the chart receives reversed rows, so API shape and table behavior do not change.
+        </div>
+        <div class="cell">
+          <strong>Tooltip state is explicit</strong>
+          <code>null</code> means no hover, so the info panel stays hidden until pointer hover.
+        </div>
+        <div class="cell">
+          <strong>Axis labels follow sort mode</strong>
+          <code>cost</code> uses dollars; <code>tokens</code> and <code>cache</code> use compact token counts.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p class="note">Focused unified diff excerpts are shown below. The local project does not include <code>@pierre/diffs</code>, so this document uses the styled fallback. Generated dist bundle changes are intentionally omitted from the snippets.</p>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -516,6 +516,11 @@ function LedgerWorkspace({</span>
+<span class="add">+  const chartRows = useMemo(() =&gt; [...summary.daily].reverse(), [summary.daily]);</span>
+<span class="add">+  const selectedChartIndex = Math.max(</span>
+<span class="add">+    0,</span>
+<span class="add">+    chartRows.findIndex((row) =&gt; row.name === selectedDay)</span>
+<span class="add">+  );</span>
+<span class="ctx">@@ -538,8 +543,8 @@ function LedgerWorkspace({</span>
+<span class="del">-          rows={summary.daily}</span>
+<span class="del">-          selectedIndex={selectedDayIndex}</span>
+<span class="add">+          rows={chartRows}</span>
+<span class="add">+          selectedIndex={selectedChartIndex}</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -776,13 +781,13 @@ function UsageChart({</span>
+<span class="add">+  const yTicks = [1, 2 / 3, 1 / 3, 0];</span>
+<span class="ctx">@@ -781,8 +786,7 @@ function UsageChart({</span>
+<span class="del">-  const activeTooltip = hovered ?? selectedIndex;</span>
+<span class="del">-  const tooltipPoint = points[activeTooltip] ?? null;</span>
+<span class="add">+  const tooltipPoint = hovered === null ? null : points[hovered] ?? null;</span>
+<span class="ctx">@@ -791,9 +796,16 @@ function UsageChart({</span>
+<span class="del">-          {[0, 1, 2, 3].map((tick) =&gt; {</span>
+<span class="del">-            const y = pad.top + (chartHeight / 3) * tick;</span>
+<span class="del">-            return &lt;line key={tick} x1={pad.left} x2={width - pad.right} y1={y} y2={y} /&gt;;</span>
+<span class="add">+          {yTicks.map((tick) =&gt; {</span>
+<span class="add">+            const y = pad.top + chartHeight - chartHeight * tick;</span>
+<span class="add">+            return (</span>
+<span class="add">+              &lt;React.Fragment key={tick}&gt;</span>
+<span class="add">+                &lt;text x={pad.left - 8} y={y + 4} textAnchor="end"&gt;</span>
+<span class="add">+                  {axisValue(max * tick, sortMode)}</span>
+<span class="add">+                &lt;/text&gt;</span>
+<span class="add">+                &lt;line x1={pad.left} x2={width - pad.right} y1={y} y2={y} /&gt;</span>
+<span class="add">+              &lt;/React.Fragment&gt;</span>
+<span class="add">+            );</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -809,8 +821,6 @@ function UsageChart({</span>
+<span class="ctx">           const sharedProps = {</span>
+<span class="ctx">             onMouseEnter: () =&gt; setHovered(index),</span>
+<span class="ctx">             onMouseLeave: () =&gt; setHovered(null),</span>
+<span class="del">-            onFocus: () =&gt; setHovered(index),</span>
+<span class="del">-            onBlur: () =&gt; setHovered(null),</span>
+<span class="ctx">             onClick: () =&gt; onSelect(point.row.name),</span>
+<span class="ctx">@@ -859,8 +869,9 @@ function UsageChart({</span>
+<span class="del">-          &lt;text x={pad.left} y={height - 8}&gt;{sortMode}&lt;/text&gt;</span>
+<span class="del">-          &lt;text x={width - pad.right} y={height - 8} textAnchor="end"&gt;{rows[selectedIndex]?.name ?? "no data"}&lt;/text&gt;</span>
+<span class="add">+          &lt;text x={pad.left} y={height - 8}&gt;{rows[0]?.name ?? "no data"}&lt;/text&gt;</span>
+<span class="add">+          &lt;text x={(pad.left + width - pad.right) / 2} y={height - 8} textAnchor="middle"&gt;{sortMode}&lt;/text&gt;</span>
+<span class="add">+          &lt;text x={width - pad.right} y={height - 8} textAnchor="end"&gt;{rows[rows.length - 1]?.name ?? "no data"}&lt;/text&gt;</span>
+<span class="ctx">@@ -1416,6 +1427,11 @@ function metricValue(row: NamedUsagePoint, mode: SortMode) {</span>
+<span class="add">+function axisValue(value: number, mode: SortMode) {</span>
+<span class="add">+  if (mode === "cost") return money(value);</span>
+<span class="add">+  return compact(Math.round(value));</span>
+<span class="add">+}</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -375,6 +375,10 @@ h2 {</span>
+<span class="add">+.sessions-pane .pane-title {</span>
+<span class="add">+  margin-bottom: 16px;</span>
+<span class="add">+}</span>
+<span class="ctx">@@ -514,6 +518,7 @@ h2 {</span>
+<span class="add">+.chart-grid text,</span>
+<span class="ctx"> .chart-axis text {</span>
+<span class="ctx">   fill: var(--soft);</span></code></pre>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <ul>
+        <li>The latest usage day now appears at the right edge of the graph, matching the direction users expect time to move.</li>
+        <li>The chart no longer looks like it is constantly showing hover details when the pointer is elsewhere.</li>
+        <li>Token graphs now have visible y-axis values, making bar and point height easier to interpret.</li>
+        <li>The selected-day sessions table has more room below its title, so the pane feels less cramped.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li>Ran <code>npm run build</code> in <code>dashboard/</code>; Vite completed successfully.</li>
+        <li>Checked source with <code>rg</code> to confirm the old <code>activeTooltip</code> fallback and focus-driven tooltip handlers are gone.</li>
+        <li>Started the Vite dev server and attempted a mocked browser verification, but Playwright could not launch because its Chromium executable is not installed in this environment.</li>
+        <li>Rebuilt <code>dashboard/dist</code> after the final source edit.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>No screenshot-based visual check was completed because the local Playwright browser binary is missing. The build and source checks passed.</li>
+        <li>Keyboard focus no longer opens the mouseover tooltip. The chart marks still keep their <code>aria-label</code> values for assistive context, and pointer click selection remains unchanged.</li>
+        <li>The generated dist filenames changed because Vite hashes bundled assets. That is expected when the embedded dashboard is rebuilt.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <p>No follow-up issue was created. A useful later improvement would be a small chart interaction test that can run without a heavyweight browser install, or a documented local Playwright setup for visual QA.</p>
+    </section>
+  </main>
+</body>
+</html>

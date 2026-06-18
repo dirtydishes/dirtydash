@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderValue, Response, StatusCode, Uri};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -33,6 +33,7 @@ async fn serve_async(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         .route("/api/summary", get(summary))
         .route("/api/sources", get(sources))
         .route("/api/sessions", get(sessions))
+        .route("/api/days/:day/sessions", get(day_sessions))
         .route("/api/pricing", get(pricing))
         .route("/api/doctor", get(doctor))
         .fallback(static_asset)
@@ -90,6 +91,19 @@ async fn sessions(
     let db = Database::open(&state.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let sessions = db
         .sessions(100)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    serde_json::to_value(sessions)
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn day_sessions(
+    State(state): State<Arc<AppState>>,
+    AxumPath(day): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let db = Database::open(&state.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let sessions = db
+        .sessions_for_day(&day, 100)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     serde_json::to_value(sessions)
         .map(Json)
