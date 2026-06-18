@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pane-Focused Keyboard Navigation</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.112 0.021 276);
+      --panel: oklch(0.166 0.03 274);
+      --panel-2: oklch(0.205 0.035 272);
+      --line: oklch(0.34 0.046 270);
+      --ink: oklch(0.92 0.027 262);
+      --muted: oklch(0.7 0.041 264);
+      --cyan: oklch(0.78 0.14 205);
+      --green: oklch(0.75 0.15 151);
+      --yellow: oklch(0.83 0.15 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1080px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    header {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2, code, pre, .meta, .tag { font-family: var(--mono); }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 30px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { max-width: 78ch; color: var(--muted); }
+    ul { padding-left: 22px; color: var(--muted); }
+    li + li { margin-top: 7px; }
+    code {
+      color: var(--cyan);
+      background: oklch(0.13 0.024 276);
+      padding: 2px 5px;
+      border: 1px solid oklch(0.28 0.035 270);
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      padding: 4px 7px;
+      color: var(--yellow);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    section { padding: 0 4px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .cell {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .cell strong {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--ink);
+      font-family: var(--mono);
+    }
+    .note {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+    pre {
+      margin: 12px 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.095 0.018 276);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .diff code {
+      display: block;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+    }
+    .file { color: var(--yellow); }
+    .ctx { color: var(--muted); }
+    .add { color: var(--green); }
+    .del { color: var(--red); }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Pane-Focused Keyboard Navigation</h1>
+      <p>Changed Ledger keyboard behavior so selection starts in daily usage, Tab cycles the active pane, and keys operate inside the active pane without moving the page.</p>
+      <div class="meta">
+        <span class="tag">2026-06-18 03:52</span>
+        <span class="tag">dirtydash-715</span>
+        <span class="tag">dashboard</span>
+        <span class="tag">keyboard ux</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The Ledger workspace now has an explicit active pane model. It starts on <code>daily usage</code>, uses <code>Tab</code> and <code>Shift+Tab</code> to cycle through chart, sessions, and inspector, and keeps all scrolling inside the selected pane.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Added <code>LedgerPaneId</code> and <code>activePane</code> state, defaulting to <code>daily</code>.</li>
+        <li>Made Ledger panes focusable with <code>data-pane</code>, <code>tabIndex</code>, and active-pane styling.</li>
+        <li>Changed <code>Tab</code> handling on Ledger to cycle panes instead of moving browser focus through row buttons.</li>
+        <li>Scoped arrow behavior to the active pane: daily and chart move selected day, sessions moves selected session, inspector scrolls.</li>
+        <li>Added <code>PageUp</code> and <code>PageDown</code> to scroll the active Ledger pane.</li>
+        <li>Updated shortcut copy to document pane navigation and pane scrolling.</li>
+        <li>Rebuilt <code>dashboard/dist</code> for the embedded Rust dashboard.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>The fixed viewport is now the right shell behavior, but the app also needs a clear keyboard focus model. Previously, Ledger arrow keys always preferred the selected-day sessions collection. That made the first selection feel wrong because the user enters Ledger looking at daily usage first.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <div class="grid">
+        <div class="cell">
+          <strong>Daily starts active</strong>
+          Ledger initializes and resets to the daily pane when entering the workspace.
+        </div>
+        <div class="cell">
+          <strong>Tab cycles panes</strong>
+          <code>Tab</code> advances through daily, chart, sessions, and inspector. <code>Shift+Tab</code> reverses that order.
+        </div>
+        <div class="cell">
+          <strong>Rows stay visible</strong>
+          The selected daily row and selected session row are scrolled into view inside their own panes.
+        </div>
+        <div class="cell">
+          <strong>Page scroll stays locked</strong>
+          Pane-local scrolling uses the active pane element, so <code>window.scrollY</code> remains zero.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p class="note">Focused unified diff excerpts are shown below. The local project does not include <code>@pierre/diffs</code>, so this document uses the styled fallback. Generated bundle hash changes are intentionally omitted.</p>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -98,6 +98,7 @@ type DoctorReport = {</span>
+<span class="ctx"> type WorkspaceId = "ledger" | "sources" | "sessions" | "ops";</span>
+<span class="add">+type LedgerPaneId = "daily" | "chart" | "sessions" | "inspector";</span>
+<span class="ctx">@@ -147,6 +148,7 @@ const workspaces: {</span>
+<span class="ctx"> const chartTypes: ChartType[] = ["bar", "line", "histogram"];</span>
+<span class="add">+const ledgerPaneOrder: LedgerPaneId[] = ["daily", "chart", "sessions", "inspector"];</span>
+<span class="ctx">@@ -164,6 +166,7 @@ function App() {</span>
+<span class="ctx">   const [selectedSessionCursor, setSelectedSessionCursor] = useState(0);</span>
+<span class="add">+  const [activePane, setActivePane] = useState&lt;LedgerPaneId&gt;("daily");</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -279,6 +282,34 @@ function App() {</span>
+<span class="add">+  useEffect(() =&gt; {</span>
+<span class="add">+    if (activeWorkspace === "ledger") setActivePane("daily");</span>
+<span class="add">+  }, [activeWorkspace]);</span>
+<span class="add">+</span>
+<span class="add">+  useEffect(() =&gt; {</span>
+<span class="add">+    if (activeWorkspace !== "ledger" || shortcutsOpen || loading) return;</span>
+<span class="add">+    document</span>
+<span class="add">+      .querySelector&lt;HTMLElement&gt;(`[data-pane="${activePane}"]`)</span>
+<span class="add">+      ?.focus({ preventScroll: true });</span>
+<span class="add">+  }, [activeWorkspace, activePane, loading, shortcutsOpen]);</span>
+<span class="add">+</span>
+<span class="add">+  useEffect(() =&gt; {</span>
+<span class="add">+    if (activeWorkspace !== "ledger") return;</span>
+<span class="add">+    const selector =</span>
+<span class="add">+      activePane === "daily"</span>
+<span class="add">+        ? '[data-pane="daily"] .ledger-row.active'</span>
+<span class="add">+        : activePane === "sessions"</span>
+<span class="add">+          ? '[data-pane="sessions"] .session-row.active'</span>
+<span class="add">+          : null;</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -347,24 +392,50 @@ function App() {</span>
+<span class="ctx">       if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {</span>
+<span class="ctx">         event.preventDefault();</span>
+<span class="del">-        moveSession(1);</span>
+<span class="add">+        if (activeWorkspace === "ledger") {</span>
+<span class="add">+          if (activePane === "daily" || activePane === "chart") moveDay(1);</span>
+<span class="add">+          else if (activePane === "sessions") moveSession(1);</span>
+<span class="add">+          else scrollActivePane(72);</span>
+<span class="add">+        } else {</span>
+<span class="add">+          moveSession(1);</span>
+<span class="add">+        }</span>
+<span class="ctx">         return;</span>
+<span class="ctx">       }</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="ctx">@@ -395,6 +395,19 @@ h2 {</span>
+<span class="ctx">   overscroll-behavior: contain;</span>
+<span class="ctx"> }</span>
+<span class="add">+</span>
+<span class="add">+.pane:focus {</span>
+<span class="add">+  outline: none;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.pane.active-pane {</span>
+<span class="add">+  outline: 1px solid var(--yellow);</span>
+<span class="add">+  outline-offset: -2px;</span>
+<span class="add">+}</span>
+<span class="add">+</span>
+<span class="add">+.pane.active-pane .pane-title {</span>
+<span class="add">+  border-bottom-color: var(--yellow);</span>
+<span class="add">+}</span></code></pre>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>Ledger keyboard control now starts where the user is looking: daily usage. Users can press <code>Tab</code> to move pane focus, then use arrows or page keys inside that pane without losing the fixed-screen dashboard.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li>Ran <code>npm run build</code> in <code>dashboard/</code>. Vite completed successfully.</li>
+        <li>Ran <code>cargo test</code>. All 21 Rust tests passed.</li>
+        <li>Served the embedded dashboard with <code>cargo run -p dirtydash -- serve --port 4609</code>.</li>
+        <li>Used headless Chrome DevTools to confirm initial active pane and focused element are both <code>daily</code>.</li>
+        <li>Confirmed <code>ArrowDown</code> on daily changes the active day from <code>2026-06-18</code> to <code>2026-06-17</code> with <code>window.scrollY=0</code>.</li>
+        <li>Confirmed <code>Tab</code> moves active pane to <code>chart</code>, then <code>sessions</code>, then <code>inspector</code>.</li>
+        <li>Confirmed <code>ArrowDown</code> on sessions moves the active session index from <code>0</code> to <code>1</code> and scrolls only the sessions pane.</li>
+        <li>Confirmed <code>PageDown</code> on inspector changes only inspector <code>scrollTop</code> and leaves document scroll at zero.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>This pass scopes pane cycling to Ledger, where the multi-pane keyboard model is currently most important.</li>
+        <li>Chart pane arrow keys currently move day selection, matching the chart's selected-day role. It does not add chart-specific point focus beyond the existing SVG point affordances.</li>
+        <li>The browser verification used Chrome DevTools directly because this repository does not have Playwright installed.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <ul>
+        <li>No follow-up is required for <code>dirtydash-715</code>.</li>
+        <li>A later pass could generalize pane cycling across non-Ledger workspaces if those screens gain comparable multi-pane keyboard workflows.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

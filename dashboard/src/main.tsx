@@ -98,6 +98,7 @@ type DoctorReport = {
 };
 
 type WorkspaceId = "ledger" | "sources" | "sessions" | "ops";
+type LedgerPaneId = "daily" | "chart" | "sessions" | "inspector";
 type SortMode = "cost" | "tokens" | "cache";
 type ViewMode = "inspect" | "trace" | "compare";
 type ChartType = "bar" | "line" | "histogram";
@@ -147,6 +148,7 @@ const workspaces: {
 const sortModes: SortMode[] = ["cost", "tokens", "cache"];
 const viewModes: ViewMode[] = ["inspect", "trace", "compare"];
 const chartTypes: ChartType[] = ["bar", "line", "histogram"];
+const ledgerPaneOrder: LedgerPaneId[] = ["daily", "chart", "sessions", "inspector"];
 
 function App() {
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>("ledger");
@@ -164,6 +166,7 @@ function App() {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
   const [selectedSessionCursor, setSelectedSessionCursor] = useState(0);
+  const [activePane, setActivePane] = useState<LedgerPaneId>("daily");
   const [sortMode, setSortMode] = useState<SortMode>("cost");
   const [viewMode, setViewMode] = useState<ViewMode>("inspect");
   const [chartType, setChartType] = useState<ChartType>("bar");
@@ -280,6 +283,34 @@ function App() {
   }, [selectedSessionSource.length]);
 
   useEffect(() => {
+    if (activeWorkspace === "ledger") setActivePane("daily");
+  }, [activeWorkspace]);
+
+  useEffect(() => {
+    if (activeWorkspace !== "ledger" || shortcutsOpen || loading) return;
+    document
+      .querySelector<HTMLElement>(`[data-pane="${activePane}"]`)
+      ?.focus({ preventScroll: true });
+  }, [activeWorkspace, activePane, loading, shortcutsOpen]);
+
+  useEffect(() => {
+    if (activeWorkspace !== "ledger") return;
+    const selector =
+      activePane === "daily"
+        ? '[data-pane="daily"] .ledger-row.active'
+        : activePane === "sessions"
+          ? '[data-pane="sessions"] .session-row.active'
+          : null;
+    if (!selector) return;
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>(selector)?.scrollIntoView({
+        block: "nearest",
+        inline: "nearest"
+      });
+    });
+  }, [activeWorkspace, activePane, selectedDay, selectedSessionCursor, selectedSessionSource.length]);
+
+  useEffect(() => {
     function moveDay(delta: number) {
       if (!ledgerRows.length) return;
       const next = Math.max(0, Math.min(ledgerRows.length - 1, selectedDayIndex + delta));
@@ -305,8 +336,22 @@ function App() {
       }
     }
 
+    function movePane(delta: number) {
+      setActivePane((current) => cycleValueBy(ledgerPaneOrder, current, delta));
+    }
+
+    function scrollActivePane(deltaY: number, deltaX = 0) {
+      const pane = document.querySelector<HTMLElement>(`[data-pane="${activePane}"]`);
+      pane?.scrollBy({ top: deltaY, left: deltaX, behavior: "auto" });
+    }
+
     function onKeyDown(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "Tab" && activeWorkspace === "ledger" && !shortcutsOpen) {
+        event.preventDefault();
+        movePane(event.shiftKey ? -1 : 1);
+        return;
+      }
       if (isTypingTarget(event.target)) return;
 
       if (event.key >= "1" && event.key <= "4") {
@@ -347,24 +392,50 @@ function App() {
       }
       if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {
         event.preventDefault();
-        moveSession(1);
+        if (activeWorkspace === "ledger") {
+          if (activePane === "daily" || activePane === "chart") moveDay(1);
+          else if (activePane === "sessions") moveSession(1);
+          else scrollActivePane(72);
+        } else {
+          moveSession(1);
+        }
         return;
       }
       if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") {
         event.preventDefault();
-        moveSession(-1);
+        if (activeWorkspace === "ledger") {
+          if (activePane === "daily" || activePane === "chart") moveDay(-1);
+          else if (activePane === "sessions") moveSession(-1);
+          else scrollActivePane(-72);
+        } else {
+          moveSession(-1);
+        }
         return;
       }
       if (event.key === "ArrowLeft") {
         event.preventDefault();
-        if (activeWorkspace === "ledger") moveDay(-1);
-        else moveTab(-1);
+        if (activeWorkspace === "ledger") {
+          if (activePane === "daily" || activePane === "chart") moveDay(-1);
+          else scrollActivePane(0, -96);
+        } else moveTab(-1);
         return;
       }
       if (event.key === "ArrowRight") {
         event.preventDefault();
-        if (activeWorkspace === "ledger") moveDay(1);
-        else moveTab(1);
+        if (activeWorkspace === "ledger") {
+          if (activePane === "daily" || activePane === "chart") moveDay(1);
+          else scrollActivePane(0, 96);
+        } else moveTab(1);
+        return;
+      }
+      if (event.key === "PageDown" && activeWorkspace === "ledger") {
+        event.preventDefault();
+        scrollActivePane(window.innerHeight * 0.45);
+        return;
+      }
+      if (event.key === "PageUp" && activeWorkspace === "ledger") {
+        event.preventDefault();
+        scrollActivePane(window.innerHeight * -0.45);
       }
     }
 
@@ -372,6 +443,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     activeWorkspace,
+    activePane,
     activeTab,
     ledgerRows,
     query,
@@ -466,6 +538,7 @@ function App() {
           <Workspace
             activeWorkspace={activeWorkspace}
             activeTab={activeTab}
+            activePane={activePane}
             summary={summary}
             sources={sources}
             sessions={sortedFilteredSessions}
@@ -481,6 +554,7 @@ function App() {
             query={normalizedQuery}
             onSelectDay={setSelectedDay}
             onSelectSession={setSelectedSessionCursor}
+            onSelectPane={setActivePane}
             pricing={pricing}
             doctor={doctor}
           />
@@ -495,6 +569,7 @@ function App() {
 function Workspace(props: {
   activeWorkspace: WorkspaceId;
   activeTab: string;
+  activePane: LedgerPaneId;
   summary: DashboardSummary;
   sources: SourceSummary[];
   sessions: SessionSummary[];
@@ -510,6 +585,7 @@ function Workspace(props: {
   query: string;
   onSelectDay: (day: string) => void;
   onSelectSession: (index: number) => void;
+  onSelectPane: (pane: LedgerPaneId) => void;
   pricing: PricingRecord[];
   doctor: DoctorReport | null;
 }) {
@@ -526,12 +602,14 @@ function LedgerWorkspace({
   selectedDayRow,
   selectedSession,
   selectedSessionCursor,
+  activePane,
   sortMode,
   viewMode,
   chartType,
   dayLoading,
   onSelectDay,
-  onSelectSession
+  onSelectSession,
+  onSelectPane
 }: {
   summary: DashboardSummary;
   daySessions: SessionSummary[];
@@ -539,12 +617,14 @@ function LedgerWorkspace({
   selectedDayRow: NamedUsagePoint | null;
   selectedSession: SessionSummary | null;
   selectedSessionCursor: number;
+  activePane: LedgerPaneId;
   sortMode: SortMode;
   viewMode: ViewMode;
   chartType: ChartType;
   dayLoading: boolean;
   onSelectDay: (day: string) => void;
   onSelectSession: (index: number) => void;
+  onSelectPane: (pane: LedgerPaneId) => void;
 }) {
   const selectedDayIndex = Math.max(
     0,
@@ -558,7 +638,13 @@ function LedgerWorkspace({
 
   return (
     <div className="ledger-grid">
-      <section className="pane ledger-pane" aria-label="Daily usage ledger">
+      <section
+        className={paneClassName("ledger-pane", activePane === "daily")}
+        aria-label="Daily usage ledger"
+        data-pane="daily"
+        tabIndex={0}
+        onFocus={() => onSelectPane("daily")}
+      >
         <PaneTitle
           title="daily usage"
           meta={summary.daily.length ? `newest first, ${summary.daily.length} days` : "no days"}
@@ -571,7 +657,13 @@ function LedgerWorkspace({
         />
       </section>
 
-      <section className="pane chart-pane" aria-label="Usage chart">
+      <section
+        className={paneClassName("chart-pane", activePane === "chart")}
+        aria-label="Usage chart"
+        data-pane="chart"
+        tabIndex={0}
+        onFocus={() => onSelectPane("chart")}
+      >
         <PaneTitle
           title={`${chartType} chart`}
           meta={selectedDayRow ? selectedDayRow.name : "waiting"}
@@ -585,7 +677,13 @@ function LedgerWorkspace({
         />
       </section>
 
-      <section className="pane sessions-pane" aria-label="Selected day sessions">
+      <section
+        className={paneClassName("sessions-pane", activePane === "sessions")}
+        aria-label="Selected day sessions"
+        data-pane="sessions"
+        tabIndex={0}
+        onFocus={() => onSelectPane("sessions")}
+      >
         <PaneTitle
           title="selected-day sessions"
           meta={dayLoading ? "loading" : `${daySessions.length} rows`}
@@ -603,6 +701,9 @@ function LedgerWorkspace({
         session={selectedSession}
         viewMode={viewMode}
         sortMode={sortMode}
+        active={activePane === "inspector"}
+        paneId="inspector"
+        onFocusPane={() => onSelectPane("inspector")}
       />
     </div>
   );
@@ -1025,15 +1126,27 @@ function Inspector({
   day,
   session,
   viewMode,
-  sortMode
+  sortMode,
+  active = false,
+  paneId,
+  onFocusPane
 }: {
   day?: NamedUsagePoint | null;
   session: SessionSummary | null;
   viewMode: ViewMode;
   sortMode: SortMode;
+  active?: boolean;
+  paneId?: LedgerPaneId;
+  onFocusPane?: () => void;
 }) {
   return (
-    <aside className="pane inspector-pane" aria-label="Inspector">
+    <aside
+      className={paneClassName("inspector-pane", active)}
+      aria-label="Inspector"
+      data-pane={paneId}
+      tabIndex={paneId ? 0 : undefined}
+      onFocus={onFocusPane}
+    >
       <PaneTitle title={viewMode} meta={sortMode} />
       {day ? (
         <dl className="detail-list">
@@ -1309,6 +1422,10 @@ function PaneTitle({ title, meta }: { title: string; meta: string }) {
   );
 }
 
+function paneClassName(className: string, active: boolean) {
+  return active ? `pane ${className} active-pane` : `pane ${className}`;
+}
+
 function ModePill({ label, value }: { label: string; value: string }) {
   return (
     <span className="mode-pill">
@@ -1382,9 +1499,11 @@ function ShortcutOverlay({ onClose }: { onClose: () => void }) {
   const rows = [
     ["1-4", "switch workspace"],
     ["/", "focus search"],
-    ["↑/↓", "move row cursor"],
-    ["←/→", "change day or tab"],
-    ["j/k", "move row cursor"],
+    ["Tab", "select next pane"],
+    ["↑/↓", "move row or scroll pane"],
+    ["←/→", "move day or scroll pane"],
+    ["PgUp/PgDn", "scroll active pane"],
+    ["j/k", "move row or scroll pane"],
     ["s", "cycle sort"],
     ["v", "cycle view"],
     ["g", "cycle chart"],
@@ -1480,6 +1599,11 @@ function cacheShare(row: NamedUsagePoint) {
 function cycleValue<T>(values: T[], current: T): T {
   const index = values.indexOf(current);
   return values[(index + 1) % values.length];
+}
+
+function cycleValueBy<T>(values: T[], current: T, delta: number): T {
+  const index = Math.max(0, values.indexOf(current));
+  return values[(index + delta + values.length) % values.length];
 }
 
 function isTypingTarget(target: EventTarget | null) {

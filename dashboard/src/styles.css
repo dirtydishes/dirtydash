@@ -395,6 +395,19 @@ h2 {
   overscroll-behavior: contain;
 }
 
+.pane:focus {
+  outline: none;
+}
+
+.pane.active-pane {
+  outline: 1px solid var(--yellow);
+  outline-offset: -2px;
+}
+
+.pane.active-pane .pane-title {
+  border-bottom-color: var(--yellow);
+}
+
 .chart-pane {
   background: oklch(0.145 0.027 276);
 }
