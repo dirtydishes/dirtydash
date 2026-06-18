@@ -68,6 +68,7 @@ pub struct UsageEvent {
     pub turn_id: Option<String>,
     pub provider: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
@@ -753,6 +754,7 @@ fn parse_generic_jsonl(
                     None,
                     None,
                     None,
+                    None,
                 )? {
                     events.push(event);
                 }
@@ -790,6 +792,7 @@ fn parse_generic_json(
         None,
         None,
         None,
+        None,
     )?;
 
     Ok(ParsedFile {
@@ -814,6 +817,7 @@ fn parse_codex_jsonl(
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
     let mut current_turn_id: Option<String> = None;
+    let mut current_reasoning_effort: Option<String> = None;
 
     for (index, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -836,6 +840,9 @@ fn parse_codex_jsonl(
         }
         if let Some(turn_id) = extract_string(&value, TURN_ID_KEYS) {
             current_turn_id = Some(turn_id);
+        }
+        if let Some(reasoning_effort) = extract_reasoning_effort(&value) {
+            current_reasoning_effort = Some(reasoning_effort);
         }
 
         let payload_type = value
@@ -869,6 +876,7 @@ fn parse_codex_jsonl(
                 options,
                 Some(current_model.as_deref().unwrap_or("gpt-5.5")),
                 current_turn_id.as_deref(),
+                current_reasoning_effort.as_deref(),
                 priority_evidence,
             )? {
                 event.provider = current_provider
@@ -890,6 +898,7 @@ fn parse_codex_jsonl(
             options,
             current_model.as_deref(),
             current_turn_id.as_deref(),
+            current_reasoning_effort.as_deref(),
             priority_evidence,
         )? {
             events.push(event);
@@ -914,6 +923,7 @@ fn event_from_value(
     options: ImportOptions,
     fallback_model: Option<&str>,
     fallback_turn_id: Option<&str>,
+    fallback_reasoning_effort: Option<&str>,
     priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
     let usage = extract_usage_numbers(value);
@@ -932,6 +942,7 @@ fn event_from_value(
         options,
         fallback_model,
         fallback_turn_id,
+        fallback_reasoning_effort,
         priority_evidence,
     )
 }
@@ -949,6 +960,7 @@ fn event_from_usage(
     options: ImportOptions,
     fallback_model: Option<&str>,
     fallback_turn_id: Option<&str>,
+    fallback_reasoning_effort: Option<&str>,
     priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
     if !usage.has_usage() {
@@ -969,6 +981,8 @@ fn event_from_usage(
         extract_string(value, PROJECT_KEYS).unwrap_or_else(|| infer_project_path(source, file));
     let turn_id =
         extract_string(value, TURN_ID_KEYS).or_else(|| fallback_turn_id.map(ToOwned::to_owned));
+    let reasoning_effort = extract_reasoning_effort(value)
+        .or_else(|| fallback_reasoning_effort.map(ToOwned::to_owned));
     let event_timestamp = extract_timestamp(value).or_else(|| file_modified_at(file));
     let reported_cost = extract_reported_cost(value);
     let requested_pricing_mode = if source.kind == SourceKind::Codex
@@ -1017,6 +1031,7 @@ fn event_from_usage(
         turn_id,
         provider,
         model,
+        reasoning_effort,
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         cache_read_tokens: usage.cache_read_tokens,
@@ -1210,6 +1225,12 @@ const REASONING_KEYS: &[&str] = &[
 ];
 const MODEL_KEYS: &[&str] = &["model", "model_id", "modelID", "modelId", "active_model"];
 const PROVIDER_KEYS: &[&str] = &["provider", "provider_id", "providerID", "providerId"];
+const REASONING_EFFORT_KEYS: &[&str] = &[
+    "reasoning_effort",
+    "reasoningEffort",
+    "reasoning",
+    "effort",
+];
 const SESSION_KEYS: &[&str] = &[
     "session_id",
     "sessionId",
@@ -1324,6 +1345,16 @@ fn extract_string(value: &Value, keys: &[&str]) -> Option<String> {
 
 fn extract_timestamp(value: &Value) -> Option<String> {
     extract_string(value, TIMESTAMP_KEYS).and_then(|raw| normalize_timestamp(&raw))
+}
+
+fn extract_reasoning_effort(value: &Value) -> Option<String> {
+    extract_string(value, REASONING_EFFORT_KEYS).and_then(|raw| {
+        let normalized = raw.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "minimal" | "low" | "medium" | "high" => Some(normalized),
+            _ => None,
+        }
+    })
 }
 
 fn normalize_timestamp(raw: &str) -> Option<String> {
@@ -1595,10 +1626,14 @@ mod tests {
 
         let conn = db.connection().unwrap();
         let modes = conn
-            .prepare("SELECT model, pricing_mode FROM usage_events ORDER BY model")
+            .prepare("SELECT model, pricing_mode, reasoning_effort FROM usage_events ORDER BY model")
             .unwrap()
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -1606,8 +1641,16 @@ mod tests {
         assert_eq!(
             modes,
             vec![
-                ("gpt-5.4".to_string(), "standard".to_string()),
-                ("gpt-5.5".to_string(), "standard".to_string())
+                (
+                    "gpt-5.4".to_string(),
+                    "standard".to_string(),
+                    "minimal".to_string()
+                ),
+                (
+                    "gpt-5.5".to_string(),
+                    "standard".to_string(),
+                    "low".to_string()
+                )
             ]
         );
     }
@@ -1739,6 +1782,7 @@ mod tests {
             turn_id: Some("turn-priority".to_string()),
             provider: "openai-codex".to_string(),
             model: "gpt-5.5".to_string(),
+            reasoning_effort: None,
             prompt_tokens: 1_000,
             completion_tokens: 50,
             cache_read_tokens: 100,

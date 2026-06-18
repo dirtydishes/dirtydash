@@ -39,6 +39,7 @@ pub struct DashboardSummary {
     pub daily: Vec<NamedUsagePoint>,
     pub by_source: Vec<NamedUsagePoint>,
     pub by_model: Vec<NamedUsagePoint>,
+    pub by_reasoning_effort: Vec<NamedUsagePoint>,
     pub by_project: Vec<NamedUsagePoint>,
     pub expensive_sessions: Vec<SessionSummary>,
 }
@@ -130,6 +131,7 @@ struct UsageEventPricingState {
     provider: String,
     model: String,
     turn_id: Option<String>,
+    reasoning_effort: Option<String>,
     prompt_tokens: u64,
     completion_tokens: u64,
     cache_read_tokens: u64,
@@ -182,6 +184,7 @@ impl Database {
                 turn_id TEXT,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
+                reasoning_effort TEXT,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -275,6 +278,9 @@ impl Database {
                 [],
             )?;
         }
+        if !columns.iter().any(|column| column == "reasoning_effort") {
+            conn.execute("ALTER TABLE usage_events ADD COLUMN reasoning_effort TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -283,7 +289,7 @@ impl Database {
         let existing = conn
             .query_row(
                 r#"
-                SELECT provider, model, turn_id, prompt_tokens, completion_tokens, cache_read_tokens,
+                SELECT provider, model, turn_id, reasoning_effort, prompt_tokens, completion_tokens, cache_read_tokens,
                     cache_write_tokens, reasoning_tokens, total_tokens, estimated_cost_usd,
                     confidence, pricing_version, pricing_mode
                 FROM usage_events
@@ -295,16 +301,17 @@ impl Database {
                         provider: row.get(0)?,
                         model: row.get(1)?,
                         turn_id: row.get(2)?,
-                        prompt_tokens: row.get::<_, i64>(3)? as u64,
-                        completion_tokens: row.get::<_, i64>(4)? as u64,
-                        cache_read_tokens: row.get::<_, i64>(5)? as u64,
-                        cache_write_tokens: row.get::<_, i64>(6)? as u64,
-                        reasoning_tokens: row.get::<_, i64>(7)? as u64,
-                        total_tokens: row.get::<_, i64>(8)? as u64,
-                        estimated_cost_usd: row.get(9)?,
-                        confidence: row.get(10)?,
-                        pricing_version: row.get(11)?,
-                        pricing_mode: row.get(12)?,
+                        reasoning_effort: row.get(3)?,
+                        prompt_tokens: row.get::<_, i64>(4)? as u64,
+                        completion_tokens: row.get::<_, i64>(5)? as u64,
+                        cache_read_tokens: row.get::<_, i64>(6)? as u64,
+                        cache_write_tokens: row.get::<_, i64>(7)? as u64,
+                        reasoning_tokens: row.get::<_, i64>(8)? as u64,
+                        total_tokens: row.get::<_, i64>(9)? as u64,
+                        estimated_cost_usd: row.get(10)?,
+                        confidence: row.get(11)?,
+                        pricing_version: row.get(12)?,
+                        pricing_mode: row.get(13)?,
                     })
                 },
             )
@@ -320,25 +327,27 @@ impl Database {
                 SET provider = ?1,
                     model = ?2,
                     turn_id = ?3,
-                    prompt_tokens = ?4,
-                    completion_tokens = ?5,
-                    cache_read_tokens = ?6,
-                    cache_write_tokens = ?7,
-                    reasoning_tokens = ?8,
-                    total_tokens = ?9,
-                    estimated_cost_usd = ?10,
-                    confidence = ?11,
-                    parser_version = ?12,
-                    imported_at = ?13,
-                    pricing_version = ?14,
-                    pricing_mode = ?15,
-                    metadata_only = ?16
-                WHERE raw_event_hash = ?17
+                    reasoning_effort = ?4,
+                    prompt_tokens = ?5,
+                    completion_tokens = ?6,
+                    cache_read_tokens = ?7,
+                    cache_write_tokens = ?8,
+                    reasoning_tokens = ?9,
+                    total_tokens = ?10,
+                    estimated_cost_usd = ?11,
+                    confidence = ?12,
+                    parser_version = ?13,
+                    imported_at = ?14,
+                    pricing_version = ?15,
+                    pricing_mode = ?16,
+                    metadata_only = ?17
+                WHERE raw_event_hash = ?18
                 "#,
                 params![
                     event.provider,
                     event.model,
                     event.turn_id,
+                    event.reasoning_effort,
                     event.prompt_tokens,
                     event.completion_tokens,
                     event.cache_read_tokens,
@@ -362,13 +371,13 @@ impl Database {
             r#"
             INSERT INTO usage_events (
                 machine, source, project_path, session_id, turn_id, provider, model,
-                prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
+                reasoning_effort, prompt_tokens, completion_tokens, cache_read_tokens, cache_write_tokens,
                 reasoning_tokens, total_tokens, estimated_cost_usd, confidence,
                 event_timestamp, raw_path, raw_span, parser_name, parser_version,
                 raw_event_hash, imported_at, pricing_version, pricing_mode, metadata_only
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
             "#,
             params![
                 event.machine,
@@ -378,6 +387,7 @@ impl Database {
                 event.turn_id,
                 event.provider,
                 event.model,
+                event.reasoning_effort,
                 event.prompt_tokens,
                 event.completion_tokens,
                 event.cache_read_tokens,
@@ -615,6 +625,7 @@ impl Database {
             daily: self.daily_usage(30)?,
             by_source: self.grouped_usage("source", 20)?,
             by_model: self.grouped_model_usage(20)?,
+            by_reasoning_effort: self.grouped_usage("COALESCE(reasoning_effort, 'unknown')", 8)?,
             by_project: self.grouped_usage("project_path", 20)?,
             expensive_sessions: self.sessions(12)?,
         })
@@ -1005,6 +1016,7 @@ impl UsageEventPricingState {
         self.provider == event.provider
             && self.model == event.model
             && self.turn_id == event.turn_id
+            && self.reasoning_effort == event.reasoning_effort
             && self.prompt_tokens == event.prompt_tokens
             && self.completion_tokens == event.completion_tokens
             && self.cache_read_tokens == event.cache_read_tokens
@@ -1241,6 +1253,42 @@ mod tests {
         assert_eq!(day_sessions[0].session_id, "session-new");
     }
 
+    #[test]
+    fn dashboard_summary_groups_reasoning_effort() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        let mut low = event(
+            "openai",
+            "gpt-5.5",
+            1_000,
+            "low-effort",
+            PricingMode::Standard,
+        );
+        low.reasoning_effort = Some("low".to_string());
+        db.upsert_usage_event(&low).unwrap();
+
+        let mut high = event(
+            "openai",
+            "gpt-5.5",
+            3_000,
+            "high-effort",
+            PricingMode::Standard,
+        );
+        high.reasoning_effort = Some("high".to_string());
+        db.upsert_usage_event(&high).unwrap();
+
+        let summary = db.dashboard_summary().unwrap();
+        let efforts = summary
+            .by_reasoning_effort
+            .iter()
+            .map(|row| (row.name.as_str(), row.total_tokens))
+            .collect::<Vec<_>>();
+
+        assert_eq!(efforts, vec![("high", 3_000), ("low", 1_000)]);
+    }
+
     fn event(
         provider: &str,
         model: &str,
@@ -1256,6 +1304,7 @@ mod tests {
             turn_id: Some(format!("turn-{hash}")),
             provider: provider.to_string(),
             model: model.to_string(),
+            reasoning_effort: Some("medium".to_string()),
             prompt_tokens: tokens,
             completion_tokens: 0,
             cache_read_tokens: 0,
