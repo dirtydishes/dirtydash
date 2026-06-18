@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>dirtydash turn: bump version to v0.1.1</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101019;
+      --panel: #171722;
+      --panel-2: #20202e;
+      --line: #39384d;
+      --text: #f1efff;
+      --muted: #b8b2d1;
+      --cyan: #86e7ff;
+      --green: #8ff0aa;
+      --red: #ff8b9d;
+      --yellow: #ffe08a;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.6;
+    }
+
+    main {
+      width: min(960px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 48px 0 64px;
+    }
+
+    header {
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1,
+    h2,
+    code,
+    pre,
+    .meta {
+      font-family: var(--mono);
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(2rem, 5vw, 3.75rem);
+      line-height: 1;
+      letter-spacing: -0.02em;
+      text-wrap: balance;
+    }
+
+    h2 {
+      margin: 34px 0 10px;
+      font-size: 1rem;
+      color: var(--cyan);
+      letter-spacing: 0;
+    }
+
+    p,
+    li {
+      color: var(--muted);
+      max-width: 74ch;
+    }
+
+    strong {
+      color: var(--text);
+    }
+
+    code {
+      color: var(--yellow);
+      font-size: 0.92em;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+
+    .pill {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 5px 8px;
+    }
+
+    section {
+      padding-top: 2px;
+    }
+
+    ul {
+      padding-left: 1.2rem;
+    }
+
+    .diff {
+      margin: 16px 0 0;
+      border: 1px solid var(--line);
+      background: #0b0b12;
+      overflow-x: auto;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px;
+      color: #dad7ec;
+      font-size: 0.88rem;
+      line-height: 1.45;
+      white-space: pre;
+    }
+
+    .file {
+      color: var(--cyan);
+    }
+
+    .minus {
+      color: var(--red);
+    }
+
+    .plus {
+      color: var(--green);
+    }
+
+    .note {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px 16px;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Bumped dirtydash to v0.1.1</h1>
+      <p>Updated the release metadata for the Rust workspace and bundled dashboard package so both publishable surfaces now report <strong>0.1.1</strong>.</p>
+      <div class="meta">
+        <span class="pill">2026-06-18 03:02</span>
+        <span class="pill">Issue dirtydash-7qv</span>
+        <span class="pill">Version metadata</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The project version moved from <code>0.1.0</code> to <code>0.1.1</code> in Cargo workspace metadata, the Rust lockfile package entry, and the dashboard package manifest.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Changed <code>Cargo.toml</code> workspace package version to <code>0.1.1</code>.</li>
+        <li>Changed the <code>dirtydash</code> package entry in <code>Cargo.lock</code> to <code>0.1.1</code>.</li>
+        <li>Changed <code>dashboard/package.json</code> to <code>0.1.1</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>dirtydash has a Rust CLI/server and a bundled React dashboard. The release number appears in both ecosystems, so the bump keeps command-line version reporting and dashboard package metadata aligned.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <p>The Rust crate inherits its version from <code>[workspace.package]</code>, so the crate manifest did not need a direct edit. The lockfile was updated at the local package entry to match the workspace version.</p>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p>This is the complete version-related diff for the task.</p>
+      <div class="diff" role="region" aria-label="Version bump diff" tabindex="0">
+        <pre><code><span class="file">diff --git a/Cargo.lock b/Cargo.lock</span>
+@@ -379,7 +379,7 @@ dependencies = [
+
+ [[package]]
+ name = "dirtydash"
+<span class="minus">-version = "0.1.0"</span>
+<span class="plus">+version = "0.1.1"</span>
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+<span class="file">diff --git a/Cargo.toml b/Cargo.toml</span>
+@@ -3,7 +3,7 @@ members = ["crates/dirtydash"]
+ resolver = "2"
+
+ [workspace.package]
+<span class="minus">-version = "0.1.0"</span>
+<span class="plus">+version = "0.1.1"</span>
+ edition = "2021"
+ license = "MIT"
+ authors = ["dirtydash contributors"]
+<span class="file">diff --git a/dashboard/package.json b/dashboard/package.json</span>
+@@ -1,7 +1,7 @@
+ {
+   "name": "dirtydash-dashboard",
+   "private": true,
+<span class="minus">-  "version": "0.1.0",</span>
+<span class="plus">+  "version": "0.1.1",</span>
+   "type": "module",
+   "scripts": {
+     "build": "vite build",</code></pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>Users and release tooling should now see dirtydash as version <code>0.1.1</code>. No runtime behavior, dashboard workflow, database schema, or import logic changed.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li>Ran <code>cargo test</code>: 21 tests passed across unit, integration, and doc-test targets.</li>
+        <li>Ran <code>npm run build</code> in <code>dashboard/</code>: Vite production build completed successfully.</li>
+        <li>Ran whitespace checks for turn documentation before staging and for all staged files after staging.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <p>No functional limitation was introduced. An unrelated untracked root <code>package-lock.json</code> existed before the change and was intentionally left out of the release bump.</p>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <p>No follow-up work is required for this version bump. Future release tasks should continue checking both Cargo and dashboard metadata so the two surfaces stay in sync.</p>
+    </section>
+  </main>
+</body>
+</html>
