@@ -20,6 +20,60 @@ pub const PARSER_VERSION: &str = "dirtydash-v1.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Unknown,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
+            ReasoningEffort::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => ReasoningEffort::None,
+            "low" => ReasoningEffort::Low,
+            "medium" => ReasoningEffort::Medium,
+            "high" => ReasoningEffort::High,
+            "xhigh" => ReasoningEffort::XHigh,
+            _ => ReasoningEffort::Unknown,
+        }
+    }
+
+    pub fn normalized(raw: Option<&str>) -> (Self, Option<String>) {
+        let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return (ReasoningEffort::Unknown, None);
+        };
+        let normalized = match raw.to_ascii_lowercase().as_str() {
+            "none" | "minimal" | "off" | "false" | "0" => ReasoningEffort::None,
+            "low" => ReasoningEffort::Low,
+            "medium" => ReasoningEffort::Medium,
+            "high" => ReasoningEffort::High,
+            "xhigh" | "extra_high" | "extra-high" => ReasoningEffort::XHigh,
+            _ => ReasoningEffort::Unknown,
+        };
+        (normalized, Some(raw.to_string()))
+    }
+
+    pub fn is_known(self) -> bool {
+        self != ReasoningEffort::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
     ClaudeCode,
     Codex,
@@ -74,6 +128,8 @@ pub struct UsageEvent {
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
+    pub reasoning_effort: ReasoningEffort,
+    pub raw_reasoning_effort: Option<String>,
     pub estimated_cost_usd: f64,
     pub confidence: f64,
     pub event_timestamp: Option<String>,
@@ -86,6 +142,22 @@ pub struct UsageEvent {
     pub pricing_version: String,
     pub pricing_mode: PricingMode,
     pub metadata_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningTurn {
+    pub machine: String,
+    pub source: SourceKind,
+    pub session_id: String,
+    pub turn_id: String,
+    pub project_path: String,
+    pub model: String,
+    pub reasoning_effort: ReasoningEffort,
+    pub raw_reasoning_effort: Option<String>,
+    pub event_timestamp: Option<String>,
+    pub raw_path: String,
+    pub raw_span: Option<String>,
+    pub imported_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +825,8 @@ fn parse_generic_jsonl(
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )? {
                     events.push(event);
                 }
@@ -790,6 +864,8 @@ fn parse_generic_json(
         None,
         None,
         None,
+        None,
+        None,
     )?;
 
     Ok(ParsedFile {
@@ -814,6 +890,8 @@ fn parse_codex_jsonl(
     let mut current_model: Option<String> = None;
     let mut current_provider: Option<String> = None;
     let mut current_turn_id: Option<String> = None;
+    let mut current_reasoning_effort = ReasoningEffort::Unknown;
+    let mut current_raw_reasoning_effort: Option<String> = None;
 
     for (index, line) in raw.lines().enumerate() {
         if line.trim().is_empty() {
@@ -844,6 +922,40 @@ fn parse_codex_jsonl(
             .or_else(|| value.get("type").and_then(Value::as_str));
 
         if payload_type == Some("turn_context") {
+            let payload = value.pointer("/payload").unwrap_or(&value);
+            let (reasoning_effort, raw_reasoning_effort) =
+                extract_reasoning_effort_from_codex_turn_context(payload);
+            current_reasoning_effort = reasoning_effort;
+            current_raw_reasoning_effort = raw_reasoning_effort;
+            if let Some(turn_id) =
+                extract_string(payload, TURN_ID_KEYS).or_else(|| current_turn_id.clone())
+            {
+                current_turn_id = Some(turn_id.clone());
+                let session_id = extract_string(&value, SESSION_KEYS).unwrap_or_else(|| {
+                    file.file_stem_string()
+                        .unwrap_or_else(|| "unknown-session".to_string())
+                });
+                let project_path = extract_string(&value, PROJECT_KEYS)
+                    .unwrap_or_else(|| infer_project_path(source, file));
+                let model = extract_string(&value, MODEL_KEYS)
+                    .or_else(|| current_model.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let turn = ReasoningTurn {
+                    machine: machine.to_string(),
+                    source: source.kind,
+                    session_id,
+                    turn_id,
+                    project_path,
+                    model,
+                    reasoning_effort,
+                    raw_reasoning_effort: current_raw_reasoning_effort.clone(),
+                    event_timestamp: extract_timestamp(&value).or_else(|| file_modified_at(file)),
+                    raw_path: file.display().to_string(),
+                    raw_span: Some(format!("line {}", index + 1)),
+                    imported_at: imported_at.to_string(),
+                };
+                db.upsert_reasoning_turn(&turn)?;
+            }
             continue;
         }
 
@@ -869,6 +981,8 @@ fn parse_codex_jsonl(
                 options,
                 Some(current_model.as_deref().unwrap_or("gpt-5.5")),
                 current_turn_id.as_deref(),
+                Some(current_reasoning_effort),
+                current_raw_reasoning_effort.as_deref(),
                 priority_evidence,
             )? {
                 event.provider = current_provider
@@ -890,6 +1004,8 @@ fn parse_codex_jsonl(
             options,
             current_model.as_deref(),
             current_turn_id.as_deref(),
+            Some(current_reasoning_effort),
+            current_raw_reasoning_effort.as_deref(),
             priority_evidence,
         )? {
             events.push(event);
@@ -914,6 +1030,8 @@ fn event_from_value(
     options: ImportOptions,
     fallback_model: Option<&str>,
     fallback_turn_id: Option<&str>,
+    fallback_reasoning_effort: Option<ReasoningEffort>,
+    fallback_raw_reasoning_effort: Option<&str>,
     priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
     let usage = extract_usage_numbers(value);
@@ -932,6 +1050,8 @@ fn event_from_value(
         options,
         fallback_model,
         fallback_turn_id,
+        fallback_reasoning_effort,
+        fallback_raw_reasoning_effort,
         priority_evidence,
     )
 }
@@ -949,6 +1069,8 @@ fn event_from_usage(
     options: ImportOptions,
     fallback_model: Option<&str>,
     fallback_turn_id: Option<&str>,
+    fallback_reasoning_effort: Option<ReasoningEffort>,
+    fallback_raw_reasoning_effort: Option<&str>,
     priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
     if !usage.has_usage() {
@@ -969,6 +1091,10 @@ fn event_from_usage(
         extract_string(value, PROJECT_KEYS).unwrap_or_else(|| infer_project_path(source, file));
     let turn_id =
         extract_string(value, TURN_ID_KEYS).or_else(|| fallback_turn_id.map(ToOwned::to_owned));
+    let (reasoning_effort, raw_reasoning_effort) = fallback_reasoning_effort.map_or_else(
+        || (ReasoningEffort::Unknown, None),
+        |effort| (effort, fallback_raw_reasoning_effort.map(ToOwned::to_owned)),
+    );
     let event_timestamp = extract_timestamp(value).or_else(|| file_modified_at(file));
     let reported_cost = extract_reported_cost(value);
     let requested_pricing_mode = if source.kind == SourceKind::Codex
@@ -1023,6 +1149,8 @@ fn event_from_usage(
         cache_write_tokens: usage.cache_write_tokens,
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.total_tokens(),
+        reasoning_effort,
+        raw_reasoning_effort,
         estimated_cost_usd: reported_cost
             .or_else(|| cost.as_ref().map(|estimate| estimate.estimated_cost_usd))
             .unwrap_or(0.0),
@@ -1050,6 +1178,17 @@ fn event_from_usage(
         },
         metadata_only: options.metadata_only,
     }))
+}
+
+fn extract_reasoning_effort_from_codex_turn_context(
+    payload: &Value,
+) -> (ReasoningEffort, Option<String>) {
+    let raw = payload.get("effort").and_then(Value::as_str).or_else(|| {
+        payload
+            .pointer("/collaboration_mode/settings/reasoning_effort")
+            .and_then(Value::as_str)
+    });
+    ReasoningEffort::normalized(raw)
 }
 
 fn extract_usage_numbers(value: &Value) -> UsageNumbers {
@@ -1613,6 +1752,176 @@ mod tests {
     }
 
     #[test]
+    fn codex_turn_context_reasoning_effort_is_normalized_and_persisted() {
+        let dir = tempdir().unwrap();
+        let source_root = dir.path().join("codex/sessions");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("reasoning.jsonl"),
+            r#"{"timestamp":"2026-06-07T12:00:00Z","session_id":"session-reasoning","type":"turn_context","payload":{"turn_id":"turn-effort","cwd":"/repo/reasoning","model":"gpt-5.5","effort":"extra-high"}}
+{"timestamp":"2026-06-07T12:00:10Z","session_id":"session-reasoning","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":90,"cached_input_tokens":0,"output_tokens":10}}}}
+{"timestamp":"2026-06-07T12:01:00Z","session_id":"session-reasoning","type":"turn_context","payload":{"turn_id":"turn-settings","cwd":"/repo/reasoning","model":"gpt-5.5","collaboration_mode":{"settings":{"reasoning_effort":"minimal"}}}}
+{"timestamp":"2026-06-07T12:01:10Z","session_id":"session-reasoning","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":45,"cached_input_tokens":0,"output_tokens":5}}}}
+{"timestamp":"2026-06-07T12:02:00Z","session_id":"session-reasoning","type":"turn_context","payload":{"turn_id":"turn-missing","cwd":"/repo/reasoning","model":"gpt-5.5"}}
+{"timestamp":"2026-06-07T12:02:10Z","session_id":"session-reasoning","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":18,"cached_input_tokens":0,"output_tokens":2}}}}
+{"timestamp":"2026-06-07T12:03:00Z","session_id":"session-reasoning","type":"turn_context","payload":{"turn_id":"turn-odd","cwd":"/repo/reasoning","model":"gpt-5.5","effort":"warp-speed"}}
+{"timestamp":"2026-06-07T12:03:10Z","session_id":"session-reasoning","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":9,"cached_input_tokens":0,"output_tokens":1}}}}"#,
+        )
+        .unwrap();
+
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+        let report = import_sources(
+            &db,
+            vec![detected(SourceKind::Codex, source_root)],
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.inserted_events, 4);
+        let conn = db.connection().unwrap();
+        let events = conn
+            .prepare(
+                "SELECT turn_id, reasoning_effort, raw_reasoning_effort FROM usage_events ORDER BY event_timestamp",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                (
+                    "turn-effort".to_string(),
+                    "xhigh".to_string(),
+                    Some("extra-high".to_string())
+                ),
+                (
+                    "turn-settings".to_string(),
+                    "none".to_string(),
+                    Some("minimal".to_string())
+                ),
+                ("turn-missing".to_string(), "unknown".to_string(), None),
+                (
+                    "turn-odd".to_string(),
+                    "unknown".to_string(),
+                    Some("warp-speed".to_string())
+                ),
+            ]
+        );
+
+        let turns = conn
+            .prepare(
+                "SELECT turn_id, reasoning_effort, raw_reasoning_effort FROM reasoning_turns ORDER BY turn_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(turns.len(), 4);
+        assert!(turns.contains(&(
+            "turn-effort".to_string(),
+            "xhigh".to_string(),
+            Some("extra-high".to_string())
+        )));
+    }
+
+    #[test]
+    fn duplicate_codex_turn_context_prefers_latest_known_reasoning_effort() {
+        let dir = tempdir().unwrap();
+        let source_root = dir.path().join("codex/sessions");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("duplicates.jsonl"),
+            r#"{"timestamp":"2026-06-07T12:00:00Z","session_id":"session-dup","type":"turn_context","payload":{"turn_id":"turn-dup","cwd":"/repo/reasoning","model":"gpt-5.5"}}
+{"timestamp":"2026-06-07T12:00:01Z","session_id":"session-dup","type":"turn_context","payload":{"turn_id":"turn-dup","cwd":"/repo/reasoning","model":"gpt-5.5","effort":"high"}}
+{"timestamp":"2026-06-07T12:00:10Z","session_id":"session-dup","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":75,"cached_input_tokens":0,"output_tokens":25}}}}"#,
+        )
+        .unwrap();
+
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+        import_sources(
+            &db,
+            vec![detected(SourceKind::Codex, source_root)],
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+
+        let conn = db.connection().unwrap();
+        let persisted = conn
+            .query_row(
+                "SELECT reasoning_effort, raw_reasoning_effort FROM reasoning_turns WHERE turn_id = 'turn-dup'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("high".to_string(), Some("high".to_string())));
+    }
+
+    #[test]
+    fn codex_mixed_effort_session_rolls_up_by_token_share() {
+        let dir = tempdir().unwrap();
+        let source_root = dir.path().join("codex/sessions");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(
+            source_root.join("mixed.jsonl"),
+            r#"{"timestamp":"2026-06-07T12:00:00Z","session_id":"mixed-session","type":"turn_context","payload":{"turn_id":"turn-high","cwd":"/repo/reasoning","model":"gpt-5.5","effort":"high"}}
+{"timestamp":"2026-06-07T12:00:10Z","session_id":"mixed-session","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":250,"cached_input_tokens":0,"output_tokens":50}}}}
+{"timestamp":"2026-06-07T12:01:00Z","session_id":"mixed-session","type":"turn_context","payload":{"turn_id":"turn-low","cwd":"/repo/reasoning","model":"gpt-5.5","effort":"low"}}
+{"timestamp":"2026-06-07T12:01:10Z","session_id":"mixed-session","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":80,"cached_input_tokens":0,"output_tokens":20}}}}"#,
+        )
+        .unwrap();
+
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+        import_sources(
+            &db,
+            vec![detected(SourceKind::Codex, source_root)],
+            ImportOptions {
+                metadata_only: true,
+            },
+        )
+        .unwrap();
+
+        let session = db
+            .sessions(10)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.session_id == "mixed-session")
+            .expect("mixed session exists");
+        assert_eq!(session.total_tokens, 400);
+        assert_eq!(session.reasoning.len(), 2);
+        assert_eq!(session.reasoning[0].effort, "low");
+        assert_eq!(session.reasoning[0].tokens, 100);
+        assert!((session.reasoning[0].share - 0.25).abs() < 0.000001);
+        assert_eq!(session.reasoning[1].effort, "high");
+        assert_eq!(session.reasoning[1].tokens, 300);
+        assert!((session.reasoning[1].share - 0.75).abs() < 0.000001);
+    }
+
+    #[test]
     fn codex_logs_2_priority_rows_mark_matching_turn_events() {
         let dir = tempdir().unwrap();
         let codex_home = dir.path().join("codex");
@@ -1745,6 +2054,8 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: 1_150,
+            reasoning_effort: ReasoningEffort::Unknown,
+            raw_reasoning_effort: None,
             estimated_cost_usd: 0.001,
             confidence: 0.92,
             event_timestamp: None,

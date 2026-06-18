@@ -46,6 +46,16 @@ type NamedUsagePoint = {
   standard_tokens: number;
   priority_tokens: number;
   priority_estimated_cost_usd: number;
+  reasoning: ReasoningBucket[];
+};
+
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "unknown";
+
+type ReasoningBucket = {
+  effort: ReasoningEffort;
+  tokens: number;
+  estimated_cost_usd: number;
+  share: number;
 };
 
 type SessionSummary = {
@@ -63,6 +73,7 @@ type SessionSummary = {
   raw_path: string;
   parser_name: string;
   pricing_version: string;
+  reasoning: ReasoningBucket[];
 };
 
 type DashboardSummary = {
@@ -933,7 +944,8 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       estimated_cost_usd: 0,
       standard_tokens: summary.totals.prompt_tokens,
       priority_tokens: 0,
-      priority_estimated_cost_usd: 0
+      priority_estimated_cost_usd: 0,
+      reasoning: []
     },
     {
       name: "cache read",
@@ -946,7 +958,8 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       estimated_cost_usd: 0,
       standard_tokens: summary.totals.cache_read_tokens,
       priority_tokens: 0,
-      priority_estimated_cost_usd: 0
+      priority_estimated_cost_usd: 0,
+      reasoning: []
     },
     {
       name: "cache write",
@@ -959,7 +972,8 @@ function CachePage({ summary }: { summary: DashboardSummary }) {
       estimated_cost_usd: 0,
       standard_tokens: summary.totals.cache_write_tokens,
       priority_tokens: 0,
-      priority_estimated_cost_usd: 0
+      priority_estimated_cost_usd: 0,
+      reasoning: []
     }
   ];
   return (
@@ -1198,13 +1212,43 @@ function TrendPanel({
   className?: string;
   metric?: UsageBarMetric;
 }) {
+  const [barMode, setBarMode] = useState<"usage" | "reasoning">("usage");
   const max = Math.max(metric === "cost" ? 0.01 : 1, ...rows.map((row) => barValue(row, metric)));
   const hasPriority = rows.some((row) => priorityBarValue(row, metric) > 0);
+  const hasReasoning = metric === "tokens" && rows.some((row) => row.reasoning.length > 0);
+  const activeMode = hasReasoning ? barMode : "usage";
+  const headerCopy =
+    activeMode === "reasoning"
+      ? `${rows.length} rows, colored by reasoning effort`
+      : hasPriority
+        ? `${rows.length} rows, yellow is fast/priority`
+        : `${rows.length} rows`;
   return (
     <section className={`panel ${className}`}>
       <div className="panel-header">
         <h2>{title}</h2>
-        <span>{hasPriority ? `${rows.length} rows, yellow is fast/priority` : `${rows.length} rows`}</span>
+        <div className="panel-tools">
+          <span>{headerCopy}</span>
+          {hasReasoning ? (
+            <div className="segment-control" aria-label="Bar coloring mode">
+              <span>bars:</span>
+              <button
+                type="button"
+                className={activeMode === "usage" ? "active" : ""}
+                onClick={() => setBarMode("usage")}
+              >
+                usage
+              </button>
+              <button
+                type="button"
+                className={activeMode === "reasoning" ? "active" : ""}
+                onClick={() => setBarMode("reasoning")}
+              >
+                reasoning
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
       <div className="bar-list">
         {rows.length === 0 ? <Empty text="No imported usage yet." /> : null}
@@ -1214,7 +1258,11 @@ function TrendPanel({
               <span>{row.name || "unknown"}</span>
               <small>{money(row.estimated_cost_usd)}</small>
             </div>
-            <UsageBar row={row} max={max} metric={metric} />
+            {activeMode === "reasoning" ? (
+              <ReasoningBar row={row} max={max} />
+            ) : (
+              <UsageBar row={row} max={max} metric={metric} />
+            )}
             <UsageSummary row={row} metric={metric} />
           </div>
         ))}
@@ -1266,6 +1314,30 @@ function UsageBar({
   );
 }
 
+function ReasoningBar({ row, max }: { row: NamedUsagePoint; max: number }) {
+  const value = row.total_tokens;
+  const fill = value > 0 ? Math.max(4, (value / max) * 100) : 0;
+  const summaries = reasoningDisplayBuckets(row.reasoning)
+    .map((bucket) => `${bucket.percent}% ${reasoningLabel(bucket.effort)}`)
+    .join(", ");
+  const label = `${row.name || "unknown"}: ${summaries || "0% unknown"}`;
+
+  return (
+    <div className="bar-track" role="img" aria-label={label} title={label}>
+      <span className="reasoning-fill" style={{ width: `${fill}%` }}>
+        {row.reasoning.map((bucket) => (
+          <span
+            key={bucket.effort}
+            className="reasoning-segment"
+            data-effort={bucket.effort}
+            style={{ width: `${Math.max(0, bucket.share * 100)}%` }}
+          />
+        ))}
+      </span>
+    </div>
+  );
+}
+
 function UsageSummary({ row, metric = "tokens" }: { row: NamedUsagePoint; metric?: UsageBarMetric }) {
   const inputWithCache = row.prompt_tokens + row.cache_read_tokens + row.cache_write_tokens;
   const generated = row.completion_tokens + row.reasoning_tokens;
@@ -1307,6 +1379,59 @@ function priorityBarValue(row: NamedUsagePoint, metric: UsageBarMetric) {
   return metric === "cost" ? row.priority_estimated_cost_usd : row.priority_tokens;
 }
 
+function ReasoningSummary({ buckets }: { buckets: ReasoningBucket[] }) {
+  const displayBuckets = reasoningDisplayBuckets(buckets);
+  if (displayBuckets.length === 0) {
+    return (
+      <span className="reasoning-summary" data-effort="unknown">
+        reasoning: unknown
+      </span>
+    );
+  }
+  if (displayBuckets.length === 1) {
+    const bucket = displayBuckets[0];
+    return (
+      <span className="reasoning-summary" data-effort={bucket.effort}>
+        reasoning: {reasoningLabel(bucket.effort)}
+      </span>
+    );
+  }
+  return (
+    <span className="reasoning-summary mixed">
+      {displayBuckets.map((bucket) => (
+        <span key={bucket.effort} data-effort={bucket.effort}>
+          {bucket.percent}% {reasoningLabel(bucket.effort)}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+type ReasoningDisplayBucket = ReasoningBucket & { percent: number };
+
+function reasoningDisplayBuckets(buckets: ReasoningBucket[]): ReasoningDisplayBucket[] {
+  const positive = buckets.filter((bucket) => bucket.tokens > 0);
+  if (positive.length === 0) return [];
+
+  const rounded = positive.map((bucket) => ({
+    ...bucket,
+    percent: Math.max(0, Math.round(bucket.share * 100))
+  }));
+  const total = rounded.reduce((sum, bucket) => sum + bucket.percent, 0);
+  const delta = 100 - total;
+  if (delta !== 0) {
+    const largest = rounded.reduce((largestIndex, bucket, index) => {
+      return bucket.tokens > rounded[largestIndex].tokens ? index : largestIndex;
+    }, 0);
+    rounded[largest].percent = Math.max(0, rounded[largest].percent + delta);
+  }
+  return rounded;
+}
+
+function reasoningLabel(effort: ReasoningEffort) {
+  return effort === "none" ? "no reasoning" : effort;
+}
+
 function SessionsTable({ title, sessions }: { title: string; sessions: SessionSummary[] }) {
   return (
     <section className="panel wide">
@@ -1322,6 +1447,7 @@ function SessionsTable({ title, sessions }: { title: string; sessions: SessionSu
               <th>Source</th>
               <th>Project</th>
               <th>Model</th>
+              <th className="reasoning-col">Reasoning</th>
               <th>Tokens</th>
               <th>Cost</th>
               <th>Provenance</th>
@@ -1334,6 +1460,9 @@ function SessionsTable({ title, sessions }: { title: string; sessions: SessionSu
                 <td>{session.source}</td>
                 <td>{session.project_path}</td>
                 <td>{session.model}</td>
+                <td className="reasoning-col">
+                  <ReasoningSummary buckets={session.reasoning} />
+                </td>
                 <td>{compact(session.total_tokens)}</td>
                 <td>{money(session.estimated_cost_usd)}</td>
                 <td>

@@ -678,6 +678,8 @@ mod tests {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             total_tokens: 110_000,
+            reasoning_effort: crate::importers::ReasoningEffort::Unknown,
+            raw_reasoning_effort: None,
             estimated_cost_usd: 0.0,
             confidence: 0.92,
             event_timestamp: None,
