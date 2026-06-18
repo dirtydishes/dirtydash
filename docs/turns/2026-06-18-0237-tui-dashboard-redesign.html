@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dirtydash TUI Dashboard Redesign</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: oklch(0.115 0.02 276);
+      --panel: oklch(0.165 0.027 274);
+      --panel-2: oklch(0.205 0.034 272);
+      --line: oklch(0.34 0.044 270);
+      --ink: oklch(0.92 0.025 262);
+      --muted: oklch(0.7 0.038 264);
+      --soft: oklch(0.58 0.04 264);
+      --cyan: oklch(0.78 0.14 205);
+      --green: oklch(0.74 0.14 151);
+      --yellow: oklch(0.83 0.14 88);
+      --red: oklch(0.68 0.18 24);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    header {
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1, h2, h3, code, pre, .meta, .tag {
+      font-family: var(--mono);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 30px 0 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+    p { max-width: 78ch; color: var(--muted); }
+    ul { padding-left: 22px; color: var(--muted); }
+    li + li { margin-top: 7px; }
+    code {
+      color: var(--cyan);
+      background: oklch(0.13 0.024 276);
+      padding: 2px 5px;
+      border: 1px solid oklch(0.28 0.035 270);
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .tag {
+      border: 1px solid var(--line);
+      padding: 4px 7px;
+      color: var(--yellow);
+      background: var(--panel-2);
+      font-size: 12px;
+    }
+    section {
+      padding: 0 4px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .cell {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 14px;
+    }
+    .cell strong {
+      display: block;
+      color: var(--ink);
+      font-family: var(--mono);
+      margin-bottom: 5px;
+    }
+    pre {
+      margin: 12px 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      background: oklch(0.095 0.018 276);
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .diff .file { color: var(--yellow); }
+    .diff .ctx { color: var(--muted); }
+    .diff .add { color: var(--green); }
+    .diff .del { color: var(--red); }
+    .note {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px 14px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Dirtydash TUI Dashboard Redesign</h1>
+      <p>Replaced the production dashboard with a dense, keyboard-first TUI surface centered on the daily usage ledger and real selected-day session drilldowns.</p>
+      <div class="meta">
+        <span class="tag">2026-06-18 02:37</span>
+        <span class="tag">dirtydash-883</span>
+        <span class="tag">dashboard</span>
+        <span class="tag">backend api</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>Summary</h2>
+      <p>The app now opens to <code>1 Ledger</code>, with daily usage sorted newest first, a custom SVG chart, selected-day sessions, and an inspector showing provenance and pricing assumptions. The old 13-page sidebar and <code>/mock1</code> through <code>/mock4</code> mock-route mode were removed from the React app.</p>
+    </section>
+
+    <section>
+      <h2>Changes Made</h2>
+      <ul>
+        <li>Added backend support for date-descending daily ledger rows and <code>/api/days/:day/sessions</code>.</li>
+        <li>Rebuilt the dashboard around four numbered workspaces: Ledger, Sources, Sessions, and Ops.</li>
+        <li>Added secondary tabs, command/status bar, search, keyboard shortcuts, selected day and session cursors, sort mode, view mode, and chart type state.</li>
+        <li>Added custom SVG bar, line, and histogram chart modes with hover/focus tooltips and selected-point tracking.</li>
+        <li>Reworked CSS around panes, grid lines, sticky dense rows, terminal-like selection, dark OKLCH tokens, responsive scroll containment, and reduced-motion fallbacks.</li>
+        <li>Rebuilt <code>dashboard/dist</code> so the Rust binary embeds the redesigned UI.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Context</h2>
+      <p>Dirtydash is a local-first usage instrument for developers who already trust terminal workflows. The redesign keeps trust markers close to the data: parser, pricing snapshot, raw path, cache share, fast/priority usage, stale imports, parse errors, and doctor warnings remain visible where they affect interpretation.</p>
+    </section>
+
+    <section>
+      <h2>Important Implementation Details</h2>
+      <div class="grid">
+        <div class="cell">
+          <strong>Newest-day ledger</strong>
+          Daily rollups now use a dedicated SQL query ordered by date descending instead of the generic spend-sorted grouping helper.
+        </div>
+        <div class="cell">
+          <strong>Real drilldown</strong>
+          The selected day fetches real grouped sessions from <code>/api/days/:day/sessions</code>, limited to 100 rows.
+        </div>
+        <div class="cell">
+          <strong>Keyboard guard</strong>
+          Shortcuts skip inputs and editable targets, so typing in search does not trigger workspace or sort changes.
+        </div>
+        <div class="cell">
+          <strong>Responsive density</strong>
+          Dense rows keep min-widths inside scrollable panes while the page shell clips horizontal overflow on mobile.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Relevant Diff Snippets</h2>
+      <p class="note">Focused unified diff excerpts are shown below. The local dashboard package does not include <code>@pierre/diffs</code>, so this document uses a styled fallback with file paths and line-level additions/removals.</p>
+
+      <pre class="diff"><code><span class="file">diff --git a/crates/dirtydash/src/db.rs b/crates/dirtydash/src/db.rs</span>
+<span class="ctx">@@ -612,7 +612,7 @@ impl Database {</span>
+<span class="del">-            daily: self.grouped_usage("date(COALESCE(event_timestamp, imported_at))", 30)?,</span>
+<span class="add">+            daily: self.daily_usage(30)?,</span>
+<span class="ctx">@@ -646,9 +646,30 @@ impl Database {</span>
+<span class="add">+    pub fn sessions_for_day(&amp;self, day: &amp;str, limit: usize) -&gt; Result&lt;Vec&lt;SessionSummary&gt;&gt; {</span>
+<span class="add">+        self.sessions_with_filter(</span>
+<span class="add">+            Some("date(COALESCE(event_timestamp, imported_at)) = ?1"),</span>
+<span class="add">+            &amp;[day],</span>
+<span class="add">+            limit,</span>
+<span class="add">+        )</span>
+<span class="add">+    }</span>
+<span class="ctx">@@ -862,6 +891,47 @@ impl Database {</span>
+<span class="add">+    fn daily_usage(&amp;self, limit: usize) -&gt; Result&lt;Vec&lt;NamedUsagePoint&gt;&gt; {</span>
+<span class="add">+        ...</span>
+<span class="add">+            ORDER BY name DESC</span>
+<span class="add">+            LIMIT ?1</span>
+<span class="add">+        ...</span>
+<span class="add">+    }</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/crates/dirtydash/src/server.rs b/crates/dirtydash/src/server.rs</span>
+<span class="ctx">@@ -33,6 +33,7 @@ async fn serve_async(db_path: PathBuf, args: ServeArgs) -&gt; Result&lt;()&gt; {</span>
+<span class="add">+        .route("/api/days/:day/sessions", get(day_sessions))</span>
+<span class="ctx">@@ -96,6 +97,19 @@ async fn sessions(</span>
+<span class="add">+async fn day_sessions(</span>
+<span class="add">+    State(state): State&lt;Arc&lt;AppState&gt;&gt;,</span>
+<span class="add">+    AxumPath(day): AxumPath&lt;String&gt;,</span>
+<span class="add">+) -&gt; Result&lt;Json&lt;serde_json::Value&gt;, StatusCode&gt; {</span>
+<span class="add">+    let db = Database::open(&amp;state.db_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;</span>
+<span class="add">+    let sessions = db.sessions_for_day(&amp;day, 100).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;</span>
+<span class="add">+    serde_json::to_value(sessions).map(Json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)</span>
+<span class="add">+}</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/main.tsx b/dashboard/src/main.tsx</span>
+<span class="ctx">@@ -138,106 +130,51 @@ const emptySummary: DashboardSummary = {</span>
+<span class="del">-const navItems = [</span>
+<span class="del">-  ["Overview", Gauge],</span>
+<span class="del">-  ["The Sink", Activity],</span>
+<span class="del">-  ...</span>
+<span class="del">-] as const;</span>
+<span class="del">-type MockRoute = "mock1" | "mock2" | "mock3" | "mock4";</span>
+<span class="add">+const workspaces: {</span>
+<span class="add">+  id: WorkspaceId;</span>
+<span class="add">+  number: number;</span>
+<span class="add">+  label: string;</span>
+<span class="add">+  command: string;</span>
+<span class="add">+  tabs: string[];</span>
+<span class="add">+  icon: React.ComponentType&lt;{ size?: number; "aria-hidden"?: string | boolean }&gt;;</span>
+<span class="add">+}[] = [</span>
+<span class="add">+  { id: "ledger", number: 1, label: "Ledger", command: "daily", tabs: ["daily", "sessions", "inspector"], icon: Gauge },</span>
+<span class="add">+  { id: "sources", number: 2, label: "Sources", command: "matrix", tabs: ["matrix", "imports", "freshness"], icon: HardDrive },</span>
+<span class="add">+  { id: "sessions", number: 3, label: "Sessions", command: "search", tabs: ["search", "provenance", "trace"], icon: Terminal },</span>
+<span class="add">+  { id: "ops", number: 4, label: "Ops", command: "doctor", tabs: ["import", "pricing", "privacy", "settings", "doctor"], icon: Settings }</span>
+<span class="add">+];</span></code></pre>
+
+      <pre class="diff"><code><span class="file">diff --git a/dashboard/src/styles.css b/dashboard/src/styles.css</span>
+<span class="add">+.tui-shell {</span>
+<span class="add">+  min-height: 100vh;</span>
+<span class="add">+  display: grid;</span>
+<span class="add">+  grid-template-columns: 78px minmax(0, 1fr);</span>
+<span class="add">+  overflow-x: hidden;</span>
+<span class="add">+}</span>
+<span class="add">+.ledger-grid {</span>
+<span class="add">+  grid-template-columns: minmax(360px, 0.95fr) minmax(360px, 1.15fr) 360px;</span>
+<span class="add">+  grid-template-rows: minmax(330px, 440px) minmax(250px, auto);</span>
+<span class="add">+  align-items: start;</span>
+<span class="add">+}</span>
+<span class="add">+@media (prefers-reduced-motion: reduce) {</span>
+<span class="add">+  *, *::before, *::after { transition-duration: 0.01ms !important; }</span>
+<span class="add">+}</span></code></pre>
+    </section>
+
+    <section>
+      <h2>Expected Impact for End-Users</h2>
+      <p>Users land on the most recent usage day first, can move through the ledger with <code>j</code>/<code>k</code>, switch workspaces with <code>1</code> through <code>4</code>, and inspect real sessions for the selected day without leaving the main dashboard. Trust details stay visible without long explanatory copy.</p>
+    </section>
+
+    <section>
+      <h2>Validation</h2>
+      <ul>
+        <li><code>npm run build</code> in <code>dashboard/</code> passed.</li>
+        <li><code>cargo test</code> passed: 19 unit tests, 2 CLI tests, and doc tests.</li>
+        <li>Browser smoke against <code>cargo run -- serve --host 127.0.0.1 --port 5174</code> passed with no console errors.</li>
+        <li>Manual browser automation confirmed default screen is <code>1 Ledger</code>, SVG chart is present, the ledger has newest day first, and selected-day sessions render from the real API.</li>
+        <li>Keyboard smoke confirmed <code>g</code>, <code>j</code>, <code>1-4</code>, <code>/</code>, <code>?</code>, and <code>Esc</code>; shortcuts do not fire while typing in search.</li>
+        <li>Mobile smoke at 390px confirmed no page-level horizontal overflow, with dense rows scrollable inside panes.</li>
+        <li>Reduced-motion smoke confirmed animation duration collapsed to <code>1e-05s</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Issues, Limitations, and Mitigations</h2>
+      <ul>
+        <li>The session cache sort uses a confidence-weighted proxy because <code>SessionSummary</code> does not currently expose grouped cache tokens. The daily ledger and chart use real cache read tokens.</li>
+        <li>The matrix remains an aggregate source/model scan rather than a fully crossed source-model backend query. It uses existing summary data to avoid broad API restructuring.</li>
+        <li>Raw paths can be long. The panes keep them readable with wrapping and internal overflow rather than expanding the whole page.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Follow-up Work</h2>
+      <ul>
+        <li>Add session-level cache token fields to the backend if cache sorting inside the Sessions workspace needs to be exact.</li>
+        <li>Add a real source-model cross-tab API if the matrix should stop using proportional aggregate hints.</li>
+        <li>Consider a small focused visual regression snapshot for the ledger shell once the app has a stable fixture database.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

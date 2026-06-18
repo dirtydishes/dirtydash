@@ -612,7 +612,7 @@ impl Database {
         Ok(DashboardSummary {
             totals: self.usage_totals()?,
             cache: self.cache_stats()?,
-            daily: self.grouped_usage("date(COALESCE(event_timestamp, imported_at))", 30)?,
+            daily: self.daily_usage(30)?,
             by_source: self.grouped_usage("source", 20)?,
             by_model: self.grouped_model_usage(20)?,
             by_project: self.grouped_usage("project_path", 20)?,
@@ -646,9 +646,30 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn sessions_for_day(&self, day: &str, limit: usize) -> Result<Vec<SessionSummary>> {
+        self.sessions_with_filter(
+            Some("date(COALESCE(event_timestamp, imported_at)) = ?1"),
+            &[day],
+            limit,
+        )
+    }
+
     pub fn sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        self.sessions_with_filter(None, &[], limit)
+    }
+
+    fn sessions_with_filter(
+        &self,
+        filter: Option<&str>,
+        filter_params: &[&str],
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
+        let where_clause = filter
+            .map(|condition| format!("WHERE {condition}"))
+            .unwrap_or_default();
+        let limit_index = filter_params.len() + 1;
+        let sql = format!(
             r#"
             SELECT machine, source, session_id, project_path, provider, model,
                 SUM(total_tokens) AS total_tokens,
@@ -660,13 +681,21 @@ impl Database {
                 MIN(parser_name) AS parser_name,
                 MIN(pricing_version) AS pricing_version
             FROM usage_events
+            {where_clause}
             GROUP BY machine, source, session_id, project_path, provider, model
             ORDER BY estimated_cost_usd DESC, total_tokens DESC
-            LIMIT ?1
-            "#,
-        )?;
+            LIMIT ?{limit_index}
+            "#
+        );
+        let limit_i64 = limit as i64;
+        let mut params = filter_params
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        params.push(&limit_i64 as &dyn rusqlite::ToSql);
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| {
+            .query_map(params.as_slice(), |row| {
                 Ok(SessionSummary {
                     machine: row.get(0)?,
                     source: row.get(1)?,
@@ -842,6 +871,47 @@ impl Database {
             "#
         );
         let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(NamedUsagePoint {
+                    name: row.get(0)?,
+                    prompt_tokens: row.get::<_, i64>(1)? as u64,
+                    completion_tokens: row.get::<_, i64>(2)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(3)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(4)? as u64,
+                    reasoning_tokens: row.get::<_, i64>(5)? as u64,
+                    total_tokens: row.get::<_, i64>(6)? as u64,
+                    estimated_cost_usd: row.get(7)?,
+                    standard_tokens: row.get::<_, i64>(8)? as u64,
+                    priority_tokens: row.get::<_, i64>(9)? as u64,
+                    priority_estimated_cost_usd: row.get(10)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn daily_usage(&self, limit: usize) -> Result<Vec<NamedUsagePoint>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT COALESCE(date(COALESCE(event_timestamp, imported_at)), 'unknown') AS name,
+                COALESCE(SUM(prompt_tokens), 0),
+                COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0),
+                COALESCE(SUM(cache_write_tokens), 0),
+                COALESCE(SUM(reasoning_tokens), 0),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(estimated_cost_usd), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN 0 ELSE total_tokens END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN total_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN pricing_mode = 'priority' THEN estimated_cost_usd ELSE 0 END), 0)
+            FROM usage_events
+            GROUP BY name
+            ORDER BY name DESC
+            LIMIT ?1
+            "#,
+        )?;
         let rows = stmt
             .query_map(params![limit as i64], |row| {
                 Ok(NamedUsagePoint {
@@ -1127,6 +1197,48 @@ mod tests {
         assert_eq!(model.priority_tokens, 3_000);
         assert_eq!(model.priority_estimated_cost_usd, 0.003);
         assert!(summary.by_model.iter().all(|row| !row.name.contains('/')));
+    }
+
+    #[test]
+    fn daily_summary_is_newest_first_and_sessions_can_filter_by_day() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+
+        let mut older_expensive = event(
+            "openai",
+            "gpt-5.5",
+            9_000,
+            "old-expensive",
+            PricingMode::Standard,
+        );
+        older_expensive.session_id = "session-old".to_string();
+        older_expensive.event_timestamp = Some("2026-06-16T12:00:00Z".to_string());
+        db.upsert_usage_event(&older_expensive).unwrap();
+
+        let mut newest_small = event(
+            "openai",
+            "gpt-5.5",
+            1_000,
+            "new-small",
+            PricingMode::Standard,
+        );
+        newest_small.session_id = "session-new".to_string();
+        newest_small.event_timestamp = Some("2026-06-18T12:00:00Z".to_string());
+        db.upsert_usage_event(&newest_small).unwrap();
+
+        let summary = db.dashboard_summary().unwrap();
+        let days = summary
+            .daily
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(days, vec!["2026-06-18", "2026-06-16"]);
+
+        let day_sessions = db.sessions_for_day("2026-06-18", 10).unwrap();
+        assert_eq!(day_sessions.len(), 1);
+        assert_eq!(day_sessions[0].session_id, "session-new");
     }
 
     fn event(

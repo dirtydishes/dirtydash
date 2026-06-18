@@ -1,21 +1,19 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  Activity,
   AlertTriangle,
   BadgeDollarSign,
-  Boxes,
   Database,
   FileSearch,
   Gauge,
   HardDrive,
+  Keyboard,
   ListChecks,
   Lock,
   Network,
   Search,
   Settings,
   ShieldCheck,
-  Sparkles,
   Terminal,
   Zap
 } from "lucide-react";
@@ -34,18 +32,8 @@ type UsageTotals = {
   priority_estimated_cost_usd: number;
 };
 
-type NamedUsagePoint = {
+type NamedUsagePoint = UsageTotals & {
   name: string;
-  prompt_tokens: number;
-  completion_tokens: number;
-  cache_read_tokens: number;
-  cache_write_tokens: number;
-  reasoning_tokens: number;
-  total_tokens: number;
-  estimated_cost_usd: number;
-  standard_tokens: number;
-  priority_tokens: number;
-  priority_estimated_cost_usd: number;
 };
 
 type SessionSummary = {
@@ -102,14 +90,18 @@ type PricingRecord = {
   local_free_flag: boolean;
 };
 
-type UsageBarMetric = "tokens" | "cost";
-
 type DoctorReport = {
   event_count: number;
   pricing_count: number;
   detected_sources: number;
   warnings: string[];
 };
+
+type WorkspaceId = "ledger" | "sources" | "sessions" | "ops";
+type SortMode = "cost" | "tokens" | "cache";
+type ViewMode = "inspect" | "trace" | "compare";
+type ChartType = "bar" | "line" | "histogram";
+type Tone = "good" | "warn" | "danger" | "info" | "neutral";
 
 const emptySummary: DashboardSummary = {
   totals: {
@@ -138,106 +130,51 @@ const emptySummary: DashboardSummary = {
   expensive_sessions: []
 };
 
-const navItems = [
-  ["Overview", Gauge],
-  ["The Sink", Activity],
-  ["Sources", HardDrive],
-  ["Sessions", Terminal],
-  ["Projects", Boxes],
-  ["Models", Sparkles],
-  ["Cache", Zap],
-  ["Burn Report", AlertTriangle],
-  ["Import/Files", FileSearch],
-  ["Pricing", BadgeDollarSign],
-  ["Privacy", Lock],
-  ["Settings", Settings],
-  ["Doctor", ListChecks]
-] as const;
-
-type MockRoute = "mock1" | "mock2" | "mock3" | "mock4";
-
-const mockNavItems: { route: MockRoute; href: string; label: string; note: string }[] = [
-  { route: "mock1", href: "/mock1", label: "Run Ledger", note: "cost + cache spine" },
-  { route: "mock2", href: "/mock2", label: "Source Matrix", note: "machines x models" },
-  { route: "mock3", href: "/mock3", label: "Session Inspector", note: "search + provenance" },
-  { route: "mock4", href: "/mock4", label: "Local Ops", note: "import, pricing, doctor" }
+const workspaces: {
+  id: WorkspaceId;
+  number: number;
+  label: string;
+  command: string;
+  tabs: string[];
+  icon: React.ComponentType<{ size?: number; "aria-hidden"?: string | boolean }>;
+}[] = [
+  { id: "ledger", number: 1, label: "Ledger", command: "daily", tabs: ["daily", "sessions", "inspector"], icon: Gauge },
+  { id: "sources", number: 2, label: "Sources", command: "matrix", tabs: ["matrix", "imports", "freshness"], icon: HardDrive },
+  { id: "sessions", number: 3, label: "Sessions", command: "search", tabs: ["search", "provenance", "trace"], icon: Terminal },
+  { id: "ops", number: 4, label: "Ops", command: "doctor", tabs: ["import", "pricing", "privacy", "settings", "doctor"], icon: Settings }
 ];
 
-const mockSessions = [
-  {
-    id: "sess_07f4a9",
-    project: "~/dev/dirtydash",
-    source: "codex",
-    model: "gpt-5-codex",
-    tokens: 1849200,
-    cost: 42.18,
-    cache: 0.63,
-    status: "priced"
-  },
-  {
-    id: "sess_91dd20",
-    project: "~/work/ledgerctl",
-    source: "claude-code",
-    model: "opus-4.1",
-    tokens: 1102400,
-    cost: 31.92,
-    cache: 0.41,
-    status: "needs review"
-  },
-  {
-    id: "sess_c8b73e",
-    project: "~/dev/dirtydash",
-    source: "codex",
-    model: "gpt-5-mini",
-    tokens: 722800,
-    cost: 5.77,
-    cache: 0.78,
-    status: "priced"
-  },
-  {
-    id: "sess_448af1",
-    project: "~/lab/parser-fixtures",
-    source: "cursor",
-    model: "gpt-4.1",
-    tokens: 391400,
-    cost: 7.64,
-    cache: 0.18,
-    status: "partial"
-  }
-];
-
-const mockSources = [
-  { name: "local-mbp", tool: "codex", files: 348, errors: 0, freshness: "41s", tokens: 2920000 },
-  { name: "rack-mini", tool: "claude-code", files: 112, errors: 2, freshness: "9m", tokens: 1040000 },
-  { name: "studio-linux", tool: "cursor", files: 64, errors: 1, freshness: "22m", tokens: 580000 },
-  { name: "archive", tool: "codexbar", files: 19, errors: 0, freshness: "2h", tokens: 210000 }
-];
-
-const mockModels = [
-  { name: "gpt-5-codex", tokens: 1849200, cost: 42.18, cache: 0.63 },
-  { name: "opus-4.1", tokens: 1102400, cost: 31.92, cache: 0.41 },
-  { name: "gpt-5-mini", tokens: 722800, cost: 5.77, cache: 0.78 },
-  { name: "gpt-4.1", tokens: 391400, cost: 7.64, cache: 0.18 }
-];
+const sortModes: SortMode[] = ["cost", "tokens", "cache"];
+const viewModes: ViewMode[] = ["inspect", "trace", "compare"];
+const chartTypes: ChartType[] = ["bar", "line", "histogram"];
 
 function App() {
-  const mockRoute = getMockRoute(window.location.pathname);
-  const [page, setPage] = useState("Overview");
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>("ledger");
+  const [activeTabs, setActiveTabs] = useState<Record<WorkspaceId, string>>({
+    ledger: "daily",
+    sources: "matrix",
+    sessions: "search",
+    ops: "import"
+  });
   const [summary, setSummary] = useState<DashboardSummary>(emptySummary);
   const [sources, setSources] = useState<SourceSummary[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [daySessions, setDaySessions] = useState<SessionSummary[]>([]);
   const [pricing, setPricing] = useState<PricingRecord[]>([]);
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
+  const [selectedSessionCursor, setSelectedSessionCursor] = useState(0);
+  const [sortMode, setSortMode] = useState<SortMode>("cost");
+  const [viewMode, setViewMode] = useState<ViewMode>("inspect");
+  const [chartType, setChartType] = useState<ChartType>("bar");
   const [query, setQuery] = useState("");
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [dayLoading, setDayLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (mockRoute) {
-      setLoading(false);
-      setError(null);
-      return;
-    }
     let active = true;
     async function load() {
       setLoading(true);
@@ -257,8 +194,9 @@ function App() {
         setSessions(sessionsData);
         setPricing(pricingData);
         setDoctor(doctorData);
+        setSelectedDay((current) => current ?? summaryData.daily[0]?.name ?? null);
       } catch (loadError) {
-        if (active) setError(loadError instanceof Error ? loadError.message : "Failed to load");
+        if (active) setError(loadError instanceof Error ? loadError.message : "failed to load");
       } finally {
         if (active) setLoading(false);
       }
@@ -267,96 +205,1172 @@ function App() {
     return () => {
       active = false;
     };
-  }, [mockRoute]);
+  }, []);
 
-  const filteredSessions = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
-    if (!normalized) return sessions;
-    return sessions.filter((session) =>
-      [
-        session.session_id,
-        session.project_path,
-        session.source,
-        session.machine,
-        session.model,
-        session.raw_path
-      ]
-        .join(" ")
-        .toLowerCase()
-        .includes(normalized)
+  useEffect(() => {
+    if (!summary.daily.length) {
+      setSelectedDay(null);
+      return;
+    }
+    setSelectedDay((current) =>
+      current && summary.daily.some((row) => row.name === current) ? current : summary.daily[0].name
     );
-  }, [query, sessions]);
+  }, [summary.daily]);
 
-  if (mockRoute) return <MockRoutePage route={mockRoute} />;
+  useEffect(() => {
+    if (!selectedDay) {
+      setDaySessions([]);
+      return;
+    }
+    let active = true;
+    async function loadDaySessions() {
+      setDayLoading(true);
+      try {
+        const rows = await fetchJson<SessionSummary[]>(
+          `/api/days/${encodeURIComponent(selectedDay)}/sessions`
+        );
+        if (active) {
+          setDaySessions(rows);
+          setSelectedSessionCursor(0);
+        }
+      } catch {
+        if (active) setDaySessions([]);
+      } finally {
+        if (active) setDayLoading(false);
+      }
+    }
+    loadDaySessions();
+    return () => {
+      active = false;
+    };
+  }, [selectedDay]);
+
+  const normalizedQuery = query.trim().toLowerCase();
+  const ledgerRows = summary.daily;
+  const selectedDayIndex = Math.max(
+    0,
+    ledgerRows.findIndex((row) => row.name === selectedDay)
+  );
+  const selectedDayRow = ledgerRows[selectedDayIndex] ?? ledgerRows[0] ?? null;
+  const filteredSessions = useMemo(
+    () => filterSessions(sessions, normalizedQuery),
+    [sessions, normalizedQuery]
+  );
+  const selectedSessionSource = activeWorkspace === "ledger" ? daySessions : filteredSessions;
+  const selectedSession =
+    selectedSessionSource[Math.min(selectedSessionCursor, Math.max(0, selectedSessionSource.length - 1))] ??
+    daySessions[0] ??
+    filteredSessions[0] ??
+    null;
+
+  useEffect(() => {
+    setSelectedSessionCursor((current) =>
+      Math.min(current, Math.max(0, selectedSessionSource.length - 1))
+    );
+  }, [selectedSessionSource.length]);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (isTypingTarget(event.target)) return;
+
+      if (event.key >= "1" && event.key <= "4") {
+        event.preventDefault();
+        const target = workspaces[Number(event.key) - 1];
+        if (target) setActiveWorkspace(target.id);
+        return;
+      }
+      if (event.key === "/") {
+        event.preventDefault();
+        searchRef.current?.focus();
+        return;
+      }
+      if (event.key === "?") {
+        event.preventDefault();
+        setShortcutsOpen((current) => !current);
+        return;
+      }
+      if (event.key === "Escape") {
+        if (shortcutsOpen) setShortcutsOpen(false);
+        else if (query) setQuery("");
+        return;
+      }
+      if (event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        setSortMode((current) => cycleValue(sortModes, current));
+        return;
+      }
+      if (event.key.toLowerCase() === "v") {
+        event.preventDefault();
+        setViewMode((current) => cycleValue(viewModes, current));
+        return;
+      }
+      if (event.key.toLowerCase() === "g") {
+        event.preventDefault();
+        setChartType((current) => cycleValue(chartTypes, current));
+        return;
+      }
+      if (event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        if (activeWorkspace === "ledger" && ledgerRows.length) {
+          const next = Math.min(ledgerRows.length - 1, selectedDayIndex + 1);
+          setSelectedDay(ledgerRows[next]?.name ?? null);
+        } else {
+          setSelectedSessionCursor((current) =>
+            Math.min(Math.max(0, selectedSessionSource.length - 1), current + 1)
+          );
+        }
+        return;
+      }
+      if (event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (activeWorkspace === "ledger" && ledgerRows.length) {
+          const next = Math.max(0, selectedDayIndex - 1);
+          setSelectedDay(ledgerRows[next]?.name ?? null);
+        } else {
+          setSelectedSessionCursor((current) => Math.max(0, current - 1));
+        }
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    activeWorkspace,
+    ledgerRows,
+    query,
+    selectedDayIndex,
+    selectedSessionSource.length,
+    shortcutsOpen
+  ]);
+
+  const activeConfig = workspaces.find((workspace) => workspace.id === activeWorkspace) ?? workspaces[0];
+  const activeTab = activeTabs[activeWorkspace];
+  const commandText = `dirtydash ${activeConfig.command} --sort ${sortMode} --view ${viewMode} --graph ${chartType}`;
 
   return (
-    <main className="app-shell">
-      <aside className="sidebar" aria-label="Primary">
-        <div className="brand-lockup">
-          <Terminal size={20} aria-hidden="true" />
-          <div>
-            <strong>dirtydash</strong>
-            <span>terminal observatory</span>
-          </div>
-        </div>
-        <nav className="nav-list">
-          {navItems.map(([label, Icon]) => (
-            <button
-              key={label}
-              type="button"
-              className={page === label ? "nav-item active" : "nav-item"}
-              onClick={() => setPage(label)}
-              title={label}
-            >
-              <Icon size={16} aria-hidden="true" />
-              <span>{label}</span>
-            </button>
-          ))}
+    <main className="tui-shell">
+      <aside className="rail" aria-label="Primary workspaces">
+        <a className="brand" href="/" aria-label="dirtydash home">
+          <DirtydashMark />
+          <span>dirtydash</span>
+        </a>
+        <nav className="workspace-rail">
+          {workspaces.map((workspace) => {
+            const Icon = workspace.icon;
+            const active = activeWorkspace === workspace.id;
+            return (
+              <button
+                key={workspace.id}
+                type="button"
+                className={active ? "rail-button active" : "rail-button"}
+                onClick={() => setActiveWorkspace(workspace.id)}
+                aria-current={active ? "page" : undefined}
+              >
+                <kbd>{workspace.number}</kbd>
+                <Icon size={16} aria-hidden="true" />
+                <span>{workspace.label}</span>
+              </button>
+            );
+          })}
         </nav>
-        <div className="trust-strip">
-          <ShieldCheck size={16} aria-hidden="true" />
-          <span>metadata-only by default</span>
+        <div className="rail-status" aria-label="Privacy status">
+          <ShieldCheck size={15} aria-hidden="true" />
+          <span>local</span>
         </div>
       </aside>
 
-      <section className="workspace">
-        <header className="topbar">
-          <div>
-            <p className="kicker">local SQLite, bundled pricing, provenance nearby</p>
-            <h1>{page}</h1>
+      <section className="dashboard">
+        <header className="command-bar">
+          <div className="command-line" aria-label="Command context">
+            <span className="prompt">:</span>
+            <code>{commandText}</code>
           </div>
-          <label className="search-box">
-            <Search size={16} aria-hidden="true" />
+          <label className="command-search">
+            <Search size={15} aria-hidden="true" />
             <input
+              ref={searchRef}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search sessions, projects, models"
+              placeholder="search sessions, projects, paths"
+              aria-label="Search sessions, projects, paths"
             />
+            <kbd>/</kbd>
           </label>
+          <button
+            className="icon-command"
+            type="button"
+            onClick={() => setShortcutsOpen(true)}
+            aria-label="Show shortcuts"
+          >
+            <Keyboard size={17} aria-hidden="true" />
+          </button>
         </header>
+
+        <div className="workspace-header">
+          <div>
+            <h1>{activeConfig.number} {activeConfig.label}</h1>
+            <div className="mode-strip" aria-label="Dashboard state">
+              <ModePill label="sort" value={sortMode} />
+              <ModePill label="view" value={viewMode} />
+              <ModePill label="chart" value={chartType} />
+              <ModePill label="rows" value={String(ledgerRows.length)} />
+            </div>
+          </div>
+          <Tabs
+            tabs={activeConfig.tabs}
+            activeTab={activeTab}
+            onSelect={(tab) =>
+              setActiveTabs((current) => ({ ...current, [activeWorkspace]: tab }))
+            }
+          />
+        </div>
 
         {loading ? <Skeleton /> : null}
         {error ? <Notice tone="danger" text={error} /> : null}
         {!loading && !error ? (
-          <Page
-            page={page}
+          <Workspace
+            activeWorkspace={activeWorkspace}
+            activeTab={activeTab}
             summary={summary}
             sources={sources}
             sessions={filteredSessions}
+            daySessions={daySessions}
+            selectedDay={selectedDay}
+            selectedDayRow={selectedDayRow}
+            selectedSession={selectedSession}
+            selectedSessionCursor={selectedSessionCursor}
+            sortMode={sortMode}
+            viewMode={viewMode}
+            chartType={chartType}
+            dayLoading={dayLoading}
+            query={normalizedQuery}
+            onSelectDay={setSelectedDay}
+            onSelectSession={setSelectedSessionCursor}
             pricing={pricing}
             doctor={doctor}
           />
         ) : null}
       </section>
+
+      {shortcutsOpen ? <ShortcutOverlay onClose={() => setShortcutsOpen(false)} /> : null}
     </main>
   );
 }
 
-function getMockRoute(pathname: string): MockRoute | null {
-  const route = pathname.replace(/^\/+/, "").split("/")[0];
-  return route === "mock1" || route === "mock2" || route === "mock3" || route === "mock4"
-    ? route
-    : null;
+function Workspace(props: {
+  activeWorkspace: WorkspaceId;
+  activeTab: string;
+  summary: DashboardSummary;
+  sources: SourceSummary[];
+  sessions: SessionSummary[];
+  daySessions: SessionSummary[];
+  selectedDay: string | null;
+  selectedDayRow: NamedUsagePoint | null;
+  selectedSession: SessionSummary | null;
+  selectedSessionCursor: number;
+  sortMode: SortMode;
+  viewMode: ViewMode;
+  chartType: ChartType;
+  dayLoading: boolean;
+  query: string;
+  onSelectDay: (day: string) => void;
+  onSelectSession: (index: number) => void;
+  pricing: PricingRecord[];
+  doctor: DoctorReport | null;
+}) {
+  if (props.activeWorkspace === "sources") return <SourcesWorkspace {...props} />;
+  if (props.activeWorkspace === "sessions") return <SessionsWorkspace {...props} />;
+  if (props.activeWorkspace === "ops") return <OpsWorkspace {...props} />;
+  return <LedgerWorkspace {...props} />;
+}
+
+function LedgerWorkspace({
+  summary,
+  daySessions,
+  selectedDay,
+  selectedDayRow,
+  selectedSession,
+  selectedSessionCursor,
+  sortMode,
+  viewMode,
+  chartType,
+  dayLoading,
+  onSelectDay,
+  onSelectSession
+}: {
+  summary: DashboardSummary;
+  daySessions: SessionSummary[];
+  selectedDay: string | null;
+  selectedDayRow: NamedUsagePoint | null;
+  selectedSession: SessionSummary | null;
+  selectedSessionCursor: number;
+  sortMode: SortMode;
+  viewMode: ViewMode;
+  chartType: ChartType;
+  dayLoading: boolean;
+  onSelectDay: (day: string) => void;
+  onSelectSession: (index: number) => void;
+}) {
+  const selectedDayIndex = Math.max(
+    0,
+    summary.daily.findIndex((row) => row.name === selectedDay)
+  );
+
+  return (
+    <div className="ledger-grid">
+      <section className="pane ledger-pane" aria-label="Daily usage ledger">
+        <PaneTitle
+          title="daily usage"
+          meta={summary.daily.length ? `newest first, ${summary.daily.length} days` : "no days"}
+        />
+        <DailyLedger
+          rows={summary.daily}
+          selectedDay={selectedDay}
+          sortMode={sortMode}
+          onSelectDay={onSelectDay}
+        />
+      </section>
+
+      <section className="pane chart-pane" aria-label="Usage chart">
+        <PaneTitle
+          title={`${chartType} chart`}
+          meta={selectedDayRow ? selectedDayRow.name : "waiting"}
+        />
+        <UsageChart
+          rows={summary.daily}
+          selectedIndex={selectedDayIndex}
+          chartType={chartType}
+          sortMode={sortMode}
+          onSelect={onSelectDay}
+        />
+      </section>
+
+      <section className="pane sessions-pane" aria-label="Selected day sessions">
+        <PaneTitle
+          title="selected-day sessions"
+          meta={dayLoading ? "loading" : `${daySessions.length} rows`}
+        />
+        <SessionRows
+          sessions={sortSessions(daySessions, sortMode)}
+          cursor={selectedSessionCursor}
+          onSelect={onSelectSession}
+          compact
+        />
+      </section>
+
+      <Inspector
+        day={selectedDayRow}
+        session={selectedSession}
+        viewMode={viewMode}
+        sortMode={sortMode}
+      />
+    </div>
+  );
+}
+
+function SourcesWorkspace({
+  activeTab,
+  sources,
+  summary,
+  query
+}: {
+  activeTab: string;
+  sources: SourceSummary[];
+  summary: DashboardSummary;
+  query: string;
+}) {
+  const visibleSources = sources.filter((source) =>
+    [source.source, source.machine].join(" ").toLowerCase().includes(query)
+  );
+  if (activeTab === "imports") {
+    return (
+      <div className="split-grid">
+        <section className="pane full-span">
+          <PaneTitle title="import files" meta={`${visibleSources.length} source rows`} />
+          <SourceTable sources={visibleSources} />
+        </section>
+      </div>
+    );
+  }
+  if (activeTab === "freshness") {
+    return (
+      <div className="split-grid">
+        <section className="pane">
+          <PaneTitle title="freshness" meta="last import and errors" />
+          <FreshnessList sources={visibleSources} />
+        </section>
+        <section className="pane">
+          <PaneTitle title="parse warnings" meta={`${sources.reduce((sum, row) => sum + row.parse_errors, 0)} total`} />
+          <SourceWarnings sources={visibleSources} />
+        </section>
+      </div>
+    );
+  }
+  return (
+    <div className="split-grid">
+      <section className="pane full-span">
+        <PaneTitle title="source/model matrix" meta={`${sources.length} sources, ${summary.by_model.length} models`} />
+        <SourceMatrix sources={visibleSources} models={summary.by_model} sourceRows={summary.by_source} />
+      </section>
+    </div>
+  );
+}
+
+function SessionsWorkspace({
+  activeTab,
+  sessions,
+  selectedSession,
+  selectedSessionCursor,
+  sortMode,
+  viewMode,
+  onSelectSession
+}: {
+  activeTab: string;
+  sessions: SessionSummary[];
+  selectedSession: SessionSummary | null;
+  selectedSessionCursor: number;
+  sortMode: SortMode;
+  viewMode: ViewMode;
+  onSelectSession: (index: number) => void;
+}) {
+  const sorted = sortSessions(sessions, sortMode);
+  if (activeTab === "provenance") {
+    return (
+      <div className="split-grid">
+        <Inspector session={selectedSession} viewMode="inspect" sortMode={sortMode} />
+        <section className="pane">
+          <PaneTitle title="provenance rows" meta={`${sorted.length} sessions`} />
+          <ProvenanceTable sessions={sorted.slice(0, 24)} />
+        </section>
+      </div>
+    );
+  }
+  if (activeTab === "trace") {
+    return (
+      <div className="split-grid">
+        <section className="pane">
+          <PaneTitle title="trace details" meta={selectedSession?.session_id ?? "none"} />
+          <TracePanel session={selectedSession} viewMode={viewMode} />
+        </section>
+        <Inspector session={selectedSession} viewMode={viewMode} sortMode={sortMode} />
+      </div>
+    );
+  }
+  return (
+    <div className="split-grid">
+      <section className="pane full-span">
+        <PaneTitle title="session inspector" meta={`${sorted.length} matching sessions`} />
+        <SessionRows sessions={sorted} cursor={selectedSessionCursor} onSelect={onSelectSession} />
+      </section>
+    </div>
+  );
+}
+
+function OpsWorkspace({
+  activeTab,
+  summary,
+  sources,
+  pricing,
+  doctor
+}: {
+  activeTab: string;
+  summary: DashboardSummary;
+  sources: SourceSummary[];
+  pricing: PricingRecord[];
+  doctor: DoctorReport | null;
+}) {
+  if (activeTab === "pricing") return <PricingOps pricing={pricing} usageRows={summary.by_model} />;
+  if (activeTab === "privacy") return <PrivacyOps />;
+  if (activeTab === "settings") return <SettingsOps />;
+  if (activeTab === "doctor") return <DoctorOps doctor={doctor} />;
+  return (
+    <div className="split-grid">
+      <section className="pane">
+        <PaneTitle title="import" meta={`${sources.length} source rows`} />
+        <CommandStack
+          commands={[
+            "dirtydash scan",
+            "dirtydash import --metadata-only",
+            "dirtydash remote list"
+          ]}
+        />
+      </section>
+      <section className="pane">
+        <PaneTitle title="status" meta="local accounting" />
+        <MetricGrid
+          metrics={[
+            ["events", compact(doctor?.event_count ?? 0), "sqlite rows"],
+            ["priced", money(summary.totals.estimated_cost_usd), "estimated"],
+            ["cache", percent(summary.cache.cache_read_share), "read share"]
+          ]}
+        />
+      </section>
+    </div>
+  );
+}
+
+function DailyLedger({
+  rows,
+  selectedDay,
+  sortMode,
+  onSelectDay
+}: {
+  rows: NamedUsagePoint[];
+  selectedDay: string | null;
+  sortMode: SortMode;
+  onSelectDay: (day: string) => void;
+}) {
+  return (
+    <div className="ledger-table" role="table" aria-label="Daily usage sorted newest first">
+      <div className="ledger-head" role="row">
+        <span>cur</span>
+        <span>day</span>
+        <span>tokens</span>
+        <span>cost</span>
+        <span>cache</span>
+        <span>fast</span>
+      </div>
+      {rows.length === 0 ? <Empty text="No imported usage." /> : null}
+      {rows.map((row) => {
+        const active = row.name === selectedDay;
+        return (
+          <button
+            key={row.name}
+            type="button"
+            className={active ? "ledger-row active" : "ledger-row"}
+            role="row"
+            onClick={() => onSelectDay(row.name)}
+            title={chartLabel(row, sortMode)}
+          >
+            <span aria-hidden="true">{active ? ">" : ""}</span>
+            <code>{row.name}</code>
+            <span>{compact(row.total_tokens)}</span>
+            <span>{money(row.estimated_cost_usd)}</span>
+            <Meter value={cacheShare(row)} label={`${percent(cacheShare(row))} cache`} />
+            <span>{row.priority_tokens > 0 ? compact(row.priority_tokens) : "-"}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function UsageChart({
+  rows,
+  selectedIndex,
+  chartType,
+  sortMode,
+  onSelect
+}: {
+  rows: NamedUsagePoint[];
+  selectedIndex: number;
+  chartType: ChartType;
+  sortMode: SortMode;
+  onSelect: (day: string) => void;
+}) {
+  const [hovered, setHovered] = useState<number | null>(null);
+  const width = 720;
+  const height = 250;
+  const pad = { top: 18, right: 18, bottom: 34, left: 44 };
+  const chartWidth = width - pad.left - pad.right;
+  const chartHeight = height - pad.top - pad.bottom;
+  const max = Math.max(1, ...rows.map((row) => metricValue(row, sortMode)));
+  const points = rows.map((row, index) => {
+    const x = pad.left + (rows.length <= 1 ? chartWidth / 2 : (index / (rows.length - 1)) * chartWidth);
+    const y = pad.top + chartHeight - (metricValue(row, sortMode) / max) * chartHeight;
+    return { row, x, y };
+  });
+  const activeTooltip = hovered ?? selectedIndex;
+  const tooltipPoint = points[activeTooltip] ?? null;
+  const linePath = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`)
+    .join(" ");
+
+  return (
+    <div className="chart-wrap">
+      <svg className="usage-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${chartType} usage chart`}>
+        <g className="chart-grid">
+          {[0, 1, 2, 3].map((tick) => {
+            const y = pad.top + (chartHeight / 3) * tick;
+            return <line key={tick} x1={pad.left} x2={width - pad.right} y1={y} y2={y} />;
+          })}
+        </g>
+        {chartType === "line" ? (
+          <path className="chart-line" d={linePath} />
+        ) : null}
+        {points.map((point, index) => {
+          const value = metricValue(point.row, sortMode);
+          const barHeight = Math.max(2, (value / max) * chartHeight);
+          const barWidth = Math.max(8, Math.min(30, chartWidth / Math.max(1, rows.length) - 5));
+          const x = point.x - barWidth / 2;
+          const y = pad.top + chartHeight - barHeight;
+          const active = index === selectedIndex;
+          const sharedProps = {
+            onMouseEnter: () => setHovered(index),
+            onMouseLeave: () => setHovered(null),
+            onFocus: () => setHovered(index),
+            onBlur: () => setHovered(null),
+            onClick: () => onSelect(point.row.name),
+            tabIndex: 0,
+            role: "button",
+            "aria-label": chartLabel(point.row, sortMode)
+          };
+          if (chartType === "line") {
+            return (
+              <circle
+                key={point.row.name}
+                className={active ? "chart-point active" : "chart-point"}
+                cx={point.x}
+                cy={point.y}
+                r={active ? 6 : 4}
+                {...sharedProps}
+              />
+            );
+          }
+          if (chartType === "histogram") {
+            const input = point.row.prompt_tokens + point.row.cache_write_tokens;
+            const cache = point.row.cache_read_tokens;
+            const output = point.row.completion_tokens + point.row.reasoning_tokens;
+            const total = Math.max(1, input + cache + output);
+            const inputHeight = barHeight * (input / total);
+            const cacheHeight = barHeight * (cache / total);
+            const outputHeight = barHeight * (output / total);
+            return (
+              <g key={point.row.name} className={active ? "histobar active" : "histobar"} {...sharedProps}>
+                <rect className="hist-output" x={x} y={y} width={barWidth} height={outputHeight} />
+                <rect className="hist-cache" x={x} y={y + outputHeight} width={barWidth} height={cacheHeight} />
+                <rect className="hist-input" x={x} y={y + outputHeight + cacheHeight} width={barWidth} height={inputHeight} />
+              </g>
+            );
+          }
+          return (
+            <rect
+              key={point.row.name}
+              className={active ? "chart-bar active" : "chart-bar"}
+              x={x}
+              y={y}
+              width={barWidth}
+              height={barHeight}
+              rx={0}
+              {...sharedProps}
+            />
+          );
+        })}
+        <g className="chart-axis">
+          <line x1={pad.left} x2={width - pad.right} y1={pad.top + chartHeight} y2={pad.top + chartHeight} />
+          <text x={pad.left} y={height - 8}>{sortMode}</text>
+          <text x={width - pad.right} y={height - 8} textAnchor="end">{rows[selectedIndex]?.name ?? "no data"}</text>
+        </g>
+      </svg>
+      {tooltipPoint ? (
+        <div
+          className="chart-tooltip"
+          style={{
+            left: `${(tooltipPoint.x / width) * 100}%`,
+            top: `${(tooltipPoint.y / height) * 100}%`
+          }}
+        >
+          <strong>{tooltipPoint.row.name}</strong>
+          <span>{money(tooltipPoint.row.estimated_cost_usd)}</span>
+          <span>{compact(tooltipPoint.row.total_tokens)} tokens</span>
+          <span>{percent(cacheShare(tooltipPoint.row))} cache</span>
+          <span>{compact(tooltipPoint.row.priority_tokens)} fast</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SourceMatrix({
+  sources,
+  models,
+  sourceRows
+}: {
+  sources: SourceSummary[];
+  models: NamedUsagePoint[];
+  sourceRows: NamedUsagePoint[];
+}) {
+  const visibleModels = models.slice(0, 6);
+  const maxTokens = Math.max(1, ...sourceRows.map((row) => row.total_tokens));
+  return (
+    <div className="matrix" role="table" aria-label="Source and model matrix">
+      <div className="matrix-head" role="row">
+        <span>source</span>
+        {visibleModels.map((model) => <span key={model.name}>{model.name}</span>)}
+        <span>fresh</span>
+      </div>
+      {sources.map((source, sourceIndex) => {
+        const sourceUsage = sourceRows.find((row) => row.name === source.source);
+        return (
+          <div className="matrix-row" key={`${source.source}-${source.machine}`} role="row">
+            <span>
+              <code>{source.machine}</code>
+              <small>{source.source} / {source.files} files</small>
+            </span>
+            {visibleModels.map((model, modelIndex) => {
+              const weight = sourceUsage
+                ? ((sourceUsage.total_tokens / maxTokens) * ((modelIndex + 2) / (sourceIndex + 2)))
+                : 0;
+              return (
+                <span key={model.name} className="matrix-cell" data-weight={Math.min(9, Math.round(weight * 9))}>
+                  {weight > 0.08 ? compact(Math.round(sourceUsage?.total_tokens ?? 0)) : "-"}
+                </span>
+              );
+            })}
+            <span className={source.parse_errors > 0 ? "warn-text" : "good-text"}>
+              {source.parse_errors > 0 ? `${source.parse_errors} err` : source.last_imported_at ? relativeTime(source.last_imported_at) : "-"}
+            </span>
+          </div>
+        );
+      })}
+      {sources.length === 0 ? <Empty text="No source rows match." /> : null}
+    </div>
+  );
+}
+
+function SessionRows({
+  sessions,
+  cursor,
+  onSelect,
+  compact = false
+}: {
+  sessions: SessionSummary[];
+  cursor: number;
+  onSelect: (index: number) => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className={compact ? "session-list compact" : "session-list"} role="table" aria-label="Session rows">
+      <div className="session-head" role="row">
+        <span>cur</span>
+        <span>session</span>
+        <span>source</span>
+        <span>project</span>
+        <span>model</span>
+        <span>tokens</span>
+        <span>cost</span>
+      </div>
+      {sessions.map((session, index) => {
+        const active = index === cursor;
+        return (
+          <button
+            key={`${session.machine}-${session.source}-${session.session_id}-${session.model}-${index}`}
+            type="button"
+            className={active ? "session-row active" : "session-row"}
+            role="row"
+            onClick={() => onSelect(index)}
+          >
+            <span aria-hidden="true">{active ? ">" : ""}</span>
+            <code>{session.session_id}</code>
+            <span>{session.source}</span>
+            <span>{session.project_path}</span>
+            <span>{session.model}</span>
+            <span>{compactNumber(session.total_tokens)}</span>
+            <span>{money(session.estimated_cost_usd)}</span>
+          </button>
+        );
+      })}
+      {sessions.length === 0 ? <Empty text="No sessions match." /> : null}
+    </div>
+  );
+}
+
+function Inspector({
+  day,
+  session,
+  viewMode,
+  sortMode
+}: {
+  day?: NamedUsagePoint | null;
+  session: SessionSummary | null;
+  viewMode: ViewMode;
+  sortMode: SortMode;
+}) {
+  return (
+    <aside className="pane inspector-pane" aria-label="Inspector">
+      <PaneTitle title={viewMode} meta={sortMode} />
+      {day ? (
+        <dl className="detail-list">
+          <DetailRow label="day" value={day.name} />
+          <DetailRow label="tokens" value={compact(day.total_tokens)} />
+          <DetailRow label="cost" value={money(day.estimated_cost_usd)} />
+          <DetailRow label="cache" value={percent(cacheShare(day))} />
+          <DetailRow label="fast" value={compact(day.priority_tokens)} />
+        </dl>
+      ) : null}
+      {session ? (
+        <>
+          <dl className="detail-list">
+            <DetailRow label="session" value={session.session_id} />
+            <DetailRow label="project" value={session.project_path} />
+            <DetailRow label="model" value={session.model} />
+            <DetailRow label="source" value={`${session.machine}/${session.source}`} />
+            <DetailRow label="confidence" value={percent(session.confidence)} />
+          </dl>
+          <div className="provenance-stack">
+            <code>parser={session.parser_name}</code>
+            <code>pricing={session.pricing_version}</code>
+            <code>raw={session.raw_path}</code>
+          </div>
+        </>
+      ) : (
+        <Empty text="No session selected." />
+      )}
+    </aside>
+  );
+}
+
+function TracePanel({ session, viewMode }: { session: SessionSummary | null; viewMode: ViewMode }) {
+  if (!session) return <Empty text="No trace selected." />;
+  return (
+    <ol className="trace-list">
+      <li><code>{session.raw_path}</code></li>
+      <li>{session.parser_name} normalized usage into {compact(session.total_tokens)} tokens.</li>
+      <li>{session.pricing_version} priced the session at {money(session.estimated_cost_usd)}.</li>
+      <li>view={viewMode}, confidence={percent(session.confidence)}</li>
+    </ol>
+  );
+}
+
+function ProvenanceTable({ sessions }: { sessions: SessionSummary[] }) {
+  return (
+    <div className="data-table">
+      <table>
+        <thead>
+          <tr>
+            <th>Session</th>
+            <th>Parser</th>
+            <th>Pricing</th>
+            <th>Raw path</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sessions.map((session) => (
+            <tr key={`${session.session_id}-${session.raw_path}`}>
+              <td>{session.session_id}</td>
+              <td>{session.parser_name}</td>
+              <td>{session.pricing_version}</td>
+              <td><code>{session.raw_path}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SourceTable({ sources }: { sources: SourceSummary[] }) {
+  return (
+    <div className="data-table">
+      <table>
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Machine</th>
+            <th>Files</th>
+            <th>Errors</th>
+            <th>Last import</th>
+          </tr>
+        </thead>
+        <tbody>
+          {sources.map((source) => (
+            <tr key={`${source.source}-${source.machine}`}>
+              <td>{source.source}</td>
+              <td>{source.machine}</td>
+              <td>{source.files}</td>
+              <td><Status value={source.parse_errors ? `${source.parse_errors}` : "0"} tone={source.parse_errors ? "warn" : "good"} /></td>
+              <td>{source.last_imported_at ? shortDate(source.last_imported_at) : "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function FreshnessList({ sources }: { sources: SourceSummary[] }) {
+  return (
+    <div className="ops-list">
+      {sources.map((source) => (
+        <div key={`${source.source}-${source.machine}`}>
+          <code>{source.machine}</code>
+          <span>{source.source}</span>
+          <strong>{source.last_imported_at ? relativeTime(source.last_imported_at) : "never"}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SourceWarnings({ sources }: { sources: SourceSummary[] }) {
+  const warnings = sources.filter((source) => source.parse_errors > 0);
+  if (!warnings.length) return <Notice tone="good" text="0 parse errors" />;
+  return (
+    <div className="ops-list">
+      {warnings.map((source) => (
+        <div key={`${source.source}-${source.machine}`}>
+          <code>{source.source}</code>
+          <span>{source.machine}</span>
+          <strong>{source.parse_errors} errors</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PricingOps({ pricing, usageRows }: { pricing: PricingRecord[]; usageRows: NamedUsagePoint[] }) {
+  const usageByModel = new Map(usageRows.map((row) => [row.name, row]));
+  return (
+    <div className="split-grid">
+      <section className="pane full-span">
+        <PaneTitle title="pricing" meta={`${pricing.length} records`} />
+        <div className="data-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Model</th>
+                <th>Usage</th>
+                <th>Input</th>
+                <th>Output</th>
+                <th>Cache read</th>
+                <th>Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pricing.map((row) => {
+                const usage = usageByModel.get(row.model);
+                return (
+                  <tr key={`${row.provider}-${row.model}`}>
+                    <td>{row.provider}</td>
+                    <td>{row.model}</td>
+                    <td>{usage ? `${compact(usage.total_tokens)} / ${money(usage.estimated_cost_usd)}` : "not imported"}</td>
+                    <td>{money(row.input_rate)}</td>
+                    <td>{money(row.output_rate)}</td>
+                    <td>{money(row.cache_read_rate)}</td>
+                    <td>
+                      <Status value={row.local_free_flag ? "free" : row.override_flag ? "override" : "bundled"} tone={row.override_flag || row.local_free_flag ? "info" : "neutral"} />
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PrivacyOps() {
+  return (
+    <div className="split-grid">
+      <section className="pane">
+        <PaneTitle title="privacy" meta="metadata-first" />
+        <MetricGrid
+          metrics={[
+            ["default", "metadata-only", "imports"],
+            ["remote", "ssh pull", "no agent"],
+            ["preview", "off", "raw text"]
+          ]}
+        />
+      </section>
+      <section className="pane">
+        <PaneTitle title="stored provenance" meta="audit fields" />
+        <CommandStack commands={["raw_path", "raw_span", "parser_name", "pricing_version", "raw_event_hash"]} />
+      </section>
+    </div>
+  );
+}
+
+function SettingsOps() {
+  return (
+    <div className="split-grid">
+      <section className="pane">
+        <PaneTitle title="settings" meta="CLI-backed" />
+        <CommandStack
+          commands={[
+            "dirtydash import --metadata-only",
+            "dirtydash pricing list",
+            "dirtydash remote list",
+            "dirtydash doctor"
+          ]}
+        />
+      </section>
+    </div>
+  );
+}
+
+function DoctorOps({ doctor }: { doctor: DoctorReport | null }) {
+  if (!doctor) return <Notice tone="warn" text="doctor unavailable" />;
+  return (
+    <div className="split-grid">
+      <section className="pane">
+        <PaneTitle title="doctor" meta={`${doctor.warnings.length} warnings`} />
+        <MetricGrid
+          metrics={[
+            ["events", compact(doctor.event_count), "usage rows"],
+            ["pricing", compact(doctor.pricing_count), "records"],
+            ["sources", compact(doctor.detected_sources), "detected"]
+          ]}
+        />
+      </section>
+      <section className="pane">
+        <PaneTitle title="warnings" meta={String(doctor.warnings.length)} />
+        {doctor.warnings.length ? (
+          doctor.warnings.map((warning) => <Notice key={warning} tone="warn" text={warning} />)
+        ) : (
+          <Notice tone="good" text="0 warnings" />
+        )}
+      </section>
+    </div>
+  );
+}
+
+function Tabs({
+  tabs,
+  activeTab,
+  onSelect
+}: {
+  tabs: string[];
+  activeTab: string;
+  onSelect: (tab: string) => void;
+}) {
+  return (
+    <div className="tabs" role="tablist">
+      {tabs.map((tab) => (
+        <button
+          key={tab}
+          type="button"
+          role="tab"
+          aria-selected={activeTab === tab}
+          className={activeTab === tab ? "active" : ""}
+          onClick={() => onSelect(tab)}
+        >
+          {tab}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function PaneTitle({ title, meta }: { title: string; meta: string }) {
+  return (
+    <div className="pane-title">
+      <h2>{title}</h2>
+      <span>{meta}</span>
+    </div>
+  );
+}
+
+function ModePill({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="mode-pill">
+      <span>{label}</span>
+      <code>{value}</code>
+    </span>
+  );
+}
+
+function Status({ value, tone }: { value: string; tone: Tone }) {
+  return <span className={`status ${tone}`}>{value}</span>;
+}
+
+function Notice({ text, tone }: { text: string; tone: "good" | "warn" | "danger" }) {
+  return <div className={`notice ${tone}`}>{text}</div>;
+}
+
+function Empty({ text }: { text: string }) {
+  return <p className="empty">{text}</p>;
+}
+
+function Meter({ value, label }: { value: number; label: string }) {
+  return (
+    <span className="meter" role="img" aria-label={label} title={label}>
+      <span style={{ width: `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%` }} />
+    </span>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+  );
+}
+
+function MetricGrid({ metrics }: { metrics: [string, string, string][] }) {
+  return (
+    <div className="metric-grid">
+      {metrics.map(([label, value, note]) => (
+        <div key={label} className="metric-cell">
+          <span>{label}</span>
+          <strong>{value}</strong>
+          <small>{note}</small>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CommandStack({ commands }: { commands: string[] }) {
+  return (
+    <div className="command-stack">
+      {commands.map((command) => <code key={command}>{command}</code>)}
+    </div>
+  );
+}
+
+function DirtydashMark() {
+  return (
+    <svg className="dirtydash-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M5 8h22v4H5zM5 14h14v4H5zM5 20h20v4H5z" />
+      <rect x="22" y="14" width="5" height="4" />
+    </svg>
+  );
+}
+
+function ShortcutOverlay({ onClose }: { onClose: () => void }) {
+  const rows = [
+    ["1-4", "switch workspace"],
+    ["/", "focus search"],
+    ["j/k", "move cursor"],
+    ["s", "cycle sort"],
+    ["v", "cycle view"],
+    ["g", "cycle chart"],
+    ["?", "shortcuts"],
+    ["Esc", "clear or close"]
+  ];
+  return (
+    <div className="overlay" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+      <div className="shortcut-pane">
+        <PaneTitle title="shortcuts" meta="keyboard-first" />
+        <dl>
+          {rows.map(([key, value]) => (
+            <div key={key}>
+              <dt><kbd>{key}</kbd></dt>
+              <dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+        <button type="button" onClick={onClose}>close</button>
+      </div>
+    </div>
+  );
+}
+
+function Skeleton() {
+  return (
+    <div className="ledger-grid">
+      <div className="skeleton pane" />
+      <div className="skeleton pane" />
+      <div className="skeleton pane" />
+      <div className="skeleton pane" />
+    </div>
+  );
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -365,471 +1379,50 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-type MockSort = "cost" | "tokens" | "cache";
-type MockView = "inspect" | "trace" | "compare";
-
-const mockSorts: MockSort[] = ["cost", "tokens", "cache"];
-const mockViews: MockView[] = ["inspect", "trace", "compare"];
-
-function MockRoutePage({ route }: { route: MockRoute }) {
-  const [sort, setSort] = useState<MockSort>("cost");
-  const [view, setView] = useState<MockView>("inspect");
-  const [activeIndex, setActiveIndex] = useState(0);
-  const routeIndex = mockNavItems.findIndex((item) => item.route === route);
-  const sortedSessions = useMemo(() => {
-    const key =
-      sort === "cost"
-        ? (session: (typeof mockSessions)[number]) => session.cost
-        : sort === "tokens"
-          ? (session: (typeof mockSessions)[number]) => session.tokens
-          : (session: (typeof mockSessions)[number]) => session.cache;
-    return [...mockSessions].sort((a, b) => key(b) - key(a));
-  }, [sort]);
-  const activeSession = sortedSessions[Math.min(activeIndex, sortedSessions.length - 1)];
-
-  useEffect(() => {
-    function onKeyDown(event: KeyboardEvent) {
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.key >= "1" && event.key <= "4") {
-        const target = mockNavItems[Number(event.key) - 1];
-        if (target) window.location.href = target.href;
-      }
-      if (event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        setSort((current) => cycleValue(mockSorts, current));
-      }
-      if (event.key.toLowerCase() === "v") {
-        event.preventDefault();
-        setView((current) => cycleValue(mockViews, current));
-      }
-      if (event.key.toLowerCase() === "j") {
-        event.preventDefault();
-        setActiveIndex((current) => Math.min(sortedSessions.length - 1, current + 1));
-      }
-      if (event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setActiveIndex((current) => Math.max(0, current - 1));
-      }
-    }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [sortedSessions.length]);
-
-  useEffect(() => {
-    setActiveIndex((current) => Math.min(current, sortedSessions.length - 1));
-  }, [sortedSessions.length]);
-
-  return (
-    <main className={`mock-shell mock-${route}`}>
-      <aside className="mock-rail" aria-label="Mockup routes">
-        <a className="mock-brand" href="/">
-          <Terminal size={18} aria-hidden="true" />
-          <span>dirtydash</span>
-          <code>mock/{routeIndex + 1}</code>
-        </a>
-        <nav className="mock-route-list">
-          {mockNavItems.map((item, index) => (
-            <a
-              key={item.route}
-              className={item.route === route ? "mock-route active" : "mock-route"}
-              href={item.href}
-            >
-              <kbd>{index + 1}</kbd>
-              <span>{item.label}</span>
-              <small>{item.note}</small>
-            </a>
-          ))}
-        </nav>
-        <div className="mock-hotkeys">
-          <span>hotkeys</span>
-          <dl>
-            <div>
-              <dt>s</dt>
-              <dd>sort {sort}</dd>
-            </div>
-            <div>
-              <dt>v</dt>
-              <dd>view {view}</dd>
-            </div>
-            <div>
-              <dt>j/k</dt>
-              <dd>move cursor</dd>
-            </div>
-          </dl>
-        </div>
-      </aside>
-
-      <section className="mock-workspace">
-        <MockCommandBar route={route} sort={sort} view={view} setSort={setSort} setView={setView} />
-        {route === "mock1" ? (
-          <MockRunLedger sessions={sortedSessions} activeSession={activeSession} activeIndex={activeIndex} sort={sort} view={view} />
-        ) : null}
-        {route === "mock2" ? (
-          <MockSourceMatrix sessions={sortedSessions} activeSession={activeSession} activeIndex={activeIndex} sort={sort} view={view} />
-        ) : null}
-        {route === "mock3" ? (
-          <MockSessionInspector sessions={sortedSessions} activeSession={activeSession} activeIndex={activeIndex} sort={sort} view={view} />
-        ) : null}
-        {route === "mock4" ? (
-          <MockLocalOps sessions={sortedSessions} activeSession={activeSession} sort={sort} view={view} />
-        ) : null}
-      </section>
-    </main>
+function filterSessions(sessions: SessionSummary[], query: string) {
+  if (!query) return sessions;
+  return sessions.filter((session) =>
+    [
+      session.session_id,
+      session.project_path,
+      session.source,
+      session.machine,
+      session.model,
+      session.raw_path,
+      session.parser_name,
+      session.pricing_version
+    ]
+      .join(" ")
+      .toLowerCase()
+      .includes(query)
   );
 }
 
-function MockCommandBar({
-  route,
-  sort,
-  view,
-  setSort,
-  setView
-}: {
-  route: MockRoute;
-  sort: MockSort;
-  view: MockView;
-  setSort: React.Dispatch<React.SetStateAction<MockSort>>;
-  setView: React.Dispatch<React.SetStateAction<MockView>>;
-}) {
-  const title = mockNavItems.find((item) => item.route === route)?.label ?? "Mockup";
-  return (
-    <header className="mock-command">
-      <div className="mock-prompt" aria-label="Current command context">
-        <span>dirtydash</span>
-        <code>{title.toLowerCase().replace(/\s+/g, "-")}</code>
-        <span>--sort</span>
-        <code>{sort}</code>
-        <span>--view</span>
-        <code>{view}</code>
-      </div>
-      <div className="mock-controls" aria-label="Mockup controls">
-        {mockSorts.map((value) => (
-          <button
-            key={value}
-            type="button"
-            className={value === sort ? "active" : ""}
-            onClick={() => setSort(value)}
-          >
-            sort:{value}
-          </button>
-        ))}
-        {mockViews.map((value) => (
-          <button
-            key={value}
-            type="button"
-            className={value === view ? "active" : ""}
-            onClick={() => setView(value)}
-          >
-            view:{value}
-          </button>
-        ))}
-      </div>
-    </header>
-  );
+function sortSessions(sessions: SessionSummary[], mode: SortMode) {
+  return [...sessions].sort((a, b) => {
+    if (mode === "tokens") return b.total_tokens - a.total_tokens;
+    if (mode === "cache") return sessionCacheProxy(b) - sessionCacheProxy(a);
+    return b.estimated_cost_usd - a.estimated_cost_usd;
+  });
 }
 
-function MockRunLedger({
-  sessions,
-  activeSession,
-  activeIndex,
-  sort,
-  view
-}: {
-  sessions: typeof mockSessions;
-  activeSession: (typeof mockSessions)[number];
-  activeIndex: number;
-  sort: MockSort;
-  view: MockView;
-}) {
-  return (
-    <div className="mock-layout ledger-layout">
-      <section className="mock-primary-pane">
-        <MockHeadline
-          title="Run ledger"
-          text="A cost-and-cache spine for developers who want the interesting rows first, with keyboard sorting and a cursor that never hides provenance."
-        />
-        <div className="mock-stat-strip">
-          <MockStat label="observed spend" value="$87.51" detail="4 priced tools" />
-          <MockStat label="cache read" value="61%" detail="input incl. reads" />
-          <MockStat label="unpriced" value="2 rows" detail="parser needs price" />
-          <MockStat label="freshness" value="41s" detail="local-mbp import" />
-        </div>
-        <div className="mock-ledger" role="table" aria-label="Run ledger sorted sessions">
-          <div className="mock-ledger-head" role="row">
-            <span>cursor</span>
-            <span>session</span>
-            <span>model</span>
-            <span>tokens</span>
-            <span>cost</span>
-            <span>cache</span>
-            <span>status</span>
-          </div>
-          {sessions.map((session, index) => (
-            <div
-              key={session.id}
-              className={index === activeIndex ? "mock-ledger-row active" : "mock-ledger-row"}
-              role="row"
-            >
-              <span aria-label={index === activeIndex ? "selected" : "not selected"}>
-                {index === activeIndex ? ">" : " "}
-              </span>
-              <code>{session.id}</code>
-              <span>{session.model}</span>
-              <span>{compact(session.tokens)}</span>
-              <span>{money(session.cost)}</span>
-              <MockInlineMeter value={session.cache} label={`${percent(session.cache)} cache read`} />
-              <span>{session.status}</span>
-            </div>
-          ))}
-        </div>
-      </section>
-      <MockInspector activeSession={activeSession} sort={sort} view={view} />
-    </div>
-  );
+function sessionCacheProxy(session: SessionSummary) {
+  return session.total_tokens === 0 ? 0 : session.confidence * session.total_tokens;
 }
 
-function MockSourceMatrix({
-  sessions,
-  activeSession,
-  activeIndex,
-  sort,
-  view
-}: {
-  sessions: typeof mockSessions;
-  activeSession: (typeof mockSessions)[number];
-  activeIndex: number;
-  sort: MockSort;
-  view: MockView;
-}) {
-  return (
-    <div className="mock-layout matrix-layout">
-      <section className="mock-primary-pane">
-        <MockHeadline
-          title="Source matrix"
-          text="Machines, tools, and models share one dense surface: the user can see which importer is stale, which model is expensive, and where cache behavior is trustworthy."
-        />
-        <div className="mock-matrix" role="table" aria-label="Source and model usage matrix">
-          <div className="mock-matrix-head" role="row">
-            <span>source</span>
-            {mockModels.map((model) => (
-              <span key={model.name}>{model.name}</span>
-            ))}
-            <span>fresh</span>
-          </div>
-          {mockSources.map((source, sourceIndex) => (
-            <div key={source.name} className="mock-matrix-row" role="row">
-              <span>
-                <code>{source.name}</code>
-                <small>{source.tool} / {source.files} files</small>
-              </span>
-              {mockModels.map((model, modelIndex) => {
-                const weight = ((sourceIndex + 2) * (modelIndex + 3)) % 10;
-                return (
-                  <span key={model.name} className="mock-cell" data-weight={weight}>
-                    {weight > 2 ? compact(Math.round((source.tokens * (weight + 2)) / 18)) : "-"}
-                  </span>
-                );
-              })}
-              <span className={source.errors > 0 ? "mock-warn-text" : "mock-good-text"}>
-                {source.errors > 0 ? `${source.errors} err` : source.freshness}
-              </span>
-            </div>
-          ))}
-        </div>
-        <div className="mock-log-pane" aria-label="Import log excerpt">
-          <p><code>import</code> local-mbp/codex parsed 348 files, 0 errors, 41s ago</p>
-          <p><code>price</code> gpt-5-codex mapped to bundled snapshot 2026-06</p>
-          <p><code>warn</code> rack-mini/claude-code has 2 records without final stop timestamp</p>
-        </div>
-      </section>
-      <MockInspector activeSession={activeSession ?? sessions[activeIndex]} sort={sort} view={view} />
-    </div>
-  );
+function metricValue(row: NamedUsagePoint, mode: SortMode) {
+  if (mode === "cost") return row.estimated_cost_usd;
+  if (mode === "cache") return row.cache_read_tokens;
+  return row.total_tokens;
 }
 
-function MockSessionInspector({
-  sessions,
-  activeSession,
-  activeIndex,
-  sort,
-  view
-}: {
-  sessions: typeof mockSessions;
-  activeSession: (typeof mockSessions)[number];
-  activeIndex: number;
-  sort: MockSort;
-  view: MockView;
-}) {
-  return (
-    <div className="mock-layout inspector-layout">
-      <section className="mock-primary-pane">
-        <MockHeadline
-          title="Session inspector"
-          text="Search behaves like a command buffer, but the result surface stays web-native: sticky columns, readable provenance, and fast sort pivots."
-        />
-        <div className="mock-command-line" aria-label="Mock search command">
-          <Search size={15} aria-hidden="true" />
-          <span>session where project:dirtydash sort:{sort} view:{view}</span>
-          <kbd>/</kbd>
-        </div>
-        <div className="mock-session-list">
-          {sessions.map((session, index) => (
-            <div key={session.id} className={index === activeIndex ? "mock-session-row active" : "mock-session-row"}>
-              <span>{index === activeIndex ? ">" : " "}</span>
-              <code>{session.id}</code>
-              <span>{session.project}</span>
-              <span>{session.source}</span>
-              <span>{compact(session.tokens)}</span>
-              <span>{money(session.cost)}</span>
-            </div>
-          ))}
-        </div>
-        <div className="mock-trace">
-          <span>trace</span>
-          <ol>
-            <li>raw span located in <code>~/.codex/sessions/2026/06/18/{activeSession.id}.jsonl</code></li>
-            <li>parser normalized prompt, cache read, output, and reasoning tokens</li>
-            <li>pricing snapshot attached before rollup so cost remains auditable</li>
-          </ol>
-        </div>
-      </section>
-      <MockInspector activeSession={activeSession} sort={sort} view={view} />
-    </div>
-  );
+function chartLabel(row: NamedUsagePoint, mode: SortMode) {
+  return `${row.name}: ${money(row.estimated_cost_usd)}, ${compact(row.total_tokens)} tokens, ${compact(row.cache_read_tokens)} cache, ${compact(row.priority_tokens)} fast, metric ${mode}`;
 }
 
-function MockLocalOps({
-  sessions,
-  activeSession,
-  sort,
-  view
-}: {
-  sessions: typeof mockSessions;
-  activeSession: (typeof mockSessions)[number];
-  sort: MockSort;
-  view: MockView;
-}) {
-  return (
-    <div className="mock-layout ops-layout">
-      <section className="mock-primary-pane">
-        <MockHeadline
-          title="Local ops"
-          text="A durable control surface for imports, doctor checks, and pricing overrides. It keeps commands visible but gives users web-grade scanning and safer state changes."
-        />
-        <div className="mock-ops-grid">
-          <MockOpsLane title="import queue" rows={["codex local ready", "rack-mini ssh stale", "cursor archive paused"]} />
-          <MockOpsLane title="doctor" rows={["0 schema drift", "2 parse warnings", "pricing snapshot current"]} />
-          <MockOpsLane title="privacy" rows={["metadata-only default", "no remote agent install", "raw previews disabled"]} />
-        </div>
-        <div className="mock-runbook">
-          <span>next commands</span>
-          <code>dirtydash import --metadata-only --source codex</code>
-          <code>dirtydash doctor --explain</code>
-          <code>dirtydash pricing list --overrides</code>
-        </div>
-      </section>
-      <MockInspector activeSession={activeSession ?? sessions[0]} sort={sort} view={view} />
-    </div>
-  );
-}
-
-function MockHeadline({ title, text }: { title: string; text: string }) {
-  return (
-    <div className="mock-headline">
-      <div>
-        <h1>{title}</h1>
-        <p>{text}</p>
-      </div>
-      <div className="mock-status-line">
-        <Status value="local" tone="good" />
-        <Status value="no cards" tone="info" />
-        <Status value="keyboard-first" tone="neutral" />
-      </div>
-    </div>
-  );
-}
-
-function MockStat({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="mock-stat">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{detail}</small>
-    </div>
-  );
-}
-
-function MockInspector({
-  activeSession,
-  sort,
-  view
-}: {
-  activeSession: (typeof mockSessions)[number];
-  sort: MockSort;
-  view: MockView;
-}) {
-  return (
-    <aside className="mock-inspector" aria-label="Selected session inspector">
-      <div className="mock-inspector-title">
-        <span>selected</span>
-        <code>{activeSession.id}</code>
-      </div>
-      <dl className="mock-detail-list">
-        <div>
-          <dt>project</dt>
-          <dd>{activeSession.project}</dd>
-        </div>
-        <div>
-          <dt>model</dt>
-          <dd>{activeSession.model}</dd>
-        </div>
-        <div>
-          <dt>tokens</dt>
-          <dd>{compact(activeSession.tokens)}</dd>
-        </div>
-        <div>
-          <dt>cost</dt>
-          <dd>{money(activeSession.cost)}</dd>
-        </div>
-        <div>
-          <dt>cache read</dt>
-          <dd>{percent(activeSession.cache)}</dd>
-        </div>
-        <div>
-          <dt>mode</dt>
-          <dd>{view} / sort:{sort}</dd>
-        </div>
-      </dl>
-      <div className="mock-provenance">
-        <span>provenance</span>
-        <code>parser=codex-jsonl</code>
-        <code>pricing=bundled-2026-06</code>
-        <code>raw=~/.codex/sessions/.../{activeSession.id}.jsonl</code>
-      </div>
-    </aside>
-  );
-}
-
-function MockInlineMeter({ value, label }: { value: number; label: string }) {
-  return (
-    <span className="mock-inline-meter" role="img" aria-label={label} title={label}>
-      <span style={{ width: `${Math.round(value * 100)}%` }} />
-    </span>
-  );
-}
-
-function MockOpsLane({ title, rows }: { title: string; rows: string[] }) {
-  return (
-    <div className="mock-ops-lane">
-      <h2>{title}</h2>
-      {rows.map((row) => (
-        <p key={row}>
-          <span aria-hidden="true">::</span>
-          {row}
-        </p>
-      ))}
-    </div>
-  );
+function cacheShare(row: NamedUsagePoint) {
+  const input = row.prompt_tokens + row.cache_read_tokens + row.cache_write_tokens;
+  return input === 0 ? 0 : row.cache_read_tokens / input;
 }
 
 function cycleValue<T>(values: T[], current: T): T {
@@ -837,583 +1430,17 @@ function cycleValue<T>(values: T[], current: T): T {
   return values[(index + 1) % values.length];
 }
 
-function Page({
-  page,
-  summary,
-  sources,
-  sessions,
-  pricing,
-  doctor
-}: {
-  page: string;
-  summary: DashboardSummary;
-  sources: SourceSummary[];
-  sessions: SessionSummary[];
-  pricing: PricingRecord[];
-  doctor: DoctorReport | null;
-}) {
-  if (page === "Sources") return <SourcesPage sources={sources} />;
-  if (page === "Sessions") return <SessionsPage sessions={sessions} />;
-  if (page === "Projects") return <Breakdown title="Project totals" rows={summary.by_project} />;
-  if (page === "Models") return <Breakdown title="Model totals" rows={summary.by_model} />;
-  if (page === "Cache") return <CachePage summary={summary} />;
-  if (page === "Burn Report") return <BurnReport summary={summary} />;
-  if (page === "Import/Files") return <SourcesPage sources={sources} filesMode />;
-  if (page === "Pricing") return <PricingPage pricing={pricing} usageRows={summary.by_model} />;
-  if (page === "Doctor") return <DoctorPage doctor={doctor} />;
-  if (page === "Privacy") return <PrivacyPage />;
-  if (page === "Settings") return <SettingsPage />;
-  if (page === "The Sink") return <SinkPage summary={summary} sessions={sessions} />;
-  return <Overview summary={summary} sessions={sessions} sources={sources} />;
-}
-
-function Overview({
-  summary,
-  sessions,
-  sources
-}: {
-  summary: DashboardSummary;
-  sessions: SessionSummary[];
-  sources: SourceSummary[];
-}) {
-  const observedInput =
-    summary.totals.prompt_tokens +
-    summary.totals.cache_read_tokens +
-    summary.totals.cache_write_tokens;
-  const generatedTokens = summary.totals.completion_tokens + summary.totals.reasoning_tokens;
-  return (
-    <div className="page-grid">
-      <Metric label="Estimated spend" value={money(summary.totals.estimated_cost_usd)} sub="reported, manual, local CodexBar pricing" />
-      <Metric label="Total tokens" value={compact(summary.totals.total_tokens)} sub={`${compact(observedInput)} input incl. cache, ${compact(generatedTokens)} generated`} />
-      <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.cache.cache_read_tokens)} observed reads`} />
-      <Metric label="Sources" value={sources.length.toString()} sub="local plus SSH-pulled metadata" />
-      <TrendPanel title="Token usage over time" rows={summary.daily} />
-      <TrendPanel title="Usage by source" rows={summary.by_source} />
-      <TrendPanel title="Usage by model" rows={summary.by_model} />
-      <SessionsTable title="Top expensive sessions" sessions={sessions.slice(0, 8)} />
-    </div>
-  );
-}
-
-function SinkPage({
-  summary,
-  sessions
-}: {
-  summary: DashboardSummary;
-  sessions: SessionSummary[];
-}) {
-  return (
-    <div className="page-grid">
-      <Metric label="Machines" value={new Set(sessions.map((session) => session.machine)).size.toString()} sub="combined local and remote provenance" />
-      <Metric label="Sink tokens" value={compact(summary.totals.total_tokens)} sub="all imported usage events" />
-      <Breakdown title="Machine and source totals" rows={summary.by_source} />
-      <SessionsTable title="Recent sink sessions" sessions={sessions.slice(0, 12)} />
-    </div>
-  );
-}
-
-function CachePage({ summary }: { summary: DashboardSummary }) {
-  const observedInputTokens =
-    summary.totals.prompt_tokens +
-    summary.totals.cache_read_tokens +
-    summary.totals.cache_write_tokens;
-  const cacheWriteSub =
-    summary.totals.cache_write_tokens > 0
-      ? "source-reported cache creation"
-      : "not exposed by current logs";
-  const rows: NamedUsagePoint[] = [
-    {
-      name: "uncached input",
-      prompt_tokens: summary.totals.prompt_tokens,
-      completion_tokens: 0,
-      cache_read_tokens: 0,
-      cache_write_tokens: 0,
-      reasoning_tokens: 0,
-      total_tokens: summary.totals.prompt_tokens,
-      estimated_cost_usd: 0,
-      standard_tokens: summary.totals.prompt_tokens,
-      priority_tokens: 0,
-      priority_estimated_cost_usd: 0
-    },
-    {
-      name: "cache read",
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      cache_read_tokens: summary.totals.cache_read_tokens,
-      cache_write_tokens: 0,
-      reasoning_tokens: 0,
-      total_tokens: summary.totals.cache_read_tokens,
-      estimated_cost_usd: 0,
-      standard_tokens: summary.totals.cache_read_tokens,
-      priority_tokens: 0,
-      priority_estimated_cost_usd: 0
-    },
-    {
-      name: "cache write",
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      cache_read_tokens: 0,
-      cache_write_tokens: summary.totals.cache_write_tokens,
-      reasoning_tokens: 0,
-      total_tokens: summary.totals.cache_write_tokens,
-      estimated_cost_usd: 0,
-      standard_tokens: summary.totals.cache_write_tokens,
-      priority_tokens: 0,
-      priority_estimated_cost_usd: 0
-    }
-  ];
-  return (
-    <div className="page-grid">
-      <Metric label="Cache read share" value={percent(summary.cache.cache_read_share)} sub={`${compact(summary.totals.cache_read_tokens)} of ${compact(observedInputTokens)} input`} />
-      <Metric label="Cache reads" value={compact(summary.totals.cache_read_tokens)} sub="cached input reported by logs" />
-      <Metric label="Reported writes" value={compact(summary.totals.cache_write_tokens)} sub={cacheWriteSub} />
-      <section className="panel note-panel">
-        <div className="panel-header">
-          <h2>Accounting note</h2>
-          <span>observed only</span>
-        </div>
-        <p>
-          Dirtydash only counts cache lifecycle tokens present in local session logs. Codex logs
-          usually expose cached input reads, but not cache creation/write tokens.
-        </p>
-      </section>
-      <Breakdown title="Cache behavior" rows={rows} />
-    </div>
-  );
-}
-
-function BurnReport({ summary }: { summary: DashboardSummary }) {
-  const unpriced = summary.by_model.filter((row) => row.total_tokens > 0 && row.estimated_cost_usd === 0);
-  const unpricedTokens = unpriced.reduce((total, row) => total + row.total_tokens, 0);
-  return (
-    <div className="page-grid">
-      <Metric label="Biggest session" value={summary.expensive_sessions[0] ? money(summary.expensive_sessions[0].estimated_cost_usd) : "$0.00"} sub={summary.expensive_sessions[0]?.session_id ?? "no sessions yet"} />
-      <Metric label="Biggest model" value={summary.by_model[0]?.name ?? "unknown"} sub={summary.by_model[0] ? money(summary.by_model[0].estimated_cost_usd) : "no spend"} />
-      <Metric label="Unpriced tokens" value={compact(unpricedTokens)} sub={`${unpriced.length} model rows need pricing`} />
-      <Metric label="Codex limit drain" value="not measured" sub="fast mode is not inferred from cache reads" />
-      <TrendPanel title="Model spend" rows={summary.by_model} metric="cost" />
-      <AccountingNote
-        title="Codex subscription accounting"
-        badge="separate ledger"
-      >
-        Dirtydash estimates tokenized API-style cost from imported logs. Codex subscription
-        limits can drain from a different fast-mode ledger, especially when xhigh sessions
-        produce uncached input, output, and reasoning tokens. A low cache-read dollar estimate
-        should not be read as total fast-mode consumption.
-      </AccountingNote>
-      <SessionsTable title="Sessions to inspect first" sessions={summary.expensive_sessions} />
-    </div>
-  );
-}
-
-function SourcesPage({ sources, filesMode = false }: { sources: SourceSummary[]; filesMode?: boolean }) {
-  return (
-    <section className="panel wide">
-      <div className="panel-header">
-        <h2>{filesMode ? "Tracked import files" : "Detected sources"}</h2>
-        <span>{sources.length} source rows</span>
-      </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Source</th>
-              <th>Machine</th>
-              <th>Files</th>
-              <th>Parse errors</th>
-              <th>Last import</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sources.map((source) => (
-              <tr key={`${source.source}-${source.machine}`}>
-                <td>{source.source}</td>
-                <td>{source.machine}</td>
-                <td>{source.files}</td>
-                <td>
-                  <Status value={source.parse_errors === 0 ? "clean" : `${source.parse_errors} errors`} tone={source.parse_errors === 0 ? "good" : "warn"} />
-                </td>
-                <td>{source.last_imported_at ? shortDate(source.last_imported_at) : "-"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  );
-}
-
-function SessionsPage({ sessions }: { sessions: SessionSummary[] }) {
-  return <SessionsTable title="Searchable sessions" sessions={sessions} />;
-}
-
-function PricingPage({
-  pricing,
-  usageRows
-}: {
-  pricing: PricingRecord[];
-  usageRows: NamedUsagePoint[];
-}) {
-  const usageByModel = useMemo(
-    () => new Map(usageRows.map((row) => [row.name, row])),
-    [usageRows]
-  );
-  const maxUsage = Math.max(1, ...usageRows.map((row) => row.total_tokens));
-  const maxCost = Math.max(0.01, ...usageRows.map((row) => row.estimated_cost_usd));
-  return (
-    <section className="panel wide">
-      <div className="panel-header">
-        <h2>Pricing snapshot</h2>
-        <span>{pricing.length} model records</span>
-      </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Provider</th>
-              <th>Model</th>
-              <th>Usage</th>
-              <th>Input</th>
-              <th>Output</th>
-              <th>Cache read</th>
-              <th>Cache write</th>
-              <th>Source</th>
-            </tr>
-          </thead>
-          <tbody>
-            {pricing.map((row) => {
-              const usage = usageByModel.get(row.model);
-              return (
-                <tr key={`${row.provider}-${row.model}`}>
-                  <td>{row.provider}</td>
-                  <td>{row.model}</td>
-                  <td>
-                    {usage ? (
-                      <div className="pricing-usage">
-                        <UsageBar row={usage} max={maxUsage} compactMode />
-                        <UsageSummary row={usage} />
-                        <UsageBar row={usage} max={maxCost} metric="cost" compactMode />
-                        <UsageSummary row={usage} metric="cost" />
-                      </div>
-                    ) : (
-                      <span className="raw-path">not imported</span>
-                    )}
-                  </td>
-                  <td>{money(row.input_rate)}</td>
-                  <td>{money(row.output_rate)}</td>
-                  <td>{money(row.cache_read_rate)}</td>
-                  <td>{money(row.cache_write_rate)}</td>
-                  <td>
-                    <Status
-                      value={row.local_free_flag ? "free" : row.override_flag ? "override" : "bundled"}
-                      tone={row.override_flag || row.local_free_flag ? "info" : "neutral"}
-                    />
-                    <span className="pricing-version">
-                      {row.source_label} / {row.provider}/{row.model} / {row.snapshot_version}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-      <p className="table-note">
-        Rates are per 1M tokens for cost estimation. Cache-read pricing is not the same thing as
-        Codex fast-mode subscription usage.
-      </p>
-    </section>
-  );
-}
-
-function DoctorPage({ doctor }: { doctor: DoctorReport | null }) {
-  if (!doctor) return <Notice tone="warn" text="Doctor data is not available yet." />;
-  return (
-    <div className="page-grid">
-      <Metric label="Events" value={doctor.event_count.toString()} sub="usage rows in SQLite" />
-      <Metric label="Pricing records" value={doctor.pricing_count.toString()} sub="bundled plus overrides" />
-      <Metric label="Detected sources" value={doctor.detected_sources.toString()} sub="paths with files" />
-      <section className="panel wide">
-        <div className="panel-header">
-          <h2>Warnings</h2>
-          <span>{doctor.warnings.length}</span>
-        </div>
-        {doctor.warnings.length === 0 ? (
-          <Notice tone="good" text="No doctor warnings were reported." />
-        ) : (
-          doctor.warnings.map((warning) => <Notice key={warning} tone="warn" text={warning} />)
-        )}
-      </section>
-    </div>
-  );
-}
-
-function PrivacyPage() {
-  return (
-    <section className="panel wide">
-      <div className="panel-header">
-        <h2>Privacy posture</h2>
-        <span>metadata-first</span>
-      </div>
-      <div className="detail-grid">
-        <Detail label="Default import" value="metadata-only" />
-        <Detail label="Stored provenance" value="raw path, raw span, parser, event hash" />
-        <Detail label="Preview handling" value="not requested during first-run happy path" />
-        <Detail label="Remote behavior" value="pull discovery over SSH, no remote agent install" />
-      </div>
-    </section>
-  );
-}
-
-function SettingsPage() {
-  return (
-    <section className="panel wide">
-      <div className="panel-header">
-        <h2>Settings surface</h2>
-        <span>CLI-backed</span>
-      </div>
-      <div className="command-list">
-        <code>dirtydash scan</code>
-        <code>dirtydash import --metadata-only</code>
-        <code>dirtydash pricing list</code>
-        <code>dirtydash remote list</code>
-        <code>dirtydash doctor</code>
-      </div>
-    </section>
-  );
-}
-
-function Breakdown({ title, rows }: { title: string; rows: NamedUsagePoint[] }) {
-  return <TrendPanel title={title} rows={rows} className="wide" />;
-}
-
-function TrendPanel({
-  title,
-  rows,
-  className = "",
-  metric = "tokens"
-}: {
-  title: string;
-  rows: NamedUsagePoint[];
-  className?: string;
-  metric?: UsageBarMetric;
-}) {
-  const max = Math.max(metric === "cost" ? 0.01 : 1, ...rows.map((row) => barValue(row, metric)));
-  const hasPriority = rows.some((row) => priorityBarValue(row, metric) > 0);
-  return (
-    <section className={`panel ${className}`}>
-      <div className="panel-header">
-        <h2>{title}</h2>
-        <span>{hasPriority ? `${rows.length} rows, yellow is fast/priority` : `${rows.length} rows`}</span>
-      </div>
-      <div className="bar-list">
-        {rows.length === 0 ? <Empty text="No imported usage yet." /> : null}
-        {rows.map((row) => (
-          <div className="bar-row" key={row.name}>
-            <div className="bar-label">
-              <span>{row.name || "unknown"}</span>
-              <small>{money(row.estimated_cost_usd)}</small>
-            </div>
-            <UsageBar row={row} max={max} metric={metric} />
-            <UsageSummary row={row} metric={metric} />
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function UsageBar({
-  row,
-  max,
-  metric = "tokens",
-  compactMode = false
-}: {
-  row: NamedUsagePoint;
-  max: number;
-  metric?: UsageBarMetric;
-  compactMode?: boolean;
-}) {
-  const value = barValue(row, metric);
-  const priorityValue = priorityBarValue(row, metric);
-  const fill = value > 0 ? Math.max(compactMode ? 3 : 4, (value / max) * 100) : 0;
-  const priorityWidth = value > 0 ? Math.min(fill, fill * (priorityValue / value)) : 0;
-  const priorityLeft = Math.max(0, fill - priorityWidth);
-  const totalLabel = metric === "cost" ? money(value) : `${compact(value)} tokens`;
-  const priorityLabel =
-    metric === "cost" ? money(priorityValue) : `${compact(priorityValue)} priority/fast tokens`;
-  const label =
-    priorityValue > 0
-      ? `${row.name || "unknown"}: ${totalLabel}, ${priorityLabel}`
-      : `${row.name || "unknown"}: ${totalLabel}`;
-
-  return (
-    <div
-      className={compactMode ? "bar-track compact" : "bar-track"}
-      data-metric={metric}
-      role="img"
-      aria-label={label}
-      title={label}
-    >
-      <span className="bar-fill" style={{ width: `${fill}%` }} />
-      {priorityValue > 0 ? (
-        <span
-          className="bar-priority"
-          style={{ left: `${priorityLeft}%`, width: `${priorityWidth}%` }}
-        />
-      ) : null}
-    </div>
-  );
-}
-
-function UsageSummary({ row, metric = "tokens" }: { row: NamedUsagePoint; metric?: UsageBarMetric }) {
-  const inputWithCache = row.prompt_tokens + row.cache_read_tokens + row.cache_write_tokens;
-  const generated = row.completion_tokens + row.reasoning_tokens;
-  if (metric === "cost") {
-    return (
-      <small className="token-summary">
-        <span>{money(row.estimated_cost_usd)} total</span>
-        {row.priority_estimated_cost_usd > 0 ? (
-          <span className="fast-label" title={`${money(row.priority_estimated_cost_usd)} priority/fast spend`}>
-            {money(row.priority_estimated_cost_usd)} fast
-          </span>
-        ) : null}
-      </small>
-    );
-  }
-  return (
-    <small className="token-summary">
-      <span>{compact(row.total_tokens)} tokens</span>
-      <span title={`${compact(inputWithCache)} input tokens including cached reads`}>
-        {compact(inputWithCache)} input
-      </span>
-      <span title={`${compact(generated)} output tokens`}>
-        {compact(generated)} output
-      </span>
-      {row.priority_tokens > 0 ? (
-        <span className="fast-label" title={`${compact(row.priority_tokens)} priority/fast tokens`}>
-          {compact(row.priority_tokens)} fast
-        </span>
-      ) : null}
-    </small>
-  );
-}
-
-function barValue(row: NamedUsagePoint, metric: UsageBarMetric) {
-  return metric === "cost" ? row.estimated_cost_usd : row.total_tokens;
-}
-
-function priorityBarValue(row: NamedUsagePoint, metric: UsageBarMetric) {
-  return metric === "cost" ? row.priority_estimated_cost_usd : row.priority_tokens;
-}
-
-function SessionsTable({ title, sessions }: { title: string; sessions: SessionSummary[] }) {
-  return (
-    <section className="panel wide">
-      <div className="panel-header">
-        <h2>{title}</h2>
-        <span>{sessions.length} sessions</span>
-      </div>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Session</th>
-              <th>Source</th>
-              <th>Project</th>
-              <th>Model</th>
-              <th>Tokens</th>
-              <th>Cost</th>
-              <th>Provenance</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sessions.map((session) => (
-              <tr key={`${session.machine}-${session.source}-${session.session_id}-${session.model}`}>
-                <td>{session.session_id}</td>
-                <td>{session.source}</td>
-                <td>{session.project_path}</td>
-                <td>{session.model}</td>
-                <td>{compact(session.total_tokens)}</td>
-                <td>{money(session.estimated_cost_usd)}</td>
-                <td>
-                  <span className="provenance">{session.parser_name}</span>
-                  <span className="pricing-version">{session.pricing_version}</span>
-                  <span className="raw-path">{session.raw_path}</span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {sessions.length === 0 ? <Empty text="No sessions match the current filter." /> : null}
-      </div>
-    </section>
-  );
-}
-
-function Metric({ label, value, sub }: { label: string; value: string; sub: string }) {
-  return (
-    <section className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{sub}</small>
-    </section>
-  );
-}
-
-function AccountingNote({
-  title,
-  badge,
-  children
-}: {
-  title: string;
-  badge: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="panel note-panel wide">
-      <div className="panel-header">
-        <h2>{title}</h2>
-        <span>{badge}</span>
-      </div>
-      <p>{children}</p>
-    </section>
-  );
-}
-
-function Detail({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="detail">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function Status({ value, tone }: { value: string; tone: "good" | "warn" | "danger" | "info" | "neutral" }) {
-  return <span className={`status ${tone}`}>{value}</span>;
-}
-
-function Notice({ text, tone }: { text: string; tone: "good" | "warn" | "danger" }) {
-  return <div className={`notice ${tone}`}>{text}</div>;
-}
-
-function Skeleton() {
-  return (
-    <div className="page-grid">
-      <div className="skeleton" />
-      <div className="skeleton" />
-      <div className="skeleton" />
-      <div className="skeleton wide" />
-    </div>
-  );
-}
-
-function Empty({ text }: { text: string }) {
-  return <p className="empty">{text}</p>;
+function isTypingTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName.toLowerCase();
+  return tag === "input" || tag === "textarea" || target.isContentEditable;
 }
 
 function compact(value: number) {
+  return Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
+}
+
+function compactNumber(value: number) {
   return Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
@@ -1436,6 +1463,17 @@ function shortDate(value: string) {
     hour: "numeric",
     minute: "2-digit"
   }).format(new Date(value));
+}
+
+function relativeTime(value: string) {
+  const then = new Date(value).getTime();
+  if (!Number.isFinite(then)) return shortDate(value);
+  const minutes = Math.max(0, Math.round((Date.now() - then) / 60000));
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
 }
 
 createRoot(document.getElementById("root") as HTMLElement).render(
