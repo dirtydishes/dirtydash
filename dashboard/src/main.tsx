@@ -256,12 +256,22 @@ function App() {
     () => filterSessions(sessions, normalizedQuery),
     [sessions, normalizedQuery]
   );
-  const selectedSessionSource = activeWorkspace === "ledger" ? daySessions : filteredSessions;
+  const sortedDaySessions = useMemo(
+    () => sortSessions(daySessions, sortMode),
+    [daySessions, sortMode]
+  );
+  const sortedFilteredSessions = useMemo(
+    () => sortSessions(filteredSessions, sortMode),
+    [filteredSessions, sortMode]
+  );
+  const selectedSessionSource = activeWorkspace === "ledger" ? sortedDaySessions : sortedFilteredSessions;
   const selectedSession =
     selectedSessionSource[Math.min(selectedSessionCursor, Math.max(0, selectedSessionSource.length - 1))] ??
-    daySessions[0] ??
-    filteredSessions[0] ??
+    sortedDaySessions[0] ??
+    sortedFilteredSessions[0] ??
     null;
+  const activeConfig = workspaces.find((workspace) => workspace.id === activeWorkspace) ?? workspaces[0];
+  const activeTab = activeTabs[activeWorkspace];
 
   useEffect(() => {
     setSelectedSessionCursor((current) =>
@@ -270,6 +280,31 @@ function App() {
   }, [selectedSessionSource.length]);
 
   useEffect(() => {
+    function moveDay(delta: number) {
+      if (!ledgerRows.length) return;
+      const next = Math.max(0, Math.min(ledgerRows.length - 1, selectedDayIndex + delta));
+      setSelectedDay(ledgerRows[next]?.name ?? null);
+    }
+
+    function moveSession(delta: number) {
+      if (selectedSessionSource.length) {
+        setSelectedSessionCursor((current) =>
+          Math.max(0, Math.min(selectedSessionSource.length - 1, current + delta))
+        );
+      } else if (activeWorkspace === "ledger") {
+        moveDay(delta);
+      }
+    }
+
+    function moveTab(delta: number) {
+      const tabs = (workspaces.find((workspace) => workspace.id === activeWorkspace) ?? workspaces[0]).tabs;
+      const currentIndex = Math.max(0, tabs.indexOf(activeTab));
+      const next = tabs[(currentIndex + delta + tabs.length) % tabs.length];
+      if (next) {
+        setActiveTabs((current) => ({ ...current, [activeWorkspace]: next }));
+      }
+    }
+
     function onKeyDown(event: KeyboardEvent) {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (isTypingTarget(event.target)) return;
@@ -310,26 +345,26 @@ function App() {
         setChartType((current) => cycleValue(chartTypes, current));
         return;
       }
-      if (event.key.toLowerCase() === "j") {
+      if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {
         event.preventDefault();
-        if (activeWorkspace === "ledger" && ledgerRows.length) {
-          const next = Math.min(ledgerRows.length - 1, selectedDayIndex + 1);
-          setSelectedDay(ledgerRows[next]?.name ?? null);
-        } else {
-          setSelectedSessionCursor((current) =>
-            Math.min(Math.max(0, selectedSessionSource.length - 1), current + 1)
-          );
-        }
+        moveSession(1);
         return;
       }
-      if (event.key.toLowerCase() === "k") {
+      if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") {
         event.preventDefault();
-        if (activeWorkspace === "ledger" && ledgerRows.length) {
-          const next = Math.max(0, selectedDayIndex - 1);
-          setSelectedDay(ledgerRows[next]?.name ?? null);
-        } else {
-          setSelectedSessionCursor((current) => Math.max(0, current - 1));
-        }
+        moveSession(-1);
+        return;
+      }
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        if (activeWorkspace === "ledger") moveDay(-1);
+        else moveTab(-1);
+        return;
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        if (activeWorkspace === "ledger") moveDay(1);
+        else moveTab(1);
       }
     }
 
@@ -337,6 +372,7 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     activeWorkspace,
+    activeTab,
     ledgerRows,
     query,
     selectedDayIndex,
@@ -344,8 +380,6 @@ function App() {
     shortcutsOpen
   ]);
 
-  const activeConfig = workspaces.find((workspace) => workspace.id === activeWorkspace) ?? workspaces[0];
-  const activeTab = activeTabs[activeWorkspace];
   const commandText = `dirtydash ${activeConfig.command} --sort ${sortMode} --view ${viewMode} --graph ${chartType}`;
 
   return (
@@ -434,8 +468,8 @@ function App() {
             activeTab={activeTab}
             summary={summary}
             sources={sources}
-            sessions={filteredSessions}
-            daySessions={daySessions}
+            sessions={sortedFilteredSessions}
+            daySessions={sortedDaySessions}
             selectedDay={selectedDay}
             selectedDayRow={selectedDayRow}
             selectedSession={selectedSession}
@@ -1348,7 +1382,9 @@ function ShortcutOverlay({ onClose }: { onClose: () => void }) {
   const rows = [
     ["1-4", "switch workspace"],
     ["/", "focus search"],
-    ["j/k", "move cursor"],
+    ["↑/↓", "move row cursor"],
+    ["←/→", "change day or tab"],
+    ["j/k", "move row cursor"],
     ["s", "cycle sort"],
     ["v", "cycle view"],
     ["g", "cycle chart"],
