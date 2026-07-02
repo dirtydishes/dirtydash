@@ -848,7 +848,8 @@ function OpsWorkspace({
           metrics={[
             ["events", compact(doctor?.event_count ?? 0), "sqlite rows"],
             ["priced", money(summary.totals.estimated_cost_usd), "estimated"],
-            ["cache", percent(summary.cache.cache_read_share), "read share"]
+            ["cache", percent(summary.cache.cache_read_share), "read share"],
+            ["saved", money(summary.cache.estimated_savings_usd), "cache discount"]
           ]}
         />
       </section>
@@ -879,7 +880,7 @@ function UsageGlance({ summary }: { summary: DashboardSummary }) {
       <div>
         <span>cache</span>
         <strong>{percent(summary.cache.cache_read_share)}</strong>
-        <small>{compact(summary.cache.cache_read_tokens)} read</small>
+        <small>{compact(summary.cache.cache_read_tokens)} read / {money(summary.cache.estimated_savings_usd)} saved</small>
       </div>
     </section>
   );

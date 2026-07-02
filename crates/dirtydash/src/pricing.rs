@@ -134,6 +134,28 @@ pub fn estimate_cost(
     }
 }
 
+pub fn estimate_cache_savings(
+    db: &Database,
+    provider: &str,
+    model: &str,
+    usage: &UsageNumbers,
+    pricing_mode: PricingMode,
+) -> Result<f64> {
+    let Some(record) = db.pricing_record(provider, model)? else {
+        return Ok(0.0);
+    };
+    if record.local_free_flag {
+        return Ok(0.0);
+    }
+
+    let rates = if record.override_flag || !is_codexbar_record(&record) {
+        standard_rates(&record)
+    } else {
+        codexbar_rates_for_usage(&record, usage, pricing_mode)
+    };
+    Ok(cache_savings_with_rates(usage, rates))
+}
+
 pub fn override_price(
     db: &Database,
     provider: &str,
@@ -242,22 +264,29 @@ struct RateSet {
 }
 
 fn codexbar_cost(record: &PricingRecord, usage: &UsageNumbers, mode: PricingMode) -> f64 {
+    codex_cost_with_rates(usage, codexbar_rates_for_usage(record, usage, mode))
+}
+
+fn codexbar_rates_for_usage(
+    record: &PricingRecord,
+    usage: &UsageNumbers,
+    mode: PricingMode,
+) -> RateSet {
     if mode == PricingMode::Priority {
         if let Some(rates) = codexbar_priority_rates(&record.model)
             .filter(|_| codex_total_input_tokens(usage) <= CODEX_PRIORITY_INPUT_TOKEN_LIMIT)
         {
-            return codex_cost_with_rates(usage, rates);
+            return rates;
         }
     }
 
     let use_long_rates =
         codex_uses_long_context_rates(&record.provider, &record.model, record, usage);
-    let rates = if use_long_rates {
+    if use_long_rates {
         codexbar_long_rates(&record.model).unwrap_or_else(|| standard_rates(record))
     } else {
         standard_rates(record)
-    };
-    codex_cost_with_rates(usage, rates)
+    }
 }
 
 fn codex_cost_with_rates(usage: &UsageNumbers, rates: RateSet) -> f64 {
@@ -266,6 +295,16 @@ fn codex_cost_with_rates(usage: &UsageNumbers, rates: RateSet) -> f64 {
         + per_million(output_tokens, rates.output)
         + per_million(usage.cache_read_tokens, rates.cache_read)
         + per_million(usage.cache_write_tokens, rates.cache_write)
+}
+
+fn cache_savings_with_rates(usage: &UsageNumbers, rates: RateSet) -> f64 {
+    per_million(
+        usage.cache_read_tokens,
+        (rates.input - rates.cache_read).max(0.0),
+    ) + per_million(
+        usage.cache_write_tokens,
+        (rates.input - rates.cache_write).max(0.0),
+    )
 }
 
 fn standard_rates(record: &PricingRecord) -> RateSet {

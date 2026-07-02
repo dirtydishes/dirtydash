@@ -6,8 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::importers::{self, DetectedSource, SourceKind, UsageEvent};
-use crate::pricing::{PricingMode, PricingRecord};
+use crate::importers::{self, DetectedSource, SourceKind, UsageEvent, UsageNumbers};
+use crate::pricing::{self, PricingMode, PricingRecord};
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -844,6 +844,7 @@ impl Database {
 
     fn cache_stats(&self) -> Result<CacheStats> {
         let totals = self.usage_totals()?;
+        let estimated_savings_usd = self.cache_savings_usd()?;
         let cache_input = totals.cache_read_tokens + totals.cache_write_tokens;
         let denominator = totals.prompt_tokens + cache_input;
         let cache_read_share = if denominator == 0 {
@@ -856,8 +857,50 @@ impl Database {
             cache_write_tokens: totals.cache_write_tokens,
             cache_read_share,
             hit_ratio: cache_read_share,
-            estimated_savings_usd: 0.0,
+            estimated_savings_usd,
         })
+    }
+
+    fn cache_savings_usd(&self) -> Result<f64> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT provider, model, pricing_mode, prompt_tokens, completion_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens
+            FROM usage_events
+            WHERE cache_read_tokens > 0 OR cache_write_tokens > 0
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    PricingMode::from_db(&row.get::<_, String>(2)?),
+                    UsageNumbers {
+                        prompt_tokens: row.get::<_, i64>(3)? as u64,
+                        completion_tokens: row.get::<_, i64>(4)? as u64,
+                        cache_read_tokens: row.get::<_, i64>(5)? as u64,
+                        cache_write_tokens: row.get::<_, i64>(6)? as u64,
+                        reasoning_tokens: row.get::<_, i64>(7)? as u64,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
+
+        rows.into_iter()
+            .try_fold(0.0, |total, (provider, model, pricing_mode, usage)| {
+                Ok(total
+                    + pricing::estimate_cache_savings(
+                        self,
+                        &provider,
+                        &model,
+                        &usage,
+                        pricing_mode,
+                    )?)
+            })
     }
 
     fn grouped_usage(&self, expression: &str, limit: usize) -> Result<Vec<NamedUsagePoint>> {
@@ -1164,6 +1207,8 @@ fn cursor_doc_slug_to_model(model: &str) -> Option<String> {
 mod tests {
     use tempfile::tempdir;
 
+    use crate::pricing::seed_bundled_pricing;
+
     use super::*;
 
     #[test]
@@ -1209,6 +1254,32 @@ mod tests {
         assert_eq!(model.priority_tokens, 3_000);
         assert_eq!(model.priority_estimated_cost_usd, 0.003);
         assert!(summary.by_model.iter().all(|row| !row.name.contains('/')));
+    }
+
+    #[test]
+    fn cache_stats_estimate_cached_token_savings() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+        db.migrate().unwrap();
+        seed_bundled_pricing(&db).unwrap();
+
+        let mut cached = event(
+            "openai",
+            "gpt-5.5",
+            90_000,
+            "cached-discount",
+            PricingMode::Standard,
+        );
+        cached.cache_read_tokens = 10_000;
+        cached.cache_write_tokens = 5_000;
+        cached.total_tokens = 105_000;
+        db.upsert_usage_event(&cached).unwrap();
+
+        let summary = db.dashboard_summary().unwrap();
+
+        assert_eq!(summary.cache.cache_read_tokens, 10_000);
+        assert_eq!(summary.cache.cache_write_tokens, 5_000);
+        assert!((summary.cache.estimated_savings_usd - 0.07).abs() < 0.000001);
     }
 
     #[test]

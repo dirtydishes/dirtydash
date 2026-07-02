@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod importers;
+pub mod loop_upgrade;
 pub mod pricing;
 pub mod remote;
 pub mod server;

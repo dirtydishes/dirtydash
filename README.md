@@ -140,6 +140,14 @@ Run health checks:
 cargo run -p dirtydash -- doctor
 ```
 
+Upgrade an existing dirtyloops loop to the current generated runtime artifacts:
+
+```bash
+cargo run -p dirtydash -- loop upgrade docs/implementation/my-stream
+```
+
+The command refreshes `prompts/run-loop.md`, `schemas/*.json`, and orchestrator worker/reviewer prompt files when the loop uses `orchestrator-callback`. It preserves phase docs, turn docs, `loop-state.md`, and Beads state. Use `--check` in CI or `--dry-run` before writing. If dirtydash cannot find the installed skill automatically, pass `--dirtyloops-root /path/to/skills/dirtyloops` or set `DIRTYLOOPS_ROOT`.
+
 List pricing records:
 
 ```bash

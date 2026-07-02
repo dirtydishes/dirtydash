@@ -7,6 +7,7 @@ use crate::app_paths::AppPaths;
 use crate::config::Config;
 use crate::db::Database;
 use crate::importers::{self, ImportOptions};
+use crate::loop_upgrade;
 use crate::pricing;
 use crate::remote;
 use crate::server;
@@ -43,6 +44,8 @@ pub enum Command {
     Remote(RemoteCommand),
     /// Inspect bundled pricing and manage manual overrides.
     Pricing(PricingCommand),
+    /// Inspect or maintain dirtyloops loop artifacts.
+    Loop(LoopCommand),
 }
 
 #[derive(Debug, Args)]
@@ -169,6 +172,37 @@ pub struct PricingMarkFreeArgs {
     pub model: String,
 }
 
+#[derive(Debug, Args)]
+pub struct LoopCommand {
+    #[command(subcommand)]
+    pub command: LoopSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoopSubcommand {
+    /// Upgrade a dirtyloops-generated loop directory to the current runtime artifacts.
+    Upgrade(LoopUpgradeArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct LoopUpgradeArgs {
+    /// Existing docs/implementation/<stream> loop directory.
+    #[arg(value_name = "LOOP_DIR")]
+    pub loop_dir: PathBuf,
+
+    /// dirtyloops skill root. Defaults to DIRTYLOOPS_ROOT, ~/.agents/skills/dirtyloops, or ~/dev/agents/skills/dirtyloops.
+    #[arg(long, value_name = "PATH")]
+    pub dirtyloops_root: Option<PathBuf>,
+
+    /// Report whether the loop is current without writing files. Exits non-zero when upgrades are needed.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Show planned writes without changing files.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     run_with_cli(cli)
@@ -186,7 +220,14 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
         Some(Command::Doctor(args)) => doctor(&paths, &config, args),
         Some(Command::Remote(args)) => remote::run(&paths, &mut config, args),
         Some(Command::Pricing(args)) => pricing_command(&paths, args),
+        Some(Command::Loop(args)) => loop_command(args),
         None => first_run(paths, config),
+    }
+}
+
+fn loop_command(args: LoopCommand) -> Result<()> {
+    match args.command {
+        LoopSubcommand::Upgrade(upgrade_args) => loop_upgrade::run(upgrade_args),
     }
 }
 
