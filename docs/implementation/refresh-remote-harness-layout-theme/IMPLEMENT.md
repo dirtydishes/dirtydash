@@ -32,7 +32,8 @@ Build the finalized Dirtydash refresh, remote sync, harness, Ledger layout, and 
 - Child threads default to `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`.
 - Implementation/review threads must be created in the intended Codex project worktree. A child that starts in the wrong repo/worktree blocks and calls back instead of self-relocating.
 - Orchestrator-callback is callback-wait. After launching a worker or reviewer, wait for exactly one callback and use only sparse fallback heartbeat when overdue or liveness is uncertain.
-- Worker/reviewer prompts must carry the literal orchestrator thread id. Do not launch if the prompt uses generic callback-target wording.
+- Generated worker/reviewer prompts store `RUNTIME_ORCHESTRATOR_THREAD_ID` until a run binds the concrete orchestrator thread id.
+- Worker/reviewer prompts must carry the literal orchestrator thread id after runtime binding. Do not launch if the prompt still contains the placeholder or uses generic callback-target wording.
 
 ## Review And CI
 

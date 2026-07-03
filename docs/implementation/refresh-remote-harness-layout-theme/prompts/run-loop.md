@@ -4,9 +4,9 @@ Workflow: `orchestrator-callback`
 
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
 
-Concrete orchestrator thread id: `ORCHESTRATOR_THREAD_ID_REQUIRED`
+Runtime callback placeholder: `RUNTIME_ORCHESTRATOR_THREAD_ID`
 
-Before launching any child thread, capture the actual Codex thread id of the run orchestrator and replace every `ORCHESTRATOR_THREAD_ID_REQUIRED` occurrence with that concrete id. Do not launch a worker or reviewer if the placeholder remains or if the prompt text contains generic callback-target wording.
+Before launching any child thread, capture the actual Codex thread id of the run orchestrator and replace every `RUNTIME_ORCHESTRATOR_THREAD_ID` occurrence with that concrete id. Do not launch a worker or reviewer if the placeholder remains or if the prompt text contains generic callback-target wording.
 
 Start from:
 
@@ -38,7 +38,7 @@ Start from:
 
 1. Run an initial selector subagent using `docs/implementation/refresh-remote-harness-layout-theme/prompts/selector-subagent.md`.
 2. Validate the selector report against `docs/implementation/refresh-remote-harness-layout-theme/schemas/swarm-report.schema.json`.
-3. Create one visible project-scoped implementation thread in the intended Dirtydash worktree for the selected phase. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/implementation-thread.md`, replacing phase placeholders and replacing `ORCHESTRATOR_THREAD_ID_REQUIRED` with the concrete run-orchestrator thread id.
+3. Create one visible project-scoped implementation thread in the intended Dirtydash worktree for the selected phase. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/implementation-thread.md`, replacing phase placeholders and replacing `RUNTIME_ORCHESTRATOR_THREAD_ID` with the concrete run-orchestrator thread id.
 4. After launching implementation, wait for exactly one implementation callback. Do not actively monitor the child thread. Use at most a sparse heartbeat around 30 minutes if callback is overdue or liveness is uncertain.
 5. Validate the implementation callback against `docs/implementation/refresh-remote-harness-layout-theme/schemas/implementation-callback.schema.json`.
 6. Create one visible project-scoped review thread in the intended Dirtydash worktree. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/review-thread.md`, replacing phase/PR placeholders and keeping the same concrete orchestrator thread id.
@@ -74,13 +74,13 @@ bd dep list dirtydash-refresh-loop.1 dirtydash-refresh-loop.2 dirtydash-refresh-
 
 Keep the orchestrator session orchestrator-only. Do not implement product code in the orchestrator session.
 
-The literal orchestrator thread id for callback payloads must be captured by the orchestrator session running this prompt. Replace every `ORCHESTRATOR_THREAD_ID_REQUIRED` occurrence in worker/reviewer prompt text before launch. Do not launch worker or reviewer prompts if the placeholder remains or if they use generic callback-target wording.
+The literal orchestrator thread id for callback payloads must be captured by the orchestrator session running this prompt. Replace every `RUNTIME_ORCHESTRATOR_THREAD_ID` occurrence in worker/reviewer prompt text before launch. Do not launch worker or reviewer prompts if the placeholder remains or if they use generic callback-target wording.
 
 Launch one selector subagent with `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false` using `docs/implementation/refresh-remote-harness-layout-theme/prompts/selector-subagent.md`.
 
-After selector validation, create one visible project-scoped Dirtydash implementation thread for the selected phase with `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/implementation-thread.md`, replacing phase placeholders and replacing `ORCHESTRATOR_THREAD_ID_REQUIRED` with the literal run-orchestrator thread id. The implementation thread owns the assigned branch/worktree, swarm-first implementation, local gates, PR, existing phase turn doc, and exactly one implementation callback.
+After selector validation, create one visible project-scoped Dirtydash implementation thread for the selected phase with `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/implementation-thread.md`, replacing phase placeholders and replacing `RUNTIME_ORCHESTRATOR_THREAD_ID` with the literal run-orchestrator thread id. The implementation thread owns the assigned branch/worktree, swarm-first implementation, local gates, PR, existing phase turn doc, and exactly one implementation callback.
 
-After the implementation callback is `pr-ready`, create one visible project-scoped Dirtydash review thread with `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/review-thread.md`, replacing phase/PR placeholders and replacing `ORCHESTRATOR_THREAD_ID_REQUIRED` with the same literal run-orchestrator thread id. The review thread must use `thermo-nuclear-code-quality-review` and owns CI, safe in-scope repairs, reruns, evidence, the existing phase turn doc, and exactly one review callback.
+After the implementation callback is `pr-ready`, create one visible project-scoped Dirtydash review thread with `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`. Use `docs/implementation/refresh-remote-harness-layout-theme/prompts/review-thread.md`, replacing phase/PR placeholders and replacing `RUNTIME_ORCHESTRATOR_THREAD_ID` with the same literal run-orchestrator thread id. The review thread must use `thermo-nuclear-code-quality-review` and owns CI, safe in-scope repairs, reruns, evidence, the existing phase turn doc, and exactly one review callback.
 
 After each review callback, launch a closeout-selector subagent with `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false` using `docs/implementation/refresh-remote-harness-layout-theme/prompts/closeout-selector.md`. The orchestrator alone updates Beads, updates `loop-state.md`, closes or blocks phase issues, selects the next phase, and performs stream closeout/storyboard generation.
 

@@ -4,9 +4,9 @@ Use `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_sett
 
 You are the visible project-scoped Dirtydash implementation owner for exactly one Beads phase.
 
-Callback target / literal orchestrator thread id: `ORCHESTRATOR_THREAD_ID_REQUIRED`
+Callback target / literal orchestrator thread id: `RUNTIME_ORCHESTRATOR_THREAD_ID`
 
-If `ORCHESTRATOR_THREAD_ID_REQUIRED` is still present, stop and ask the orchestrator to resend the prompt with a concrete thread id. Do not callback to a prose target.
+If `RUNTIME_ORCHESTRATOR_THREAD_ID` is still present, stop and ask the orchestrator to resend the prompt with a concrete thread id. Do not callback to a prose target.
 
 ## Required Inputs From Orchestrator
 
@@ -63,7 +63,7 @@ If the phase is small enough to use fewer than default agents, record the reason
 
 ## Callback Contract
 
-Callback exactly once to thread id `ORCHESTRATOR_THREAD_ID_REQUIRED` after the PR is ready or the task is genuinely blocked.
+Callback exactly once to thread id `RUNTIME_ORCHESTRATOR_THREAD_ID` after the PR is ready or the task is genuinely blocked.
 
 The callback must validate against:
 
@@ -76,7 +76,7 @@ Payload shape:
   <source_thread_id>YOUR_THREAD_ID</source_thread_id>
   <input>{
     "type": "implementation-callback",
-    "orchestrator_thread_id": "ORCHESTRATOR_THREAD_ID_REQUIRED",
+    "orchestrator_thread_id": "RUNTIME_ORCHESTRATOR_THREAD_ID",
     "source_thread_id": "YOUR_THREAD_ID",
     "phase_issue_id": "REPLACE_WITH_PHASE_ISSUE_ID",
     "status": "pr-ready",
