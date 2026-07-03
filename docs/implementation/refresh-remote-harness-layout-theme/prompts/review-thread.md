@@ -1,12 +1,12 @@
 # Review Thread Prompt: Refresh, Remote Sync, Harness, Layout, And Theme
 
-Use `speed: standard`, `reasoning: high`, and `inherit_orchestrator_thread_settings: false`. Do not use inherited fast mode or inherited reasoning settings.
+Use `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`. Do not use inherited fast mode or inherited reasoning settings.
 
 You are the visible project-scoped Dirtydash review + CI owner for exactly one Beads phase.
 
-Callback target / literal orchestrator thread id: `019f2644-e698-7671-8b0e-deefbd580b77`
+Callback target / literal orchestrator thread id: `ORCHESTRATOR_THREAD_ID_REQUIRED`
 
-If that literal id is not the actual orchestrator thread that launched you, stop and ask the orchestrator to resend the prompt with the correct concrete thread id. Do not callback to a prose target.
+If `ORCHESTRATOR_THREAD_ID_REQUIRED` is still present, stop and ask the orchestrator to resend the prompt with a concrete thread id. Do not callback to a prose target.
 
 ## Required Inputs From Orchestrator
 
@@ -65,7 +65,7 @@ For UI phases, require real browser evidence at relevant desktop/mobile widths. 
 
 ## Callback Contract
 
-Callback exactly once to thread id `019f2644-e698-7671-8b0e-deefbd580b77` after review and CI are resolved.
+Callback exactly once to thread id `ORCHESTRATOR_THREAD_ID_REQUIRED` after review and CI are resolved.
 
 The callback must validate against:
 
@@ -78,7 +78,7 @@ Payload shape:
   <source_thread_id>YOUR_THREAD_ID</source_thread_id>
   <input>{
     "type": "review-callback",
-    "orchestrator_thread_id": "019f2644-e698-7671-8b0e-deefbd580b77",
+    "orchestrator_thread_id": "ORCHESTRATOR_THREAD_ID_REQUIRED",
     "source_thread_id": "YOUR_THREAD_ID",
     "phase_issue_id": "REPLACE_WITH_PHASE_ISSUE_ID",
     "status": "approved",

@@ -24,9 +24,9 @@ Blocked: no
 
 - In-scope phases are plan phases 1-5: refresh foundation, Ledger layout reshape, themes, agentless SSH remote sync, and OpenCode/Hermes harness support.
 - Plan phase 6, live watcher/SSE, is explicitly future scope and filed as `dirtydash-live-watcher-future`.
-- The concrete orchestrator thread id captured during loop creation is `019f2644-e698-7671-8b0e-deefbd580b77`.
-- If the loop is run from a different orchestrator thread, replace that id in prompts before launching any child thread. Do not launch worker/reviewer prompts with a generic callback target.
-- Orchestrator-callback child threads use `speed: standard`, `reasoning: high`, and `inherit_orchestrator_thread_settings: false`.
+- The run orchestrator must capture its own concrete Codex thread id before launching child threads.
+- Child-thread prompt templates use `ORCHESTRATOR_THREAD_ID_REQUIRED` until the run orchestrator replaces it with that concrete id.
+- Orchestrator-callback child threads use `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`.
 
 ## Context To Keep
 

@@ -1,6 +1,6 @@
 # Selector Subagent Prompt: Refresh, Remote Sync, Harness, Layout, And Theme
 
-Use `speed: standard`, `reasoning: high`, and `inherit_orchestrator_thread_settings: false`.
+Use `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`.
 
 You are the selector subagent for Beads epic `dirtydash-refresh-loop`.
 

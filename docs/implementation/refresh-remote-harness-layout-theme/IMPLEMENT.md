@@ -29,7 +29,7 @@ Build the finalized Dirtydash refresh, remote sync, harness, Ledger layout, and 
 - Keep one active implementation PR at a time.
 - File Beads follow-ups instead of widening the selected phase.
 - Update Beads first, then update `loop-state.md`.
-- Child threads default to `speed: standard`, `reasoning: high`, and `inherit_orchestrator_thread_settings: false`.
+- Child threads default to `speed: standard`, `reasoning: xhigh`, and `inherit_orchestrator_thread_settings: false`.
 - Implementation/review threads must be created in the intended Codex project worktree. A child that starts in the wrong repo/worktree blocks and calls back instead of self-relocating.
 - Orchestrator-callback is callback-wait. After launching a worker or reviewer, wait for exactly one callback and use only sparse fallback heartbeat when overdue or liveness is uncertain.
 - Worker/reviewer prompts must carry the literal orchestrator thread id. Do not launch if the prompt uses generic callback-target wording.
