@@ -10,15 +10,11 @@ Stream: `refresh-remote-harness-layout-theme`
 
 Workflow: `orchestrator-callback`
 
-Current phase: Refresh Foundation
+Current phase: none
 
-Current Beads issue: `dirtydash-refresh-loop.1`
+Current Beads issue: none
 
-Current implementation thread: `019f2876-9f4b-7b50-90da-6cbd8ba3a93c`
-
-Current branch: `lavender/dirtydash-refresh-loop-1-refresh-foundation`
-
-Current PR: pending implementation callback
+Current PR: none
 
 Last completed phase: none
 
@@ -53,4 +49,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-2026-07-03: Selector chose `dirtydash-refresh-loop.1`; Beads issue claimed; implementation thread `019f2876-9f4b-7b50-90da-6cbd8ba3a93c` launched in a Dirtydash project worktree with callback target `019f2872-bd92-79a1-9c40-919dc2343437`. Orchestrator is in callback-wait and should not actively monitor the child thread.
+Loop scaffold created. Implementation has not started.
