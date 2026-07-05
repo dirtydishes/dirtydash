@@ -10,9 +10,9 @@ Stream: `refresh-remote-harness-layout-theme`
 
 Workflow: `orchestrator-callback`
 
-Current phase: none
+Current phase: Refresh Foundation
 
-Current Beads issue: none
+Current Beads issue: `dirtydash-refresh-loop.1`
 
 Current PR: none
 
@@ -49,4 +49,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Loop scaffold created. Implementation has not started.
+2026-07-05: Phase 1 relaunched after the previous failed implementation run. Active orchestrator callback target is `019f3380-c230-7a10-8778-02b12578ba33`; active implementation thread is `019f3383-675b-7420-a529-a0fbebac77fb` in Dirtydash project worktree `/home/delta/.codex/worktrees/48b5/dirtydash` on branch `lavender/dirtydash-refresh-loop-1-refresh-foundation`.
