@@ -1,0 +1,135 @@
+{
+  "status": "migrated",
+  "source_version": 1,
+  "target_version": 2,
+  "doc_root": "docs/implementation/refresh-remote-harness-layout-theme",
+  "context": {
+    "streamName": "Refresh, Remote Sync, Harness, Layout, And Theme",
+    "streamSlug": "refresh-remote-harness-layout-theme",
+    "epic": "dirtydash-refresh-loop",
+    "planSource": "docs/implementation/refresh-remote-harness-layout-theme/00-roadmap.md"
+  },
+  "blockers": [],
+  "actions": [
+    {
+      "action": "archive",
+      "path": "IMPLEMENT.md",
+      "archive": ".dirtyloops-migration-v1/IMPLEMENT.md"
+    },
+    {
+      "action": "archive",
+      "path": "prompts/run-loop.md",
+      "archive": ".dirtyloops-migration-v1/prompts/run-loop.md"
+    },
+    {
+      "action": "archive",
+      "path": "loop-state.md",
+      "archive": ".dirtyloops-migration-v1/loop-state.md"
+    },
+    {
+      "action": "archive",
+      "path": "schemas/implementation-callback.schema.json",
+      "archive": ".dirtyloops-migration-v1/schemas/implementation-callback.schema.json"
+    },
+    {
+      "action": "archive",
+      "path": "schemas/review-callback.schema.json",
+      "archive": ".dirtyloops-migration-v1/schemas/review-callback.schema.json"
+    },
+    {
+      "action": "archive",
+      "path": "schemas/swarm-report.schema.json",
+      "archive": ".dirtyloops-migration-v1/schemas/swarm-report.schema.json"
+    },
+    {
+      "action": "archive",
+      "path": "prompts/closeout-selector.md",
+      "archive": ".dirtyloops-migration-v1/prompts/closeout-selector.md"
+    },
+    {
+      "action": "remove-active-legacy-prompt",
+      "path": "prompts/closeout-selector.md"
+    },
+    {
+      "action": "archive",
+      "path": "prompts/implementation-thread.md",
+      "archive": ".dirtyloops-migration-v1/prompts/implementation-thread.md"
+    },
+    {
+      "action": "remove-active-legacy-prompt",
+      "path": "prompts/implementation-thread.md"
+    },
+    {
+      "action": "archive",
+      "path": "prompts/review-thread.md",
+      "archive": ".dirtyloops-migration-v1/prompts/review-thread.md"
+    },
+    {
+      "action": "remove-active-legacy-prompt",
+      "path": "prompts/review-thread.md"
+    },
+    {
+      "action": "archive",
+      "path": "prompts/selector-subagent.md",
+      "archive": ".dirtyloops-migration-v1/prompts/selector-subagent.md"
+    },
+    {
+      "action": "remove-active-legacy-prompt",
+      "path": "prompts/selector-subagent.md"
+    },
+    {
+      "action": "rewrite-generated-v2",
+      "path": "IMPLEMENT.md"
+    },
+    {
+      "action": "rewrite-generated-v2",
+      "path": "prompts/run-loop.md"
+    },
+    {
+      "action": "normalize-policy-line",
+      "path": "loop-state.md"
+    },
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/execution-summary.schema.json"
+    },
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/implementation-callback.schema.json"
+    },
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/review-callback.schema.json"
+    },
+    {
+      "action": "remove-active-v1-schema",
+      "path": "schemas/swarm-report.schema.json"
+    }
+  ],
+  "protected_hashes_before": {
+    "00-roadmap.md": "06b8e2b56231fb7fb222e49b56e674d671d59a7176b15041d55efdb7e3c95848",
+    "01-refresh-foundation.md": "a2afca5a863e8435e5481a38937f02b3067a68a1baf61457d2bf0ca199c9816d",
+    "02-ledger-layout-reshape.md": "842f888ecd818e56ae3740729a0145d8384e883e3a427b64ba316cbbdabdb90e",
+    "03-built-in-themes.md": "c52e7cca5e4f918500331b210633643d5d10036d4677a1ebf7f1d96398d5141e",
+    "04-agentless-ssh-remote-sync.md": "077a65c72c6251948ee7c21176703bc7ab429c8e260e198cea58f35d707de162",
+    "05-opencode-and-hermes-agent-harness-support.md": "cba617b95b7d9834e71a602d80b95e63113d08641c898db3016e87382156c1f3",
+    "turn-docs/dirtydash-refresh-loop.1.md": "d3ce2f2e9a6808b3dfc31228177c4e8402ed8977c9556137e813676fccd74bb6",
+    "turn-docs/dirtydash-refresh-loop.2.md": "9271af1834ddd03de4d6bba35596e4002ad9e8f7b517027b4aeed91a5645cd02",
+    "turn-docs/dirtydash-refresh-loop.3.md": "00054e262a5df9525e09b5b07865578fe201d6bb8460d2c5a93a35e693f5c0b6",
+    "turn-docs/dirtydash-refresh-loop.4.md": "d4f498e4343f6b719f7a9e1fbc2d9635822ad63393104c7eccdb3771248bc32f",
+    "turn-docs/dirtydash-refresh-loop.5.md": "4e0567834d2c2364ac5df378e3d83bb533ba747b62bc760cd2ef3e24a40cedba"
+  },
+  "protected_hashes_after": {
+    "00-roadmap.md": "06b8e2b56231fb7fb222e49b56e674d671d59a7176b15041d55efdb7e3c95848",
+    "01-refresh-foundation.md": "a2afca5a863e8435e5481a38937f02b3067a68a1baf61457d2bf0ca199c9816d",
+    "02-ledger-layout-reshape.md": "842f888ecd818e56ae3740729a0145d8384e883e3a427b64ba316cbbdabdb90e",
+    "03-built-in-themes.md": "c52e7cca5e4f918500331b210633643d5d10036d4677a1ebf7f1d96398d5141e",
+    "04-agentless-ssh-remote-sync.md": "077a65c72c6251948ee7c21176703bc7ab429c8e260e198cea58f35d707de162",
+    "05-opencode-and-hermes-agent-harness-support.md": "cba617b95b7d9834e71a602d80b95e63113d08641c898db3016e87382156c1f3",
+    "turn-docs/dirtydash-refresh-loop.1.md": "d3ce2f2e9a6808b3dfc31228177c4e8402ed8977c9556137e813676fccd74bb6",
+    "turn-docs/dirtydash-refresh-loop.2.md": "9271af1834ddd03de4d6bba35596e4002ad9e8f7b517027b4aeed91a5645cd02",
+    "turn-docs/dirtydash-refresh-loop.3.md": "00054e262a5df9525e09b5b07865578fe201d6bb8460d2c5a93a35e693f5c0b6",
+    "turn-docs/dirtydash-refresh-loop.4.md": "d4f498e4343f6b719f7a9e1fbc2d9635822ad63393104c7eccdb3771248bc32f",
+    "turn-docs/dirtydash-refresh-loop.5.md": "4e0567834d2c2364ac5df378e3d83bb533ba747b62bc760cd2ef3e24a40cedba"
+  }
+}

@@ -8,7 +8,7 @@ Status: active
 
 Stream: `refresh-remote-harness-layout-theme`
 
-Execution policy: `adaptive`
+Workflow: `orchestrator-callback`
 
 Current phase: Refresh Foundation
 

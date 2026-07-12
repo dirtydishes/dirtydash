@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExecutionSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["strategy", "rationale", "delegations", "adaptations"],
+  "properties": {
+    "strategy": { "enum": ["direct", "subagents", "threads", "native-multi-agent", "hybrid"] },
+    "rationale": { "type": "string", "minLength": 1 },
+    "delegations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["mission", "model", "effort", "status", "evidence"],
+        "properties": {
+          "mission": { "type": "string", "minLength": 1 },
+          "model": { "type": ["string", "null"] },
+          "effort": { "type": ["string", "null"] },
+          "status": { "enum": ["done", "blocked"] },
+          "evidence": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "adaptations": { "type": "array", "items": { "type": "string" } }
+  }
+}
