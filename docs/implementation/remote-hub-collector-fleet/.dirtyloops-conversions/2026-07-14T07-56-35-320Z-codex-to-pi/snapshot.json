@@ -1,0 +1,60 @@
+{
+  "source": "codex",
+  "target": "pi",
+  "archive": ".dirtyloops-conversions/2026-07-14T07-56-35-320Z-codex-to-pi",
+  "epic": "dirtydash-px3",
+  "binding_existed": false,
+  "loop_state_existed": true,
+  "beads_metadata_before": {
+    "doc_root": "docs/implementation/remote-hub-collector-fleet",
+    "planning": {
+      "owner": "user-supplied-plan",
+      "source": "user-supplied Dirtydash Remote Hub and Collector Fleet plan accepted 2026-07-12",
+      "status": "accepted"
+    },
+    "once_mode": false,
+    "run_policy": "until-complete",
+    "supersedes": [
+      "dirtydash-refresh-loop"
+    ],
+    "constraints": {
+      "one_active_pr": true,
+      "independent_review": true,
+      "repo_relative_artifacts": true,
+      "one_owner_per_mutable_checkout": true
+    },
+    "stream_slug": "remote-hub-collector-fleet",
+    "quality_gates": [
+      "cargo test",
+      "npm --prefix dashboard run build",
+      "phase-specific protocol, security, database, installer, and frontend tests",
+      "browser accessibility and responsive smoke where UI changes",
+      "real-tailnet release gate in phase 7"
+    ],
+    "callback_policy": {
+      "binding": "runtime-when-used",
+      "requires_concrete_target": true,
+      "requires_source_thread_id": true,
+      "forbid_creation_thread_id_as_future_target": true
+    },
+    "phase_issue_ids": [
+      "dirtydash-px3.1",
+      "dirtydash-px3.2",
+      "dirtydash-px3.3",
+      "dirtydash-px3.4",
+      "dirtydash-px3.5",
+      "dirtydash-px3.6",
+      "dirtydash-px3.7"
+    ],
+    "branch_pr_policy": "one active phase PR at a time in phase order; branches use lavender/remote-hub-collector-fleet-<phase>; PRs target main on origin",
+    "execution_policy": {
+      "mode": "adaptive-with-user-topology-constraint",
+      "topology": "orchestrator-callback",
+      "topology_origin": "explicit-user-constraint",
+      "orchestration_brief_required": true,
+      "orchestrator_chooses_delegation": true,
+      "orchestrator_chooses_model_and_effort": true
+    },
+    "dirtyloop_version": 2
+  }
+}

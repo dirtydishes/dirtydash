@@ -10,10 +10,6 @@ Stream: `remote-hub-collector-fleet`
 
 Execution policy: `adaptive-with-user-topology-constraint`
 
-Harness: `pi`
-
-Adapter contract: `dirtyloops-harness/1`
-
 Current phase: none
 
 Current Beads issue: none
