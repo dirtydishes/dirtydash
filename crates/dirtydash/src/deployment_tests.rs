@@ -1,7 +1,9 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use std::collections::VecDeque;
-use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -22,13 +24,23 @@ fn signed_fixture() -> (SignedArtifactManifest, Vec<u8>, [u8; 32]) {
         }],
     };
     let mut unsigned = SignedArtifactManifest {
-        key_id: PublisherKey::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        key_id: PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
         manifest,
         signature: String::new(),
     };
     let payload = unsigned.signing_bytes().unwrap();
     unsigned.signature = hex::encode(key.sign(&payload).to_bytes());
     (unsigned, bytes, key.verifying_key().to_bytes())
+}
+
+fn pinned_manifest(signed: &SignedArtifactManifest, public_key: &[u8]) -> VerifiedArtifactManifest {
+    let policy = PublisherTrustPolicy::new(
+        signed.key_id.clone(),
+        PublisherTrustPolicy::fingerprint(public_key).unwrap(),
+        public_key,
+    )
+    .unwrap();
+    policy.verify(signed).unwrap()
 }
 
 #[test]
@@ -53,33 +65,56 @@ fn platform_aliases_select_linux_and_macos_arm64_deterministically() {
 #[test]
 fn publisher_anchor_rejects_replaced_manifest_key_and_publisher_assertions() {
     let (signed, _bytes, public_key) = signed_fixture();
-    let fingerprint = PublisherKey::fingerprint(&public_key).unwrap();
+    let fingerprint = PublisherTrustPolicy::fingerprint(&public_key).unwrap();
     let publisher =
-        PublisherKey::new(signed.key_id.clone(), fingerprint.clone(), &public_key).unwrap();
-    assert!(signed.verify_with_publisher(&publisher).is_ok());
+        PublisherTrustPolicy::new(signed.key_id.clone(), fingerprint.clone(), &public_key).unwrap();
+    assert!(publisher.verify(&signed).is_ok());
 
     let replacement_key = SigningKey::from_bytes(&[9_u8; 32]);
     let mut replacement = signed.clone();
     replacement.key_id =
-        PublisherKey::fingerprint(&replacement_key.verifying_key().to_bytes()).unwrap();
+        PublisherTrustPolicy::fingerprint(&replacement_key.verifying_key().to_bytes()).unwrap();
     replacement.signature = hex::encode(
         replacement_key
             .sign(&replacement.signing_bytes().unwrap())
             .to_bytes(),
     );
-    assert!(replacement.verify_with_publisher(&publisher).is_err());
-    assert!(PublisherKey::new(
+    assert!(publisher.verify(&replacement).is_err());
+    assert!(PublisherTrustPolicy::new(
         "replacement",
         "sha256:deadbeef",
         &replacement_key.verifying_key().to_bytes()
     )
     .is_err());
-    assert!(PublisherKey::new(
+    assert!(PublisherTrustPolicy::new(
         signed.key_id.clone(),
         fingerprint,
         &replacement_key.verifying_key().to_bytes()
     )
     .is_err());
+}
+
+#[test]
+fn runner_rejects_verified_artifacts_from_a_different_publisher_policy() {
+    let (signed, bytes, public_key) = signed_fixture();
+    let artifact = pinned_manifest(&signed, &public_key)
+        .verify_artifact(facts().platform, bytes)
+        .unwrap();
+    let replacement = ed25519_dalek::SigningKey::from_bytes(&[99_u8; 32]);
+    let policy = PublisherTrustPolicy::new(
+        PublisherTrustPolicy::fingerprint(&replacement.verifying_key().to_bytes()).unwrap(),
+        PublisherTrustPolicy::fingerprint(&replacement.verifying_key().to_bytes()).unwrap(),
+        &replacement.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let fake = FakeExecutor {
+        facts: Some(facts()),
+        ..FakeExecutor::default()
+    };
+    let mut runner = DeploymentRunner::new(fake, policy);
+    let request = DeploymentRequest::new("alias", "0.1.2-test", ListenerPlan::default());
+    assert!(runner.probe(&request, Some(&artifact)).is_err());
+    assert!(runner.executor().actions.is_empty());
 }
 
 #[test]
@@ -131,7 +166,7 @@ fn all_linux_macos_x86_and_arm_targets_select_without_ambiguity() {
 #[test]
 fn signature_and_checksum_are_both_required() {
     let (signed, bytes, public_key) = signed_fixture();
-    let verified = signed.verify(&public_key).unwrap();
+    let verified = pinned_manifest(&signed, &public_key);
     let artifact = verified
         .verify_artifact(
             TargetPlatform {
@@ -149,7 +184,14 @@ fn signature_and_checksum_are_both_required() {
         .is_err());
     let mut unsigned = signed;
     unsigned.signature = "00".repeat(64);
-    assert!(unsigned.verify(&public_key).is_err());
+    assert!(PublisherTrustPolicy::new(
+        unsigned.key_id.clone(),
+        PublisherTrustPolicy::fingerprint(&public_key).unwrap(),
+        &public_key,
+    )
+    .unwrap()
+    .verify(&unsigned)
+    .is_err());
 }
 
 #[derive(Default)]
@@ -187,6 +229,56 @@ impl RemoteExecutor for FakeExecutor {
     }
 }
 
+#[cfg(unix)]
+fn executable_script(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn fake_ssh_script(path: &Path) {
+    executable_script(
+        path,
+        r#"#!/bin/sh
+set -eu
+socket=''
+master=0
+operation=''
+last=''
+while [ "$#" -gt 0 ]; do
+    arg=$1
+    shift
+    case "$arg" in
+        -S) socket=$1; shift ;;
+        -O) operation=$1; shift ;;
+        -M) master=1 ;;
+        -o|-p|-i) shift ;;
+        *) last=$arg ;;
+    esac
+done
+if [ "$operation" = exit ]; then
+    rm -f "$socket"
+    exit 0
+fi
+if [ "$master" = 1 ]; then
+    printf 'user@host password: ' >&2
+    IFS= read -r password
+    if [ "$password" != PASSWORD_SENTINEL ]; then
+        printf 'password=%s hostile\n' "$password" >&2
+        exit 21
+    fi
+    : > "$socket"
+    exit 0
+fi
+case "$last" in
+    *healthz*) printf 'password=PASSWORD_SENTINEL hostile failure\n' >&2; exit 42 ;;
+    *"printf 'os="*) printf 'os=Linux\narch=x86_64\nuser=deploy\nuid=1000\nhome=/tmp/remote-home\n' ; exit 0 ;;
+esac
+exec /bin/sh -c "$last"
+"#,
+    );
+}
+
 fn facts() -> RemoteFacts {
     RemoteFacts {
         platform: TargetPlatform {
@@ -214,9 +306,7 @@ fn plan_is_inspectable_and_contains_no_secret_fields() {
 #[test]
 fn runner_rolls_back_and_cleans_up_after_restart_failure() {
     let (signed, bytes, public_key) = signed_fixture();
-    let artifact = signed
-        .verify(&public_key)
-        .unwrap()
+    let artifact = pinned_manifest(&signed, &public_key)
         .verify_artifact(facts().platform, bytes)
         .unwrap();
     let dir = tempdir().unwrap();
@@ -238,7 +328,16 @@ fn runner_rolls_back_and_cleans_up_after_restart_failure() {
         ..FakeExecutor::default()
     };
     let store = DeploymentStateStore::new(dir.path().join("deployment.json"));
-    let mut runner = DeploymentRunner::new(fake).with_state_store(store);
+    let mut runner = DeploymentRunner::new(
+        fake,
+        PublisherTrustPolicy::new(
+            signed.key_id.clone(),
+            PublisherTrustPolicy::fingerprint(&public_key).unwrap(),
+            &public_key,
+        )
+        .unwrap(),
+    )
+    .with_state_store(store);
     let mut request = DeploymentRequest::new("alias", "0.1.2-test", ListenerPlan::default());
     let plan = runner.probe(&request, Some(&artifact)).unwrap();
     request.approved_plan_hash = Some(plan.plan_hash);
@@ -252,8 +351,9 @@ fn runner_rolls_back_and_cleans_up_after_restart_failure() {
     let rollback_command = executor.rollback_commands.first().unwrap();
     assert!(rollback_command.contains("/healthz"));
     assert!(rollback_command.contains("collector diagnostics --json"));
-    assert!(rollback_command.contains("restart dirtydash-hub.service"));
-    assert!(rollback_command.contains("restart dirtydash-collector.service"));
+    assert!(rollback_command.contains("systemctl --user start"));
+    assert!(rollback_command.contains("dirtydash-hub.service"));
+    assert!(rollback_command.contains("dirtydash-collector.service"));
     assert!(executor
         .actions
         .iter()
@@ -264,9 +364,7 @@ fn runner_rolls_back_and_cleans_up_after_restart_failure() {
 #[test]
 fn rollback_failure_is_an_explicit_manual_recovery_blocker() {
     let (signed, bytes, public_key) = signed_fixture();
-    let artifact = signed
-        .verify(&public_key)
-        .unwrap()
+    let artifact = pinned_manifest(&signed, &public_key)
         .verify_artifact(facts().platform, bytes)
         .unwrap();
     let dir = tempdir().unwrap();
@@ -282,7 +380,16 @@ fn rollback_failure_is_an_explicit_manual_recovery_blocker() {
         results,
         ..FakeExecutor::default()
     };
-    let mut runner = DeploymentRunner::new(fake).with_state_store(store.clone());
+    let mut runner = DeploymentRunner::new(
+        fake,
+        PublisherTrustPolicy::new(
+            signed.key_id.clone(),
+            PublisherTrustPolicy::fingerprint(&public_key).unwrap(),
+            &public_key,
+        )
+        .unwrap(),
+    )
+    .with_state_store(store.clone());
     let request = DeploymentRequest::new("alias", "0.1.2-test", ListenerPlan::default());
     let plan = runner.probe(&request, Some(&artifact)).unwrap();
     let mut approved = request;
@@ -298,9 +405,7 @@ fn rollback_failure_is_an_explicit_manual_recovery_blocker() {
 #[test]
 fn consent_is_a_durable_resumable_receipt_not_a_secret_failure() {
     let (signed, bytes, public_key) = signed_fixture();
-    let artifact = signed
-        .verify(&public_key)
-        .unwrap()
+    let artifact = pinned_manifest(&signed, &public_key)
         .verify_artifact(facts().platform, bytes)
         .unwrap();
     let dir = tempdir().unwrap();
@@ -310,7 +415,16 @@ fn consent_is_a_durable_resumable_receipt_not_a_secret_failure() {
         results: VecDeque::from([Ok(RemoteResult::success("ok"))]),
         ..FakeExecutor::default()
     };
-    let mut runner = DeploymentRunner::new(fake).with_state_store(checkpoint.clone());
+    let mut runner = DeploymentRunner::new(
+        fake,
+        PublisherTrustPolicy::new(
+            signed.key_id.clone(),
+            PublisherTrustPolicy::fingerprint(&public_key).unwrap(),
+            &public_key,
+        )
+        .unwrap(),
+    )
+    .with_state_store(checkpoint.clone());
     let request = DeploymentRequest::new("manual", "0.1.2-test", ListenerPlan::default());
     let plan = runner.probe(&request, Some(&artifact)).unwrap();
     let mut approved_request = request;
@@ -326,9 +440,7 @@ fn consent_is_a_durable_resumable_receipt_not_a_secret_failure() {
 #[test]
 fn concrete_plan_persists_review_evidence_and_rollback_intent() {
     let (signed, bytes, public_key) = signed_fixture();
-    let artifact = signed
-        .verify(&public_key)
-        .unwrap()
+    let artifact = pinned_manifest(&signed, &public_key)
         .verify_artifact(facts().platform, bytes.clone())
         .unwrap();
     let canonical = CanonicalSshTarget::from_ssh_config(
@@ -366,9 +478,7 @@ fn concrete_plan_persists_review_evidence_and_rollback_intent() {
 #[test]
 fn apply_requires_an_explicit_approved_persisted_hash() {
     let (signed, bytes, public_key) = signed_fixture();
-    let artifact = signed
-        .verify(&public_key)
-        .unwrap()
+    let artifact = pinned_manifest(&signed, &public_key)
         .verify_artifact(facts().platform, bytes)
         .unwrap();
     let dir = tempdir().unwrap();
@@ -377,7 +487,16 @@ fn apply_requires_an_explicit_approved_persisted_hash() {
         facts: Some(facts()),
         ..FakeExecutor::default()
     };
-    let mut runner = DeploymentRunner::new(fake).with_state_store(store);
+    let mut runner = DeploymentRunner::new(
+        fake,
+        PublisherTrustPolicy::new(
+            signed.key_id.clone(),
+            PublisherTrustPolicy::fingerprint(&public_key).unwrap(),
+            &public_key,
+        )
+        .unwrap(),
+    )
+    .with_state_store(store);
     let request = DeploymentRequest::new("alias", "0.1.2-test", ListenerPlan::default());
     let plan = runner.probe(&request, Some(&artifact)).unwrap();
     assert!(runner.apply(&request, &artifact).is_err());
@@ -394,6 +513,8 @@ fn rollback_refuses_database_deletion_without_a_backup() {
         database_backup: None,
         database_wal_backup: None,
         database_shm_backup: None,
+        config_path: None,
+        service_dir: None,
         platform: ServicePlatform::Systemd,
         listener: None,
         snapshot_dir: None,
@@ -448,23 +569,12 @@ fn live_stdin_writes_classified_passwords_after_fixed_prompts() {
     let script = r#"
         printf 'user@host password: ' >&2
         IFS= read -r password
-        printf 'DIRTYDASH_SUDO_PROMPT' >&2
-        IFS= read -r sudo
         [ "$password" = PASSWORD_SENTINEL ] || exit 20
-        [ "$sudo" = SUDO_SENTINEL ] || exit 21
-        dd bs=1 count=19 2>/dev/null
+        printf 'authenticated\n'
     "#;
     let args = vec!["-c".to_string(), script.to_string()];
-    let result = run_live_process(
-        Path::new("/bin/sh"),
-        &args,
-        &secrets,
-        true,
-        true,
-        Some(b"classified-artifact"),
-    )
-    .unwrap();
-    assert!(result.stdout.contains("classified-artifact"));
+    let result = run_live_process(Path::new("/bin/sh"), &args, &secrets, true).unwrap();
+    assert!(result.stdout.contains("authenticated"));
     assert!(!result.stdout.contains("SENTINEL"));
     assert!(!result.stderr.contains("SENTINEL"));
     assert!(!format!("{secrets:?}").contains("SENTINEL"));
@@ -480,7 +590,7 @@ fn live_stdin_failure_redacts_remote_secret_echoes() {
         exit 1
     "#;
     let args = vec!["-c".to_string(), script.to_string()];
-    let error = run_live_process(Path::new("/bin/sh"), &args, &secrets, true, false, None)
+    let error = run_live_process(Path::new("/bin/sh"), &args, &secrets, true)
         .unwrap_err()
         .to_string();
     assert!(!error.contains("PASSWORD_SENTINEL"));
@@ -574,6 +684,347 @@ fn no_sqlite3_install_accepts_valid_wal_backup_and_rejects_malformed_seed() {
     assert!(malformed_seed.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn ssh_remote_executor_uses_binary_safe_control_socket_transfer_and_redacts_failure() {
+    let dir = tempdir().unwrap();
+    let ssh = dir.path().join("fake-ssh");
+    fake_ssh_script(&ssh);
+    let known_hosts = dir.path().join("known_hosts");
+    fs::write(&known_hosts, b"example ssh-ed25519 AQID\n").unwrap();
+    fs::write(
+        known_hosts.with_extension("fingerprints.json"),
+        r#"{"example":{"fingerprint":"sha256:test"}}"#,
+    )
+    .unwrap();
+    let target = CanonicalSshTarget::from_ssh_config(
+        "deploy@example",
+        "hostname example\nport 22\nuser deploy\nproxycommand none\n",
+    )
+    .unwrap();
+    let secrets = SshLiveSecrets::new(Some(b"PASSWORD_SENTINEL"), None, None).unwrap();
+    let mut executor = SshRemoteExecutor::from_canonical_target(target, &known_hosts)
+        .unwrap()
+        .with_ssh_program(&ssh)
+        .with_live_secrets(secrets);
+    let destination = dir.path().join("artifact.bin");
+    let payload = vec![0x00, 0xff, 0x41, 0x00, 0xfe, 0x7f];
+    executor
+        .upload(&destination.display().to_string(), &payload, 0o600)
+        .unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), payload);
+    let error = executor
+        .run(RemoteAction::HealthCheck {
+            port: 4599,
+            platform: ServicePlatform::Systemd,
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("PASSWORD_SENTINEL"));
+    assert!(error.contains("[REDACTED]") || error.contains("authenticated SSH operation failed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_seeded_host_rolls_back_to_absent_database_and_unloaded_services() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut remote_facts = facts();
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = None;
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable_script(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$*" in
+  *show*) printf 'LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\n' ;;
+  *is-active*) exit 3 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    executable_script(
+        &bin.join("tailscale"),
+        r#"#!/bin/sh
+if [ "$1" = serve ] && [ "$2" = status ] && [ "$3" = --json ]; then printf '{}'; exit 0; fi
+exit 0
+"#,
+    );
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let snapshot = action_command(&RemoteAction::SnapshotRollbackState {
+        paths: paths.clone(),
+        platform: ServicePlatform::Systemd,
+        listener: ListenerPlan::default(),
+    })
+    .unwrap();
+    let status = Command::new("sh")
+        .args(["-c", &snapshot])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let snapshot_dir = PathBuf::from(format!("{}/deployment-rollback", paths.state_dir));
+    assert!(snapshot_dir.join(".missing-database").exists());
+    assert_eq!(
+        fs::read_to_string(snapshot_dir.join("dirtydash-hub.service.loaded"))
+            .unwrap()
+            .trim(),
+        "unloaded"
+    );
+    assert_eq!(
+        fs::read_to_string(snapshot_dir.join("dirtydash-hub.service.active"))
+            .unwrap()
+            .trim(),
+        "inactive"
+    );
+
+    let prepare = action_command(&RemoteAction::PreparePaths {
+        paths: paths.clone(),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &prepare])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    let seed_path = PathBuf::from(format!("{}/dirtydash.sqlite3.seed", paths.data_dir));
+    let mut seed = b"SQLite format 3\0fresh-seed".to_vec();
+    seed.extend_from_slice(&[0x00, 0xff, 0x01]);
+    fs::write(&seed_path, &seed).unwrap();
+    let install = action_command(&RemoteAction::InstallDatabaseSeed {
+        seed_path: seed_path.display().to_string(),
+        database_path: paths.hub_db.clone(),
+        backup_path: paths.hub_db_backup.clone(),
+        wal_backup_path: format!("{}-wal.previous", paths.hub_db_backup),
+        shm_backup_path: format!("{}-shm.previous", paths.hub_db_backup),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &install])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    fs::create_dir_all(&paths.service_dir).unwrap();
+    fs::write(&paths.config_file, b"new-config").unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-hub.service"),
+        b"new-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-collector.service"),
+        b"new-collector",
+    )
+    .unwrap();
+    fs::create_dir_all(&paths.release_dir).unwrap();
+    fs::write(
+        Path::new(&paths.release_dir).join("dirtydash"),
+        b"new-artifact",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&paths.release_dir, &paths.current).unwrap();
+
+    let rollback = action_command(&RemoteAction::Rollback {
+        current: paths.current.clone(),
+        previous: None,
+        database_path: Some(paths.hub_db.clone()),
+        database_backup: None,
+        database_wal_backup: None,
+        database_shm_backup: None,
+        config_path: Some(paths.config_file.clone()),
+        service_dir: Some(paths.service_dir.clone()),
+        platform: ServicePlatform::Systemd,
+        listener: Some(ListenerPlan::default()),
+        snapshot_dir: Some(format!("{}/deployment-rollback", paths.state_dir)),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &rollback])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(!Path::new(&paths.hub_db).exists());
+    assert!(!Path::new(&format!("{}-wal", paths.hub_db)).exists());
+    assert!(!Path::new(&format!("{}-shm", paths.hub_db)).exists());
+    assert!(!Path::new(&paths.config_file).exists());
+    assert!(!Path::new(&paths.service_dir)
+        .join("dirtydash-hub.service")
+        .exists());
+    assert!(!Path::new(&paths.service_dir)
+        .join("dirtydash-collector.service")
+        .exists());
+    assert!(!Path::new(&paths.current).exists());
+
+    let cleanup = action_command(&RemoteAction::Cleanup {
+        release: paths.release_dir.clone(),
+        remove_release: true,
+        database_backup: None,
+        database_wal_backup: None,
+        database_shm_backup: None,
+        temporary_seed: Some(seed_path.display().to_string()),
+        rollback_snapshot: Some(format!("{}/deployment-rollback", paths.state_dir)),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &cleanup])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(!Path::new(&paths.release_dir).exists());
+    assert!(!Path::new(&format!("{}/deployment-rollback", paths.state_dir)).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_restores_existing_database_sidecars_and_active_services_exactly() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let mut remote_facts = facts();
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = Some(format!("{}/old", home.display()));
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    let old_release = PathBuf::from(remote_facts.current_release.clone().unwrap());
+    fs::create_dir_all(&old_release).unwrap();
+    executable_script(&old_release.join("dirtydash"), "#!/bin/sh\nexit 0\n");
+    fs::create_dir_all(Path::new(&paths.current).parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&old_release, &paths.current).unwrap();
+    fs::create_dir_all(Path::new(&paths.hub_db).parent().unwrap()).unwrap();
+    let old_db = b"SQLite format 3\0old-db\0\xff".to_vec();
+    let old_wal = vec![0x00, 0xff, 0x10, 0x20];
+    let old_shm = vec![0x80, 0x00, 0xfe];
+    fs::write(&paths.hub_db, &old_db).unwrap();
+    fs::write(format!("{}-wal", paths.hub_db), &old_wal).unwrap();
+    fs::write(format!("{}-shm", paths.hub_db), &old_shm).unwrap();
+    fs::create_dir_all(Path::new(&paths.config_file).parent().unwrap()).unwrap();
+    fs::write(&paths.config_file, b"old-config\0\xff").unwrap();
+    fs::create_dir_all(&paths.service_dir).unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-hub.service"),
+        b"old-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-collector.service"),
+        b"old-collector",
+    )
+    .unwrap();
+
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable_script(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$*" in
+  *show*) printf 'LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n' ;;
+  *is-active*) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    executable_script(&bin.join("curl"), "#!/bin/sh\nexit 0\n");
+    executable_script(
+        &bin.join("tailscale"),
+        "#!/bin/sh\nif [ \"$1\" = serve ] && [ \"$2\" = status ] && [ \"$3\" = --json ]; then printf '{}'; fi\nexit 0\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let snapshot = action_command(&RemoteAction::SnapshotRollbackState {
+        paths: paths.clone(),
+        platform: ServicePlatform::Systemd,
+        listener: ListenerPlan::default(),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &snapshot])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    let snapshot_dir = PathBuf::from(format!("{}/deployment-rollback", paths.state_dir));
+    assert_eq!(fs::read(snapshot_dir.join("database")).unwrap(), old_db);
+    assert_eq!(
+        fs::read(snapshot_dir.join("database-wal")).unwrap(),
+        old_wal
+    );
+    assert_eq!(
+        fs::read(snapshot_dir.join("database-shm")).unwrap(),
+        old_shm
+    );
+    assert_eq!(
+        fs::read_to_string(snapshot_dir.join("dirtydash-hub.service.active"))
+            .unwrap()
+            .trim(),
+        "active"
+    );
+
+    fs::create_dir_all(&paths.release_dir).unwrap();
+    fs::write(
+        Path::new(&paths.release_dir).join("dirtydash"),
+        b"new-artifact",
+    )
+    .unwrap();
+    fs::remove_file(&paths.current).unwrap();
+    std::os::unix::fs::symlink(&paths.release_dir, &paths.current).unwrap();
+    fs::write(&paths.hub_db, b"SQLite format 3\0new-db").unwrap();
+    fs::write(format!("{}-wal", paths.hub_db), b"new-wal").unwrap();
+    fs::write(format!("{}-shm", paths.hub_db), b"new-shm").unwrap();
+    fs::write(&paths.config_file, b"new-config").unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-hub.service"),
+        b"new-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-collector.service"),
+        b"new-collector",
+    )
+    .unwrap();
+
+    let rollback = action_command(&RemoteAction::Rollback {
+        current: paths.current.clone(),
+        previous: Some(old_release.display().to_string()),
+        database_path: Some(paths.hub_db.clone()),
+        database_backup: None,
+        database_wal_backup: None,
+        database_shm_backup: None,
+        config_path: Some(paths.config_file.clone()),
+        service_dir: Some(paths.service_dir.clone()),
+        platform: ServicePlatform::Systemd,
+        listener: Some(ListenerPlan::default()),
+        snapshot_dir: Some(snapshot_dir.display().to_string()),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &rollback])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(fs::read(&paths.hub_db).unwrap(), old_db);
+    assert_eq!(fs::read(format!("{}-wal", paths.hub_db)).unwrap(), old_wal);
+    assert_eq!(fs::read(format!("{}-shm", paths.hub_db)).unwrap(), old_shm);
+    assert_eq!(fs::read(&paths.config_file).unwrap(), b"old-config\0\xff");
+    assert_eq!(
+        fs::read(Path::new(&paths.service_dir).join("dirtydash-hub.service")).unwrap(),
+        b"old-hub"
+    );
+    assert_eq!(fs::read_link(&paths.current).unwrap(), old_release);
+    assert!(rollback.contains("collector diagnostics --json"));
+}
+
 #[test]
 fn rollback_restores_snapshot_listener_and_checks_old_hub_and_collector() {
     let paths = DeploymentPaths::for_facts(&facts(), "0.1.2-test").unwrap();
@@ -584,9 +1035,11 @@ fn rollback_restores_snapshot_listener_and_checks_old_hub_and_collector() {
     })
     .unwrap();
     assert!(snapshot.contains("tailscale serve status"));
-    assert!(snapshot.contains("previous-current"));
-    assert!(snapshot.contains("is-enabled"));
-    assert!(snapshot.contains("is-active"));
+    assert!(snapshot.contains("current.target"));
+    assert!(snapshot.contains("database-wal"));
+    assert!(snapshot.contains("systemctl --user show"));
+    assert!(snapshot.contains(".loaded"));
+    assert!(snapshot.contains(".active"));
     assert!(snapshot.contains("listener-state"));
     assert!(Command::new("sh")
         .args(["-n", "-c", &snapshot])
@@ -608,6 +1061,8 @@ fn rollback_restores_snapshot_listener_and_checks_old_hub_and_collector() {
         database_shm_backup: Some(
             "/home/delta/.local/state/dirtydash/data/dirtydash.sqlite3.previous-shm".to_string(),
         ),
+        config_path: None,
+        service_dir: None,
         platform: ServicePlatform::Systemd,
         listener: Some(ListenerPlan::default()),
         snapshot_dir: Some("/home/delta/.local/state/dirtydash/deployment-rollback".to_string()),
@@ -616,8 +1071,9 @@ fn rollback_restores_snapshot_listener_and_checks_old_hub_and_collector() {
     assert!(command.contains("listener-state"));
     assert!(command.contains("listener-backend"));
     assert!(command.contains("tailscale serve reset"));
-    assert!(command.contains("systemctl --user restart dirtydash-hub.service"));
-    assert!(command.contains("systemctl --user restart dirtydash-collector.service"));
+    assert!(command.contains("dirtydash-hub.service"));
+    assert!(command.contains("dirtydash-collector.service"));
+    assert!(command.contains("systemctl --user start"));
     assert!(command.contains("/healthz"));
     assert!(command.contains("collector diagnostics --json"));
     assert!(Command::new("sh")

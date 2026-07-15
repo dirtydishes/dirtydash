@@ -31,8 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 use crate::deployment::{
-    DeploymentPlan, DeploymentReceipt, DeploymentRequest, DeploymentRunner, RemoteFacts,
-    SshLiveSecrets, SshRemoteExecutor, TargetPlatform, VerifiedArtifact,
+    DeploymentPlan, DeploymentReceipt, DeploymentRequest, DeploymentRunner, PublisherTrustPolicy,
+    RemoteFacts, SshLiveSecrets, SshRemoteExecutor, TargetPlatform, VerifiedArtifact,
 };
 use crate::listener::ListenerPlan;
 use crate::ssh::{canonical_known_hosts_line, host_key_fingerprint, CanonicalSshTarget};
@@ -668,14 +668,21 @@ pub struct EnrollmentWorkflow<B> {
     store: EnrollmentStore,
     known_hosts: KnownHostStore,
     backend: B,
+    publisher_policy: PublisherTrustPolicy,
 }
 
 impl<B> EnrollmentWorkflow<B> {
-    pub fn new(store: EnrollmentStore, known_hosts: KnownHostStore, backend: B) -> Self {
+    pub fn new(
+        store: EnrollmentStore,
+        known_hosts: KnownHostStore,
+        backend: B,
+        publisher_policy: PublisherTrustPolicy,
+    ) -> Self {
         Self {
             store,
             known_hosts,
             backend,
+            publisher_policy,
         }
     }
 
@@ -869,8 +876,11 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             self.store.save(&draft)?;
             bail!("deployment plan changed after probe")
         }
-        if immutable_plan.artifact.is_none() {
-            bail!("artifact evidence is required; use review_with_artifact");
+        let evidence = immutable_plan
+            .artifact_evidence()
+            .context("artifact evidence is required; use review_with_artifact")?;
+        if !self.publisher_policy.accepts_evidence(evidence) {
+            bail!("deployment plan publisher evidence is not anchored to the enrollment policy");
         }
         draft.reviewed_plan_hash = Some(immutable_plan.plan_hash.clone());
         draft.plan = Some(immutable_plan.clone());
@@ -893,6 +903,14 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         database_seed: Option<&[u8]>,
     ) -> Result<DeploymentPlan> {
         let mut draft = self.store.load(id)?;
+        if !self.publisher_policy.accepts_evidence(&artifact.evidence()) {
+            draft.blocker = EnrollmentBlocker::PlanInvalidated;
+            draft.last_error =
+                Some("artifact is not anchored to the enrollment publisher policy".to_string());
+            draft.updated_at = Utc::now().to_rfc3339();
+            self.store.save(&draft)?;
+            bail!("artifact is not anchored to the enrollment publisher policy");
+        }
         if draft.state != EnrollmentState::ProbeAndPlan
             || immutable_plan.verify_hash().is_err()
             || draft.plan.as_ref() != Some(immutable_plan)
@@ -1003,7 +1021,12 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             self.store.save(&draft)?;
             bail!("reviewed deployment plan is stale")
         }
-        if let Err(error) = validate_execution_intent(immutable_plan, artifact, database_seed) {
+        if let Err(error) = validate_execution_intent(
+            &self.publisher_policy,
+            immutable_plan,
+            artifact,
+            database_seed,
+        ) {
             let message = redact_error(&error.to_string(), secrets);
             draft.blocker = EnrollmentBlocker::PlanInvalidated;
             draft.state = EnrollmentState::ImmutablePlanReview;
@@ -1134,6 +1157,7 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
 }
 
 fn validate_execution_intent(
+    publisher_policy: &PublisherTrustPolicy,
     plan: &DeploymentPlan,
     artifact: &VerifiedArtifact,
     database_seed: Option<&[u8]>,
@@ -1153,9 +1177,11 @@ fn validate_execution_intent(
         }
     }
     let evidence = plan
-        .artifact
-        .as_ref()
+        .artifact_evidence()
         .context("reviewed plan has no verified artifact evidence")?;
+    if !publisher_policy.accepts_evidence(evidence) {
+        bail!("reviewed plan is not anchored to the enrollment publisher policy");
+    }
     let actual = artifact.evidence();
     if evidence != &actual {
         bail!("artifact evidence changed after plan review");
@@ -1241,6 +1267,9 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 pub struct SshEnrollmentBackend {
     target: CanonicalSshTarget,
     known_hosts_path: PathBuf,
+    publisher_policy: PublisherTrustPolicy,
+    ssh_program: PathBuf,
+    keyscan_program: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1261,11 +1290,35 @@ impl SshOperation {
 }
 
 impl SshEnrollmentBackend {
-    pub fn new(target: impl Into<String>, known_hosts_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn new(
+        target: impl Into<String>,
+        known_hosts_path: impl Into<PathBuf>,
+        publisher_policy: PublisherTrustPolicy,
+    ) -> Result<Self> {
         Ok(Self {
             target: CanonicalSshTarget::resolve(target.into())?,
             known_hosts_path: known_hosts_path.into(),
+            publisher_policy,
+            ssh_program: PathBuf::from("ssh"),
+            keyscan_program: PathBuf::from("ssh-keyscan"),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_canonical_target_for_test(
+        target: CanonicalSshTarget,
+        known_hosts_path: impl Into<PathBuf>,
+        publisher_policy: PublisherTrustPolicy,
+        ssh_program: impl Into<PathBuf>,
+        keyscan_program: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            target,
+            known_hosts_path: known_hosts_path.into(),
+            publisher_policy,
+            ssh_program: ssh_program.into(),
+            keyscan_program: keyscan_program.into(),
+        }
     }
 
     fn live_secrets(&self, secrets: &EnrollmentSecrets) -> Result<SshLiveSecrets> {
@@ -1293,7 +1346,8 @@ impl SshEnrollmentBackend {
         let mut executor = SshRemoteExecutor::from_canonical_target(
             self.target.clone(),
             self.known_hosts_path.clone(),
-        )?;
+        )?
+        .with_ssh_program(self.ssh_program.clone());
         if let AuthMethod::KeyPath { path } = auth_method {
             executor = executor.with_key_path(path.clone())?;
         }
@@ -1316,7 +1370,7 @@ impl SshEnrollmentBackend {
         } else {
             operation.command()
         };
-        Ok(executor.live_command(command, sudo, None)?.stdout)
+        Ok(executor.live_command(command, sudo)?.stdout)
     }
 }
 
@@ -1334,7 +1388,7 @@ impl EnrollmentBackend for SshEnrollmentBackend {
     ) -> Result<HostKeyObservation> {
         // `ssh-keyscan` is intentionally only an observation.  It does not
         // alter known-hosts and the workflow requires a separate confirmation.
-        let output = Command::new("ssh-keyscan")
+        let output = Command::new(&self.keyscan_program)
             .args(self.target.keyscan_args())
             .output()
             .context("observing remote SSH host key")?;
@@ -1426,7 +1480,8 @@ impl EnrollmentBackend for SshEnrollmentBackend {
             database_seed: database_seed.map(ToOwned::to_owned),
             approved_plan_hash: Some(plan_hash.to_string()),
         };
-        let mut runner = DeploymentRunner::new(executor).with_reviewed_plan(plan.clone());
+        let mut runner = DeploymentRunner::new(executor, self.publisher_policy.clone())
+            .with_reviewed_plan(plan.clone());
         let receipt = runner.apply(&request, artifact)?;
         let mut enrollment_receipt = EnrollmentReceipt::from(receipt);
         enrollment_receipt.artifact_sha256 = artifact.descriptor().sha256.clone();

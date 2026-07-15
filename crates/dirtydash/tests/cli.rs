@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use dirtydash::deployment::{
-    ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, PublisherKey,
+    ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, PublisherTrustPolicy,
     SignedArtifactManifest, TargetPlatform, MANIFEST_SCHEMA_VERSION,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -237,7 +237,8 @@ fn deploy_hub_rejects_replaced_release_evidence_and_cli_trust_flags() {
     let trusted = SigningKey::from_bytes(&[41_u8; 32]);
     let replacement = SigningKey::from_bytes(&[42_u8; 32]);
     let (manifest, artifact_dir, public_key) = write_release_fixture(dir.path(), &trusted);
-    let trusted_key_id = PublisherKey::fingerprint(&trusted.verifying_key().to_bytes()).unwrap();
+    let trusted_key_id =
+        PublisherTrustPolicy::fingerprint(&trusted.verifying_key().to_bytes()).unwrap();
     let trusted_fingerprint = trusted_key_id.clone();
     fs::write(
         dir.path().join("config.toml"),
@@ -343,7 +344,7 @@ fn write_release_fixture(
     };
     fs::write(artifact_dir.join(&descriptor.file), bytes).unwrap();
     let mut signed = SignedArtifactManifest {
-        key_id: PublisherKey::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        key_id: PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
         manifest: ArtifactManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             release: "0.1.1-cli".to_string(),

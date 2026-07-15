@@ -10,8 +10,8 @@ use crate::collector;
 use crate::config::Config;
 use crate::db::Database;
 use crate::deployment::{
-    DeploymentRequest, DeploymentStateStore, PublisherKey, RemoteExecutor, SignedArtifactManifest,
-    SshRemoteExecutor,
+    DeploymentRequest, DeploymentStateStore, PublisherTrustPolicy, RemoteExecutor,
+    SignedArtifactManifest, SshRemoteExecutor,
 };
 use crate::enrollment::{HostKeyObservation, HostKeyStatus, KnownHostStore};
 use crate::hub::ListenerTrustMode;
@@ -619,8 +619,9 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
             database_seed: inputs.seed,
             approved_plan_hash: None,
         };
-        let mut runner = crate::deployment::DeploymentRunner::new(executor)
-            .with_state_store(DeploymentStateStore::new(state_path));
+        let mut runner =
+            crate::deployment::DeploymentRunner::new(executor, inputs.publisher.clone())
+                .with_state_store(DeploymentStateStore::new(state_path));
         let plan = runner.probe(&request, Some(&inputs.artifact))?;
         if args.json {
             println!("{}", plan.to_json()?);
@@ -628,7 +629,7 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
             println!("{}", plan.to_json()?);
             println!(
                 "review plan hash {} and pass it with --approved-plan-hash --apply",
-                plan.plan_hash
+                plan.plan_hash()
             );
         }
         return Ok(());
@@ -656,7 +657,7 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
         database_seed: inputs.seed,
         approved_plan_hash: args.approved_plan_hash,
     };
-    let mut runner = crate::deployment::DeploymentRunner::new(executor)
+    let mut runner = crate::deployment::DeploymentRunner::new(executor, inputs.publisher.clone())
         .with_state_store(DeploymentStateStore::new(state_path));
     let receipt = runner.apply(&request, &inputs.artifact)?;
     if args.json {
@@ -674,6 +675,7 @@ struct DeploymentInputs {
     signed: SignedArtifactManifest,
     artifact: crate::deployment::VerifiedArtifact,
     seed: Option<Vec<u8>>,
+    publisher: PublisherTrustPolicy,
 }
 
 fn configured_publisher_anchor<'a>(
@@ -733,8 +735,8 @@ fn verify_publisher_inputs(args: &DeployHubArgs, config: &Config) -> Result<()> 
     )
     .context("parsing signed artifact manifest")?;
     let public_key = read_public_key(public_key_path)?;
-    let publisher = PublisherKey::new(key_id, fingerprint, &public_key)?;
-    let verified_manifest = signed.verify_with_publisher(&publisher)?;
+    let publisher = PublisherTrustPolicy::new(key_id, fingerprint, &public_key)?;
+    let verified_manifest = publisher.verify(&signed)?;
     for descriptor in &verified_manifest.manifest().artifacts {
         let bytes = fs::read(artifact_dir.join(&descriptor.file)).with_context(|| {
             format!(
@@ -773,8 +775,8 @@ fn deployment_inputs(
     )
     .context("parsing signed artifact manifest")?;
     let public_key = read_public_key(public_key_path)?;
-    let publisher = PublisherKey::new(key_id, fingerprint, &public_key)?;
-    let verified_manifest = signed.verify_with_publisher(&publisher)?;
+    let publisher = PublisherTrustPolicy::new(key_id, fingerprint, &public_key)?;
+    let verified_manifest = publisher.verify(&signed)?;
     // Selection is completed after the remote probe by the runner.  Local
     // artifact verification still uses every declared digest/size invariant.
     let descriptor = match platform {
@@ -807,6 +809,7 @@ fn deployment_inputs(
         signed,
         artifact,
         seed,
+        publisher,
     })
 }
 

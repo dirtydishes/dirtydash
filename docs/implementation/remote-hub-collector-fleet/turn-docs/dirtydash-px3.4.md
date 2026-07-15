@@ -78,6 +78,17 @@ SSH uses one `ssh -G`-resolved typed target (HostName/Port/User/HostKeyAlias/Pro
 
 Enrollment stores the reviewed plan and artifact/seed intent, has durable execution substates, and permits restart/retry only after cleanup with the same hash. Password-authenticated installs use the same controlled live PTY as trust/probe; fixed password, key-passphrase, and sudo prompts release bounded zeroized bytes only to live stdin. User systemd/launchd units no longer switch users, and already-loaded launchd jobs are handled explicitly. Private Tailscale binds loopback-only, while trusted-proxy CIDRs are validated at config time and transport peer/header trust is fail-closed. Rollback restores the snapshotted listener and prior service definitions, restarts both services, checks old Hub `/healthz` plus Collector diagnostics, and records a manual-recovery blocker if rollback health fails. Focused SSH, publisher replacement, secret-store, plan, byte-level SQLite/WAL, rollback/manual-recovery, listener, service, live-PTY redaction, and restart tests were added.
 
+## Final Review Repair Pass
+
+The bounded post-review repair returned to the same mutable owner and addresses exactly the four requested blockers:
+
+1. Rollback now snapshots the actual pre-mutation current pointer, config/service files, Hub DB plus WAL/SHM existence and bytes, Hub/Collector systemd or launchd loaded/active state, and listener status. Snapshot is the first remote mutation; rollback restores captured files and active/inactive/unloaded states, removes only paths recorded absent, and retains the snapshot on manual recovery. Fresh seeded hosts and initially inactive/unloaded services have executable shell coverage.
+2. Password/passphrase PTY handling now only authenticates a short-lived restricted OpenSSH ControlMaster. Artifact, config, and database bytes use a separate `-T` binary-safe pipe over the authenticated socket; production-path tests transfer NUL and `0xff` bytes under password auth and redact hostile output.
+3. `SshEnrollmentBackend` and `SshRemoteExecutor` production adapters are exercised through real adapter calls, including password auth/probe, service-state snapshot, mutation failure, rollback retention, binary transfer, and secret redaction.
+4. `PublisherTrustPolicy` is required by deployment and enrollment runners. Verified artifact construction remains private to policy verification; plan fields, plan persistence seams, and reviewed-plan injection are crate-private, so no exported unchecked artifact/plan constructor can reach apply. A mismatched-policy runtime API test covers the rejection path.
+
+Protected conversion/migration artifacts remain byte-identical to the phase baseline; all new tests use isolated temporary directories and do not mutate repository docs. No Beads state was mutated, no merge was performed, and the coordinator still owns integration.
+
 ## Review
 
 Pending independent fresh review of this repair pass. Live signing keys, real SSH hosts/managers, public certificates, and tailnet consent remain unavailable external gates; no evidence is fabricated.
@@ -93,9 +104,10 @@ Evidence:
 - `cargo fmt --all`: passed.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - Thermo-nuclear repair validation covers persisted reviewed plans, durable publisher anchoring/replacement rejection, canonical SSH/host-key trust, controlled live-PTY password/sudo success/failure/redaction, secret snapshots/permissions, no-sqlite3 byte-level valid/malformed/WAL paths, actual listener/service/current-pointer rollback, old Hub/Collector rollback health, manual-recovery status, listener CIDRs/peer trust, execution restart, and redaction.
-- `cargo test --all-targets --all-features`: passed (98 unit tests, 9 CLI tests, 14 Collector integration tests).
+- `cargo test --all-targets --all-features`: passed (103 unit tests, 9 CLI tests, 14 Collector integration tests).
 - `npm --prefix dashboard run build`: passed with Vite production output.
-- Local Hub smoke: `serve --hub --listener public --host 127.0.0.1 --port 0` started a real connect-info router and `/healthz` returned `{"service":"dirtydash-hub","status":"ok"}`.
+- Local Hub smoke: `target/debug/dirtydash serve --hub --listener public --host 127.0.0.1 --port 4598` started a real connect-info router and `/healthz` returned `{"service":"dirtydash-hub","status":"ok"}`.
+- `git diff --check` and allowed-path/protected-artifact checks: passed; protected conversion/migration artifacts are byte-identical to `HEAD`.
 - Live production signing, SSH alias/manual host enrollment, changed-key behavior against real hosts, systemd/launchd manager operations, Tailscale consent, public TLS certificates, and real release artifact deployment were not available in this isolated environment.
 
 ## PR And Commits

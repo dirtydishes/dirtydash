@@ -1,10 +1,78 @@
 use super::*;
 use crate::config::{RemoteConfig, SourceRoot};
 use crate::deployment::{
-    ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, MANIFEST_SCHEMA_VERSION,
+    ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, PublisherTrustPolicy,
+    MANIFEST_SCHEMA_VERSION,
 };
 use ed25519_dalek::{Signer, SigningKey};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::Path;
 use tempfile::tempdir;
+
+#[cfg(unix)]
+fn executable_script(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+fn enrollment_fake_ssh(path: &Path, fail_commands: bool, home: &Path) {
+    let failure = if fail_commands {
+        r#"case "$last" in
+    *"deployment-rollback"*) exec /bin/sh -c "$last" ;;
+    *"mkdir -p"*) printf 'password=PASSWORD_SENTINEL hostile mutation failure\n' >&2; exit 43 ;;
+esac
+"#
+    } else {
+        ""
+    };
+    executable_script(
+        path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+socket=''
+master=0
+operation=''
+last=''
+while [ "$#" -gt 0 ]; do
+    arg=$1
+    shift
+    case "$arg" in
+        -S) socket=$1; shift ;;
+        -O) operation=$1; shift ;;
+        -M) master=1 ;;
+        -o|-p|-i) shift ;;
+        *) last=$arg ;;
+    esac
+done
+if [ "$operation" = exit ]; then rm -f "$socket"; exit 0; fi
+if [ "$master" = 1 ]; then
+    printf 'user@host password: ' >&2
+    IFS= read -r password
+    [ "$password" = PASSWORD_SENTINEL ] || {{ printf 'password=%s hostile\n' "$password" >&2; exit 21; }}
+    : > "$socket"
+    exit 0
+fi
+case "$last" in
+    *"printf 'os="*) printf 'os=Linux\narch=x86_64\nuser=deploy\nuid=1000\nhome={home}\n' ; exit 0 ;;
+    *"printf dirtydash-authenticated"*) printf 'dirtydash-authenticated\n' ; exit 0 ;;
+esac
+{failure}
+exec /bin/sh -c "$last"
+"#,
+            home = home.display(),
+            failure = failure,
+        ),
+    );
+}
+
+#[cfg(unix)]
+fn enrollment_fake_keyscan(path: &Path) {
+    executable_script(path, "#!/bin/sh\nprintf 'example ssh-ed25519 AQID\\n'\n");
+}
 
 #[derive(Default)]
 struct ScriptedBackend {
@@ -129,6 +197,16 @@ impl ScriptedBackend {
     }
 }
 
+fn fixture_policy() -> PublisherTrustPolicy {
+    let key = SigningKey::from_bytes(&[8_u8; 32]);
+    PublisherTrustPolicy::new(
+        PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        &key.verifying_key().to_bytes(),
+    )
+    .unwrap()
+}
+
 fn fixture_artifact() -> VerifiedArtifact {
     let key = SigningKey::from_bytes(&[8_u8; 32]);
     let bytes = b"fixture".to_vec();
@@ -146,23 +224,27 @@ fn fixture_artifact() -> VerifiedArtifact {
         }],
     };
     let mut signed = crate::deployment::SignedArtifactManifest {
-        key_id: crate::deployment::PublisherKey::fingerprint(&key.verifying_key().to_bytes())
-            .unwrap(),
+        key_id: PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
         manifest,
         signature: String::new(),
     };
     signed.signature = hex::encode(key.sign(&signed.signing_bytes().unwrap()).to_bytes());
-    signed
-        .verify(&key.verifying_key().to_bytes())
-        .unwrap()
-        .verify_artifact(
-            TargetPlatform {
-                os: ArtifactOs::Linux,
-                arch: ArtifactArch::X86_64,
-            },
-            bytes,
-        )
-        .unwrap()
+    PublisherTrustPolicy::new(
+        signed.key_id.clone(),
+        PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        &key.verifying_key().to_bytes(),
+    )
+    .unwrap()
+    .verify(&signed)
+    .unwrap()
+    .verify_artifact(
+        TargetPlatform {
+            os: ArtifactOs::Linux,
+            arch: ArtifactArch::X86_64,
+        },
+        bytes,
+    )
+    .unwrap()
 }
 
 fn workflow() -> (
@@ -203,7 +285,7 @@ fn workflow() -> (
     };
     let store = EnrollmentStore::new(dir.path().join("enrollments"));
     let known = KnownHostStore::new(dir.path().join("known_hosts"));
-    let workflow = EnrollmentWorkflow::new(store, known, backend);
+    let workflow = EnrollmentWorkflow::new(store, known, backend, fixture_policy());
     (workflow, draft, plan, dir)
 }
 
@@ -318,7 +400,7 @@ fn five_states_survive_restart_and_execute_records_receipt_backfill() {
     let store = workflow.store.clone();
     let known = workflow.known_hosts.clone();
     let backend = std::mem::take(&mut workflow.backend);
-    let mut restarted = EnrollmentWorkflow::new(store, known, backend);
+    let mut restarted = EnrollmentWorkflow::new(store, known, backend, fixture_policy());
     let receipt = restarted
         .execute(
             "machine-1",
@@ -488,6 +570,149 @@ fn legacy_conversion_never_enrolls_or_calls_ssh() {
     assert_eq!(drafts.len(), 1);
     assert!(!drafts[0].enrolled);
     assert!(drafts[0].conversion_note.contains("explicit"));
+}
+
+#[cfg(unix)]
+#[test]
+fn production_ssh_enrollment_auth_probe_failure_and_snapshot_use_real_backend() {
+    let dir = tempdir().unwrap();
+    let ssh = dir.path().join("fake-ssh");
+    let keyscan = dir.path().join("fake-keyscan");
+    let remote_home = dir.path().join("remote-home");
+    enrollment_fake_ssh(&ssh, true, &remote_home);
+    enrollment_fake_keyscan(&keyscan);
+    let known_path = dir.path().join("known_hosts");
+    let canonical = CanonicalSshTarget::from_ssh_config(
+        "deploy@example",
+        "hostname example\nport 22\nuser deploy\nproxycommand none\n",
+    )
+    .unwrap();
+    let policy = fixture_policy();
+    let mut backend = SshEnrollmentBackend::from_canonical_target_for_test(
+        canonical.clone(),
+        &known_path,
+        policy.clone(),
+        &ssh,
+        &keyscan,
+    );
+    let known = KnownHostStore::new(&known_path);
+    let secrets = EnrollmentSecrets::password("PASSWORD_SENTINEL");
+    let observation = backend
+        .observe_host_key(
+            &ConnectionSpec::manual("deploy", "example", 22).unwrap(),
+            &AuthMethod::Password,
+            &known,
+            &secrets,
+        )
+        .unwrap();
+    known
+        .confirm_unknown(&canonical.host_key_name(), &observation)
+        .unwrap();
+    backend
+        .authenticate(
+            &ConnectionSpec::manual("deploy", "example", 22).unwrap(),
+            &AuthMethod::Password,
+            &known,
+            &secrets,
+        )
+        .unwrap();
+    let (facts, mut plan) = backend
+        .probe_and_plan(
+            &ConnectionSpec::manual("deploy", "example", 22).unwrap(),
+            &AuthMethod::Password,
+            &known,
+            &secrets,
+        )
+        .unwrap();
+    assert_eq!(facts.uid, 1000);
+    assert_eq!(
+        facts.platform,
+        TargetPlatform {
+            os: ArtifactOs::Linux,
+            arch: ArtifactArch::X86_64
+        }
+    );
+    let artifact = fixture_artifact();
+    plan.artifact = Some(artifact.evidence());
+    plan.refresh_hash().unwrap();
+    let draft = EnrollmentDraft::new(
+        "production-ssh",
+        ConnectionSpec::manual("deploy", "example", 22).unwrap(),
+        AuthMethod::Password,
+    )
+    .unwrap();
+    let listener = ListenerPlan::default();
+    let request = EnrollmentExecution {
+        draft: &draft,
+        plan: &plan,
+        plan_hash: &plan.plan_hash,
+        artifact: &artifact,
+        database_seed: None,
+        listener: &listener,
+        secrets: &secrets,
+    };
+    let error = backend.execute(request).unwrap_err().to_string();
+    assert!(!error.contains("PASSWORD_SENTINEL"));
+    assert!(error.contains("manual recovery") || error.contains("rolled back"));
+    let snapshot = remote_home.join(".local/state/dirtydash/deployment-rollback");
+    assert!(snapshot.join("database").exists() || snapshot.join(".missing-database").exists());
+    assert_eq!(
+        fs::read_to_string(snapshot.join("dirtydash-hub.service.loaded"))
+            .unwrap()
+            .trim(),
+        "unloaded"
+    );
+    assert_eq!(
+        fs::read_to_string(snapshot.join("dirtydash-collector.service.active"))
+            .unwrap()
+            .trim(),
+        "inactive"
+    );
+    let _ = fs::remove_dir_all(snapshot);
+
+    let failing_ssh = dir.path().join("failing-ssh");
+    enrollment_fake_ssh(&failing_ssh, false, &remote_home);
+    executable_script(
+        &failing_ssh,
+        r#"#!/bin/sh
+set -eu
+socket=''
+master=0
+operation=''
+last=''
+while [ "$#" -gt 0 ]; do
+  arg=$1; shift
+  case "$arg" in
+    -S) socket=$1; shift;;
+    -O) operation=$1; shift;;
+    -M) master=1;;
+    -o|-p|-i) shift;;
+    *) last=$arg;;
+  esac
+done
+if [ "$operation" = exit ]; then rm -f "$socket"; exit 0; fi
+if [ "$master" = 1 ]; then printf 'password: ' >&2; IFS= read -r password; : > "$socket"; exit 0; fi
+printf 'password=PASSWORD_SENTINEL hostile auth failure\n' >&2
+exit 44
+"#,
+    );
+    let mut redacting_backend = SshEnrollmentBackend::from_canonical_target_for_test(
+        canonical,
+        &known_path,
+        policy,
+        &failing_ssh,
+        &keyscan,
+    );
+    let error = redacting_backend
+        .authenticate(
+            &ConnectionSpec::manual("deploy", "example", 22).unwrap(),
+            &AuthMethod::Password,
+            &known,
+            &secrets,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("PASSWORD_SENTINEL"));
 }
 
 #[test]
