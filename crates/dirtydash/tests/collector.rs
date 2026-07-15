@@ -12,6 +12,8 @@ use dirtydash::db::Database;
 use dirtydash::hub::{IngestBatchRequest, IngestBatchResponse, OwnerCommand};
 use dirtydash::importers::{self, DetectedSource, SourceKind};
 use rusqlite::params;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn at(value: &str) -> DateTime<Utc> {
@@ -78,6 +80,44 @@ fn make_collector() -> (
 }
 
 #[derive(Default)]
+struct CredentialFallbackTransport {
+    seen_credentials: Vec<String>,
+}
+
+impl CollectorTransport for CredentialFallbackTransport {
+    fn send_batch(
+        &mut self,
+        credential_token: &str,
+        request: &IngestBatchRequest,
+    ) -> Result<IngestBatchResponse, TransportError> {
+        self.seen_credentials.push(credential_token.to_string());
+        if credential_token == "pending-token" {
+            return Err(TransportError::new(
+                RetryClass::Unauthorized,
+                "pending credential not active yet",
+            ));
+        }
+        Ok(IngestBatchResponse {
+            batch_id: request.batch_id.clone(),
+            inserted_events: request.events.len() as u64,
+            updated_events: 0,
+            skipped_events: 0,
+            idempotent_replay: false,
+            committed_at: "2026-07-15T00:00:00Z".to_string(),
+        })
+    }
+
+    fn poll_owner_command(
+        &mut self,
+        _credential_token: &str,
+        _machine_id: &str,
+        _wait: Duration,
+    ) -> Result<Option<OwnerCommand>, TransportError> {
+        Ok(None)
+    }
+}
+
+#[derive(Default)]
 struct FakeTransport {
     responses: Vec<Result<IngestBatchResponse, TransportError>>,
     command: Option<OwnerCommand>,
@@ -141,7 +181,59 @@ impl CollectorTransport for FakeTransport {
 
 #[test]
 fn five_real_agent_fixtures_parse_and_transport_only_redacted_metadata() {
-    let (_dir, mut collector, _roots, _usage_path, collector_path) = make_collector();
+    let (_dir, mut collector, roots, _usage_path, collector_path) = make_collector();
+    let nested = json!({
+        "model": "NESTED_MODEL_SECRET_SENTINEL",
+        "provider": "NESTED_PROVIDER_SECRET_SENTINEL",
+        "ssh": "NESTED_SSH_SECRET_SENTINEL",
+        "sudo": "NESTED_SUDO_SECRET_SENTINEL",
+        "authorization": "NESTED_AUTHORIZATION_SECRET_SENTINEL"
+    });
+    fs::write(
+        roots[0].1.join("nested.jsonl"),
+        json!({
+            "sessionId": "nested-claude",
+            "message": {"content": nested.clone()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        roots[1].1.join("nested.jsonl"),
+        json!({
+            "type": "event_msg",
+            "payload": {"type": "turn_context", "metadata": nested.clone()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut opencode: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(roots[2].1.join("message.json")).unwrap())
+            .unwrap();
+    opencode["metadata"] = nested.clone();
+    fs::write(
+        roots[2].1.join("message.json"),
+        serde_json::to_string(&opencode).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        roots[3].1.join("nested.jsonl"),
+        json!({
+            "type": "message",
+            "id": "nested-pi",
+            "provider": "safe-provider",
+            "model": "safe-model",
+            "message": {"content": nested.clone()}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        roots[4].1.join("nested.jsonl"),
+        json!({"type": "turn", "session_id": "nested-hermes", "content": nested}).to_string(),
+    )
+    .unwrap();
+
     let report = collector
         .reconcile_manual(at("2026-07-15T00:00:00Z"))
         .unwrap();
@@ -166,6 +258,11 @@ fn five_real_agent_fixtures_parse_and_transport_only_redacted_metadata() {
         "/Users/example/secret-project",
         "C:\\\\Users\\\\example",
         "\\\\server\\share\\private-project",
+        "NESTED_MODEL_SECRET_SENTINEL",
+        "NESTED_PROVIDER_SECRET_SENTINEL",
+        "NESTED_SSH_SECRET_SENTINEL",
+        "NESTED_SUDO_SECRET_SENTINEL",
+        "NESTED_AUTHORIZATION_SECRET_SENTINEL",
     ] {
         assert!(!json.contains(sentinel), "payload leaked {sentinel}");
     }
@@ -280,7 +377,17 @@ fn parser_upgrade_reprocesses_manifest_but_reuses_fingerprint() {
     assert_eq!(before, after_parsed.events[0].raw_event_hash);
 
     let relocated = roots[0].1.join("relocated-session.jsonl");
-    fs::copy(&source, &relocated).unwrap();
+    let original_bytes = fs::read_to_string(&source).unwrap();
+    // Move the unchanged record after an unrelated valid metadata record;
+    // line position must not participate in canonical Collector identity.
+    fs::write(
+        &relocated,
+        format!(
+            "{}\n{}",
+            r#"{"sessionId":"unrelated-metadata","type":"system"}"#, original_bytes
+        ),
+    )
+    .unwrap();
     let relocated_source = DetectedSource {
         path: roots[0].1.clone(),
         ..detected.clone()
@@ -297,6 +404,32 @@ fn parser_upgrade_reprocesses_manifest_but_reuses_fingerprint() {
         importers::stable_event_fingerprint(&after_parsed.events[0]),
         importers::stable_event_fingerprint(&relocated_parsed.events[0])
     );
+}
+
+#[test]
+fn unchanged_manifests_and_tombstones_are_coalesced() {
+    let (_dir, mut collector, roots, _usage_path, collector_path) = make_collector();
+    let first = collector
+        .reconcile_startup(at("2026-07-15T00:00:00Z"))
+        .unwrap();
+    assert!(first.batch_id.is_some());
+    let second = collector
+        .reconcile_startup(at("2026-07-15T00:15:00Z"))
+        .unwrap();
+    assert!(second.batch_id.is_none());
+    let store = Database::open(collector_path.clone()).unwrap();
+    assert_eq!(store.collector_outbox_count().unwrap(), 1);
+
+    fs::remove_file(roots[0].1.join("session.jsonl")).unwrap();
+    let tombstone = collector
+        .reconcile_startup(at("2026-07-15T00:30:00Z"))
+        .unwrap();
+    assert!(tombstone.batch_id.is_some());
+    let repeated = collector
+        .reconcile_startup(at("2026-07-15T00:45:00Z"))
+        .unwrap();
+    assert!(repeated.batch_id.is_none());
+    assert_eq!(store.collector_outbox_count().unwrap(), 2);
 }
 
 #[test]
@@ -379,6 +512,37 @@ fn hermes_state_database_rows_are_parsed_as_metadata() {
 }
 
 #[test]
+fn restricted_updater_verifies_bytes_and_applies_atomically() {
+    let dir = tempdir().unwrap();
+    let artifact = b"approved-artifact-bytes";
+    let digest = hex::encode(Sha256::digest(artifact));
+    let target = dir.path().join("installed/dirtydash.bin");
+    let collector = Collector::with_databases(
+        Database::open(dir.path().join("usage.sqlite3")).unwrap(),
+        Database::open(dir.path().join("collector.sqlite3")).unwrap(),
+        CollectorOptions {
+            machine_id: Some("machine-update".to_string()),
+            credential_token: Some("ddcol_fixture.secret".to_string()),
+            approved_updates: vec![ApprovedUpdate {
+                version: "0.1.2".to_string(),
+                sha256: digest.clone(),
+            }],
+            update_target: Some(target.clone()),
+            ..CollectorOptions::default()
+        },
+    )
+    .unwrap();
+    collector
+        .apply_approved_update_artifact("0.1.2", &digest, artifact)
+        .unwrap();
+    assert_eq!(fs::read(&target).unwrap(), artifact);
+    assert!(collector
+        .apply_approved_update_artifact("0.1.2", &"0".repeat(64), b"unapproved")
+        .is_err());
+    assert_eq!(fs::read(&target).unwrap(), artifact);
+}
+
+#[test]
 fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
     let (_dir, mut collector, _roots, _usage_path, _collector_path) = make_collector();
     let now = at("2026-07-15T00:00:00Z");
@@ -429,7 +593,7 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
     });
     assert!(matches!(
         collector.poll_owner_command(&mut transport, now).unwrap(),
-        Some(CommandOutcome::UpdateAccepted { .. })
+        Some(CommandOutcome::Rejected { .. })
     ));
     transport.command = Some(OwnerCommand::ApprovedUpdate {
         command_id: "update-2".to_string(),
@@ -440,6 +604,108 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
         collector.poll_owner_command(&mut transport, now).unwrap(),
         Some(CommandOutcome::Rejected { .. })
     ));
+}
+
+#[test]
+fn pending_credential_auth_failure_falls_back_without_retiring_old_token() {
+    let (_dir, mut collector, _roots, _usage_path, collector_path) = make_collector();
+    collector
+        .reconcile_startup(at("2026-07-15T00:00:00Z"))
+        .unwrap();
+    collector
+        .handle_owner_command(
+            OwnerCommand::RotateCredential {
+                command_id: "rotate-fallback".to_string(),
+                credential_token: "pending-token".to_string(),
+            },
+            at("2026-07-15T00:00:00Z"),
+        )
+        .unwrap();
+    let mut transport = CredentialFallbackTransport::default();
+    let report = collector
+        .deliver_pending(&mut transport, at("2026-07-15T00:00:01Z"))
+        .unwrap();
+    assert_eq!(report.acknowledged, 1);
+    assert_eq!(
+        transport.seen_credentials,
+        vec![
+            "pending-token".to_string(),
+            "ddcol_fixture.secret".to_string()
+        ]
+    );
+    let identity = Database::open(collector_path)
+        .unwrap()
+        .collector_identity()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        identity.credential_token.as_deref(),
+        Some("ddcol_fixture.secret")
+    );
+    assert_eq!(
+        identity.pending_credential_token.as_deref(),
+        Some("pending-token")
+    );
+}
+
+#[test]
+fn terminal_outbox_is_excluded_and_requires_manual_recovery() {
+    let (_dir, mut collector, _roots, _usage_path, collector_path) = make_collector();
+    collector
+        .reconcile_startup(at("2026-07-15T00:00:00Z"))
+        .unwrap();
+    let mut unauthorized = FakeTransport {
+        responses: vec![Err(TransportError::new(
+            RetryClass::Unauthorized,
+            "expired credential",
+        ))],
+        ..FakeTransport::default()
+    };
+    let report = collector
+        .deliver_pending(&mut unauthorized, at("2026-07-15T00:00:01Z"))
+        .unwrap();
+    assert_eq!(report.pending, 0);
+    assert_eq!(report.terminal, 1);
+    let store = Database::open(collector_path).unwrap();
+    assert!(store
+        .collector_outbox_ready("2026-07-15T00:00:02Z", 10)
+        .unwrap()
+        .is_empty());
+    assert!(!collector
+        .recover_outbox_batch("batch-does-not-exist", at("2026-07-15T00:00:02Z"))
+        .unwrap());
+    let batch_id = store
+        .collector_outbox_records(true)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .batch_id;
+    assert!(collector
+        .recover_outbox_batch(&batch_id, at("2026-07-15T00:00:03Z"))
+        .unwrap());
+    assert_eq!(store.collector_outbox_count().unwrap(), 1);
+}
+
+#[test]
+fn started_command_is_reclaimed_and_resumed_after_lease_expiry() {
+    let (_dir, mut collector, _roots, _usage_path, collector_path) = make_collector();
+    let store = Database::open(collector_path).unwrap();
+    assert!(store
+        .begin_collector_command_owned("reclaim-1", "2026-07-15T00:00:00Z", "crashed-owner",)
+        .unwrap());
+    let mut transport = FakeTransport {
+        command: Some(OwnerCommand::Diagnostics {
+            command_id: "reclaim-1".to_string(),
+        }),
+        ..FakeTransport::default()
+    };
+    let outcome = collector
+        .poll_owner_command(&mut transport, at("2026-07-15T00:02:00Z"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, CommandOutcome::Diagnostics(_)));
+    assert_eq!(transport.acknowledgements, 1);
 }
 
 #[test]

@@ -8,6 +8,7 @@ impl HubRepository {
         Self {
             db,
             write_guard: Arc::new(Mutex::new(())),
+            command_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             final_insert_failure: Arc::new(Mutex::new(false)),
         }
@@ -39,17 +40,9 @@ impl HubRepository {
             params![machine_id, display_name, now],
         )
         .map_err(HubError::internal)?;
-        tx.execute(
-            r#"
-            UPDATE collector_credentials
-            SET revoked_at = ?3
-            WHERE machine_id = ?1
-                AND credential_label = ?2
-                AND revoked_at IS NULL
-            "#,
-            params![machine_id, credential_label, now],
-        )
-        .map_err(HubError::internal)?;
+        // Rotation is an overlap window, not an immediate cutover. The old
+        // credential remains valid until the Collector proves the replacement
+        // by authenticating a successful request.
         tx.execute(
             r#"
             INSERT INTO collector_credentials(
@@ -157,6 +150,51 @@ impl HubRepository {
         })
     }
 
+    fn prove_collector_credential(&self, auth: &AuthenticatedCollector) -> Result<(), HubError> {
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        self.prove_collector_credential_tx(&tx, auth)?;
+        tx.commit().map_err(HubError::internal)
+    }
+
+    /// A successful request made with the newest overlapping credential is
+    /// proof that rotation completed. Only then are older credentials retired.
+    fn prove_collector_credential_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        auth: &AuthenticatedCollector,
+    ) -> Result<(), HubError> {
+        let (machine_id, label, row_id): (String, String, i64) = tx
+            .query_row(
+                "SELECT machine_id, credential_label, rowid FROM collector_credentials WHERE credential_id = ?1 AND revoked_at IS NULL",
+                params![auth.credential_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(HubError::internal)?;
+        // A newer active row means this token is an older overlap token. It
+        // remains valid so a Collector can safely fall back while staging the
+        // newest token.
+        let newer_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collector_credentials WHERE machine_id = ?1 AND credential_label = ?2 AND revoked_at IS NULL AND rowid > ?3)",
+                params![machine_id, label, row_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if newer_exists {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE collector_credentials SET revoked_at = ?3 WHERE machine_id = ?1 AND credential_label = ?2 AND revoked_at IS NULL AND rowid < ?4",
+            params![machine_id, label, now_utc(), row_id],
+        )
+        .map_err(HubError::internal)?;
+        Ok(())
+    }
+
     pub(crate) fn ingest_batch(
         &self,
         auth: &AuthenticatedCollector,
@@ -195,6 +233,7 @@ impl HubRepository {
                     "batch_id was already committed with a different payload",
                 ));
             }
+            self.prove_collector_credential_tx(&tx, auth)?;
             tx.commit().map_err(HubError::internal)?;
             return Ok(IngestBatchResponse {
                 batch_id: validated.batch_id,
@@ -332,6 +371,7 @@ impl HubRepository {
         )
         .map_err(HubError::internal)?;
 
+        self.prove_collector_credential_tx(&tx, auth)?;
         tx.commit().map_err(HubError::internal)?;
         Ok(IngestBatchResponse {
             batch_id: validated.batch_id,
@@ -341,6 +381,10 @@ impl HubRepository {
             idempotent_replay: false,
             committed_at,
         })
+    }
+
+    pub(crate) fn command_notification(&self) -> Arc<Notify> {
+        Arc::clone(&self.command_notify)
     }
 
     pub(crate) fn issue_collector_command(
@@ -353,6 +397,29 @@ impl HubRepository {
         let now = now_utc();
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let conn = self.db.connection().map_err(HubError::internal)?;
+        let existing = conn
+            .query_row(
+                "SELECT machine_id, command_json FROM collector_commands WHERE command_id = ?1",
+                params![command_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        if let Some((existing_machine, existing_json)) = existing {
+            let same_command = existing_machine == machine_id
+                && serde_json::from_str::<serde_json::Value>(&existing_json).ok()
+                    == serde_json::from_str::<serde_json::Value>(&command_json).ok();
+            if !same_command {
+                return Err(HubError::conflict(
+                    "collector-command-conflict",
+                    "command_id is already bound to a different machine or command",
+                ));
+            }
+            return Ok(IssueCollectorCommandResponse {
+                command_id,
+                machine_id,
+            });
+        }
         conn.execute(
             r#"
             INSERT INTO collector_commands(command_id, machine_id, command_json, created_at)
@@ -361,6 +428,9 @@ impl HubRepository {
             params![command_id, machine_id, command_json, now],
         )
         .map_err(HubError::internal)?;
+        // Keep a permit if the poller is between its immediate DB check and
+        // registering the long-poll future; this closes the command wake race.
+        self.command_notify.notify_one();
         Ok(IssueCollectorCommandResponse {
             command_id,
             machine_id,
@@ -412,28 +482,63 @@ impl HubRepository {
         request: CollectorCommandAckRequest,
     ) -> Result<(), HubError> {
         let command_id = validate_identifier(&request.command_id, "command_id")?;
+        let result_json = serde_json::to_string(&request.result).map_err(HubError::internal)?;
+        let write_guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let conn = self.db.connection().map_err(HubError::internal)?;
-        let changed = conn
-            .execute(
-                r#"
-                UPDATE collector_commands
-                SET acknowledged_at = ?3, result_json = ?4
-                WHERE command_id = ?1 AND machine_id = ?2 AND acknowledged_at IS NULL
-                "#,
-                params![
-                    command_id,
-                    auth.machine_id,
-                    now_utc(),
-                    serde_json::to_string(&request.result).map_err(HubError::internal)?
-                ],
+        let existing = conn
+            .query_row(
+                "SELECT machine_id, acknowledged_at, result_json FROM collector_commands WHERE command_id = ?1",
+                params![command_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
-            .map_err(HubError::internal)?;
-        if changed == 0 {
+            .optional()
+            .map_err(HubError::internal)?
+            .ok_or_else(|| {
+                HubError::not_found(
+                    "collector-command-not-found",
+                    "collector command was not found or belongs to another Machine",
+                )
+            })?;
+        if existing.0 != auth.machine_id {
             return Err(HubError::not_found(
                 "collector-command-not-found",
-                "collector command was not found, belongs to another Machine, or was already acknowledged",
+                "collector command was not found or belongs to another Machine",
             ));
         }
+        if let Some(existing_result) = existing.2 {
+            let same_result = serde_json::from_str::<serde_json::Value>(&existing_result).ok()
+                == serde_json::from_str::<serde_json::Value>(&result_json).ok();
+            if !same_result {
+                return Err(HubError::conflict(
+                    "collector-command-ack-conflict",
+                    "command acknowledgement conflicts with the previously recorded result",
+                ));
+            }
+            // A byte-identical (or JSON-equivalent) acknowledgement is a
+            // successful replay, not a not-found error.
+            drop(conn);
+            drop(write_guard);
+            self.prove_collector_credential(auth)?;
+            return Ok(());
+        }
+        conn.execute(
+            r#"
+            UPDATE collector_commands
+            SET acknowledged_at = ?3, result_json = ?4
+            WHERE command_id = ?1 AND machine_id = ?2 AND acknowledged_at IS NULL
+            "#,
+            params![command_id, auth.machine_id, now_utc(), result_json],
+        )
+        .map_err(HubError::internal)?;
+        drop(conn);
+        drop(write_guard);
+        self.prove_collector_credential(auth)?;
         Ok(())
     }
 

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,6 +10,12 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::importers::{self, DetectedSource, SourceKind, UsageEvent, UsageNumbers};
 use crate::pricing::{self, PricingMode, PricingRecord};
+
+static MIGRATION_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn migration_mutex() -> &'static Mutex<()> {
+    MIGRATION_MUTEX.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -154,6 +161,11 @@ pub struct CollectorOutboxRecord {
     pub created_at: String,
     pub last_attempt_at: Option<String>,
     pub last_error: Option<String>,
+    /// `pending` rows are eligible for delivery; `dead-letter` rows require
+    /// explicit operator recovery and are never selected automatically.
+    pub status: String,
+    pub retry_class: Option<String>,
+    pub dead_lettered_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +174,9 @@ pub struct CollectorCommandResultRecord {
     pub status: String,
     pub result_json: String,
     pub handled_at: String,
+    pub owner_id: Option<String>,
+    pub lease_until: Option<String>,
+    pub attempts: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,9 +479,10 @@ impl Database {
         let mut stmt = conn.prepare(
             r#"
             SELECT batch_id, machine_id, payload_json, attempts, next_attempt_at,
-                created_at, last_attempt_at, last_error
+                created_at, last_attempt_at, last_error, status, retry_class,
+                dead_lettered_at
             FROM collector_outbox
-            WHERE next_attempt_at <= ?1
+            WHERE status = 'pending' AND next_attempt_at <= ?1
             ORDER BY created_at, batch_id
             LIMIT ?2
             "#,
@@ -479,7 +495,35 @@ impl Database {
 
     pub fn collector_outbox_count(&self) -> Result<u64> {
         let conn = self.connection()?;
-        count_row(&conn, "SELECT COUNT(*) FROM collector_outbox")
+        count_row(
+            &conn,
+            "SELECT COUNT(*) FROM collector_outbox WHERE status = 'pending'",
+        )
+    }
+
+    pub fn collector_outbox_dead_letter_count(&self) -> Result<u64> {
+        let conn = self.connection()?;
+        count_row(
+            &conn,
+            "SELECT COUNT(*) FROM collector_outbox WHERE status = 'dead-letter'",
+        )
+    }
+
+    pub fn collector_outbox_records(
+        &self,
+        include_terminal: bool,
+    ) -> Result<Vec<CollectorOutboxRecord>> {
+        let conn = self.connection()?;
+        let sql = if include_terminal {
+            "SELECT batch_id, machine_id, payload_json, attempts, next_attempt_at, created_at, last_attempt_at, last_error, status, retry_class, dead_lettered_at FROM collector_outbox ORDER BY created_at, batch_id"
+        } else {
+            "SELECT batch_id, machine_id, payload_json, attempts, next_attempt_at, created_at, last_attempt_at, last_error, status, retry_class, dead_lettered_at FROM collector_outbox WHERE status = 'pending' ORDER BY created_at, batch_id"
+        };
+        let mut statement = conn.prepare(sql)?;
+        let rows = statement
+            .query_map([], collector_outbox_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn acknowledge_collector_batch(&self, batch_id: &str) -> Result<bool> {
@@ -509,6 +553,28 @@ impl Database {
         attempted_at: &str,
         error: &str,
     ) -> Result<()> {
+        self.fail_collector_batch_with_class(
+            batch_id,
+            attempts,
+            next_attempt_at,
+            attempted_at,
+            error,
+            "offline",
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_collector_batch_with_class(
+        &self,
+        batch_id: &str,
+        attempts: u32,
+        next_attempt_at: &str,
+        attempted_at: &str,
+        error: &str,
+        retry_class: &str,
+        terminal: bool,
+    ) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
             r#"
@@ -516,12 +582,38 @@ impl Database {
             SET attempts = ?2,
                 next_attempt_at = ?3,
                 last_attempt_at = ?4,
-                last_error = ?5
+                last_error = ?5,
+                retry_class = ?6,
+                status = CASE WHEN ?7 = 1 THEN 'dead-letter' ELSE 'pending' END,
+                dead_lettered_at = CASE WHEN ?7 = 1 THEN ?4 ELSE NULL END
             WHERE batch_id = ?1
             "#,
-            params![batch_id, attempts, next_attempt_at, attempted_at, error],
+            params![
+                batch_id,
+                attempts,
+                next_attempt_at,
+                attempted_at,
+                error,
+                retry_class,
+                if terminal { 1 } else { 0 },
+            ],
         )?;
         Ok(())
+    }
+
+    pub fn recover_collector_batch(&self, batch_id: &str, now: &str) -> Result<bool> {
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            r#"
+            UPDATE collector_outbox
+            SET status = 'pending', retry_class = NULL, dead_lettered_at = NULL,
+                attempts = 0, next_attempt_at = ?2, last_attempt_at = NULL,
+                last_error = NULL
+            WHERE batch_id = ?1 AND status = 'dead-letter'
+            "#,
+            params![batch_id, now],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn collector_command_result(
@@ -530,7 +622,7 @@ impl Database {
     ) -> Result<Option<CollectorCommandResultRecord>> {
         let conn = self.connection()?;
         conn.query_row(
-            "SELECT command_id, status, result_json, handled_at FROM collector_command_results WHERE command_id = ?1",
+            "SELECT command_id, status, result_json, handled_at, owner_id, lease_until, attempts FROM collector_command_results WHERE command_id = ?1",
             params![command_id],
             |row| {
                 Ok(CollectorCommandResultRecord {
@@ -538,6 +630,9 @@ impl Database {
                     status: row.get(1)?,
                     result_json: row.get(2)?,
                     handled_at: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    lease_until: row.get(5)?,
+                    attempts: row.get::<_, i64>(6)? as u32,
                 })
             },
         )
@@ -545,17 +640,57 @@ impl Database {
         .map_err(Into::into)
     }
 
-    /// Record receipt before executing a command. INSERT OR IGNORE makes the
-    /// side effect owner idempotent across a process crash/restart window.
+    /// Record a started receipt before executing a command. The owner and
+    /// lease make a crash/restart reclaim explicit instead of turning a
+    /// resumable command into a permanent rejection.
     pub fn begin_collector_command(&self, command_id: &str, handled_at: &str) -> Result<bool> {
+        self.begin_collector_command_owned(command_id, handled_at, "legacy-collector")
+    }
+
+    pub fn begin_collector_command_owned(
+        &self,
+        command_id: &str,
+        handled_at: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
         let conn = self.connection()?;
+        let lease_until = chrono::DateTime::parse_from_rfc3339(handled_at)
+            .map(|value| value.with_timezone(&Utc) + chrono::Duration::seconds(60))
+            .unwrap_or_else(|_| Utc::now() + chrono::Duration::seconds(60))
+            .to_rfc3339();
         let changed = conn.execute(
             r#"
-            INSERT INTO collector_command_results(command_id, status, result_json, handled_at)
-            VALUES (?1, 'started', '{}', ?2)
+            INSERT INTO collector_command_results(
+                command_id, status, result_json, handled_at, owner_id, lease_until, attempts
+            ) VALUES (?1, 'started', '{}', ?2, ?3, ?4, 1)
             ON CONFLICT(command_id) DO NOTHING
             "#,
-            params![command_id, handled_at],
+            params![command_id, handled_at, owner_id, lease_until],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn reclaim_collector_command(
+        &self,
+        command_id: &str,
+        handled_at: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        let conn = self.connection()?;
+        let lease_until = chrono::DateTime::parse_from_rfc3339(handled_at)
+            .map(|value| value.with_timezone(&Utc) + chrono::Duration::seconds(60))
+            .unwrap_or_else(|_| Utc::now() + chrono::Duration::seconds(60))
+            .to_rfc3339();
+        let changed = conn.execute(
+            r#"
+            UPDATE collector_command_results
+            SET owner_id = ?3, lease_until = ?2, handled_at = ?4,
+                attempts = attempts + 1
+            WHERE command_id = ?1 AND status = 'started'
+                AND (owner_id IS NULL OR owner_id <> ?3)
+                AND (lease_until IS NULL OR julianday(lease_until) <= julianday(?4))
+            "#,
+            params![command_id, lease_until, owner_id, handled_at],
         )?;
         Ok(changed > 0)
     }
@@ -569,12 +704,14 @@ impl Database {
         let conn = self.connection()?;
         conn.execute(
             r#"
-            INSERT INTO collector_command_results(command_id, status, result_json, handled_at)
-            VALUES (?1, 'completed', ?2, ?3)
+            INSERT INTO collector_command_results(
+                command_id, status, result_json, handled_at, lease_until, attempts
+            ) VALUES (?1, 'completed', ?2, ?3, NULL, 1)
             ON CONFLICT(command_id) DO UPDATE SET
                 status = 'completed',
                 result_json = excluded.result_json,
-                handled_at = excluded.handled_at
+                handled_at = excluded.handled_at,
+                lease_until = NULL
             "#,
             params![command_id, result_json, handled_at],
         )?;
@@ -601,6 +738,19 @@ impl Database {
             params![owner_id, now, lease_until],
         )?;
         Ok(changed > 0)
+    }
+
+    pub fn renew_collector_instance_lock(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> Result<bool> {
+        let conn = self.connection()?;
+        Ok(conn.execute(
+            "UPDATE collector_instance_lock SET lease_until = ?3 WHERE lock_id = 1 AND owner_id = ?1 AND lease_until > ?2",
+            params![owner_id, now, lease_until],
+        )? > 0)
     }
 
     pub fn release_collector_instance_lock(&self, owner_id: &str) -> Result<bool> {
@@ -640,7 +790,7 @@ impl Database {
     pub fn connection(&self) -> Result<Connection> {
         let conn = Connection::open(&self.path)
             .with_context(|| format!("opening SQLite database {}", self.path.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
@@ -649,6 +799,9 @@ impl Database {
     /// Migrate only the local Collector state database. This keeps the
     /// outbound manifest/outbox file separate from dashboard usage history.
     pub fn migrate_collector(&self) -> Result<()> {
+        let _migration_guard = migration_mutex()
+            .lock()
+            .expect("database migration mutex poisoned");
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
@@ -665,6 +818,9 @@ impl Database {
     }
 
     pub fn migrate(&self) -> Result<()> {
+        let _migration_guard = migration_mutex()
+            .lock()
+            .expect("database migration mutex poisoned");
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(
@@ -855,16 +1011,22 @@ impl Database {
                 next_attempt_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_attempt_at TEXT,
-                last_error TEXT
+                last_error TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_class TEXT,
+                dead_lettered_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_collector_outbox_ready
-                ON collector_outbox(next_attempt_at, created_at);
+                ON collector_outbox(status, next_attempt_at, created_at);
 
             CREATE TABLE IF NOT EXISTS collector_command_results (
                 command_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL DEFAULT 'completed',
+                status TEXT NOT NULL DEFAULT 'started',
                 result_json TEXT NOT NULL,
-                handled_at TEXT NOT NULL
+                handled_at TEXT NOT NULL,
+                owner_id TEXT,
+                lease_until TEXT,
+                attempts INTEGER NOT NULL DEFAULT 1
             );
 
             CREATE TABLE IF NOT EXISTS collector_state (
@@ -904,10 +1066,50 @@ impl Database {
                 [],
             )?;
         }
+        let outbox_columns = table_columns(conn, "collector_outbox")?;
+        if !outbox_columns.iter().any(|column| column == "status") {
+            conn.execute(
+                "ALTER TABLE collector_outbox ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'",
+                [],
+            )?;
+        }
+        if !outbox_columns.iter().any(|column| column == "retry_class") {
+            conn.execute(
+                "ALTER TABLE collector_outbox ADD COLUMN retry_class TEXT",
+                [],
+            )?;
+        }
+        if !outbox_columns
+            .iter()
+            .any(|column| column == "dead_lettered_at")
+        {
+            conn.execute(
+                "ALTER TABLE collector_outbox ADD COLUMN dead_lettered_at TEXT",
+                [],
+            )?;
+        }
         let command_columns = table_columns(conn, "collector_command_results")?;
         if !command_columns.iter().any(|column| column == "status") {
             conn.execute(
                 "ALTER TABLE collector_command_results ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+                [],
+            )?;
+        }
+        if !command_columns.iter().any(|column| column == "owner_id") {
+            conn.execute(
+                "ALTER TABLE collector_command_results ADD COLUMN owner_id TEXT",
+                [],
+            )?;
+        }
+        if !command_columns.iter().any(|column| column == "lease_until") {
+            conn.execute(
+                "ALTER TABLE collector_command_results ADD COLUMN lease_until TEXT",
+                [],
+            )?;
+        }
+        if !command_columns.iter().any(|column| column == "attempts") {
+            conn.execute(
+                "ALTER TABLE collector_command_results ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1",
                 [],
             )?;
         }
@@ -1934,6 +2136,9 @@ fn collector_outbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Collec
         created_at: row.get(5)?,
         last_attempt_at: row.get(6)?,
         last_error: row.get(7)?,
+        status: row.get(8)?,
+        retry_class: row.get(9)?,
+        dead_lettered_at: row.get(10)?,
     })
 }
 

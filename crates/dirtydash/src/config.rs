@@ -62,6 +62,12 @@ pub enum CookieTransportConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovedUpdateConfig {
+    pub version: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectorConfig {
     #[serde(default)]
     pub hub_url: Option<String>,
@@ -73,6 +79,14 @@ pub struct CollectorConfig {
     pub reconcile_seconds: u64,
     #[serde(default = "default_collector_watcher_debounce_millis")]
     pub watcher_debounce_millis: u64,
+    /// Only local, preconfigured artifact bytes may be considered by the
+    /// restricted updater; there is intentionally no URL or command field.
+    #[serde(default)]
+    pub update_artifact_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub update_target: Option<PathBuf>,
+    #[serde(default)]
+    pub approved_updates: Vec<ApprovedUpdateConfig>,
 }
 
 fn default_collector_reconcile_seconds() -> u64 {
@@ -91,6 +105,9 @@ impl Default for CollectorConfig {
             credential_token: None,
             reconcile_seconds: default_collector_reconcile_seconds(),
             watcher_debounce_millis: default_collector_watcher_debounce_millis(),
+            update_artifact_dir: None,
+            update_target: None,
+            approved_updates: Vec::new(),
         }
     }
 }

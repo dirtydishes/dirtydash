@@ -850,7 +850,17 @@ fn format_evidence(kind: SourceKind, file: &Path) -> Result<bool> {
         let mut handle = fs::File::open(file)?;
         use std::io::Read;
         let read = handle.read(&mut header)?;
-        return Ok(read >= 15 && &header[..15] == b"SQLite format 3");
+        if read < 15 || &header[..15] != b"SQLite format 3" {
+            return Ok(false);
+        }
+        let connection =
+            Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_sessions = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        return Ok(has_sessions);
     }
 
     let extension = file.extension().and_then(|extension| extension.to_str());
@@ -879,26 +889,145 @@ fn format_evidence(kind: SourceKind, file: &Path) -> Result<bool> {
 }
 
 fn value_is_source_evidence(kind: SourceKind, value: &Value) -> bool {
-    if !extract_usage_numbers(value).has_usage() {
-        let payload_type = value
-            .pointer("/payload/type")
-            .and_then(Value::as_str)
-            .or_else(|| value.get("type").and_then(Value::as_str));
-        if kind == SourceKind::Codex
-            && !matches!(payload_type, Some("token_count" | "turn_context"))
-        {
-            return false;
-        }
-        if kind == SourceKind::HermesAgent
-            && !matches!(
-                payload_type,
-                Some("metering" | "usage" | "session" | "turn")
-            )
-        {
-            return false;
-        }
+    // A usage-shaped object is not an agent signature. Keep these checks
+    // deliberately parser-specific: source roots are user-configurable and a
+    // generic JSONL file under one root must not be claimed by every parser.
+    match kind {
+        SourceKind::ClaudeCode => claude_record_signature(value),
+        SourceKind::Codex => codex_record_signature(value),
+        SourceKind::OpenCode => opencode_record_signature(value),
+        SourceKind::PiAgent => pi_record_signature(value),
+        SourceKind::HermesAgent => hermes_record_signature(value),
     }
-    true
+}
+
+fn claude_record_signature(value: &Value) -> bool {
+    let object = value.as_object();
+    let Some(object) = object else { return false };
+    let has_session = [
+        "sessionId",
+        "session_id",
+        "conversationId",
+        "conversation_id",
+    ]
+    .iter()
+    .any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    });
+    let record_type = object.get("type").and_then(Value::as_str);
+    let message = object.get("message");
+    let has_message_shape = message.is_some_and(|message| {
+        message.is_object()
+            && (message.get("usage").is_some()
+                || message.get("model").and_then(Value::as_str).is_some())
+    });
+    let has_root_usage = object.get("usage").is_some_and(Value::is_object);
+    has_session
+        && (has_message_shape
+            || has_root_usage
+            || matches!(
+                record_type,
+                Some("user" | "assistant" | "system" | "session")
+            ))
+}
+
+fn codex_record_signature(value: &Value) -> bool {
+    let payload_type = value
+        .pointer("/payload/type")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("type").and_then(Value::as_str));
+    matches!(payload_type, Some("token_count" | "turn_context"))
+        && value.get("payload").is_some_and(Value::is_object)
+}
+
+fn opencode_record_signature(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let session = object
+        .get("sessionID")
+        .or_else(|| object.get("session_id"))
+        .and_then(Value::as_str);
+    let provider = object
+        .get("providerID")
+        .or_else(|| object.get("provider_id"))
+        .or_else(|| object.get("provider"))
+        .and_then(Value::as_str);
+    let model = object
+        .get("modelID")
+        .or_else(|| object.get("model_id"))
+        .or_else(|| object.get("model"))
+        .and_then(Value::as_str);
+    session.is_some_and(|v| !v.is_empty())
+        && provider.is_some_and(|v| !v.is_empty())
+        && model.is_some_and(|v| !v.is_empty())
+        && object.get("usage").is_some_and(Value::is_object)
+}
+
+fn pi_record_signature(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("session") => object
+            .get("id")
+            .or_else(|| object.get("session_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty()),
+        Some("message") => {
+            let id = object.get("id").and_then(Value::as_str);
+            let provider = object
+                .get("provider")
+                .or_else(|| object.get("providerID"))
+                .and_then(Value::as_str);
+            let model = object
+                .get("model")
+                .or_else(|| object.get("modelID"))
+                .and_then(Value::as_str);
+            id.is_some_and(|v| !v.is_empty())
+                && provider.is_some_and(|v| !v.is_empty())
+                && model.is_some_and(|v| !v.is_empty())
+                && (object.get("usage").is_some_and(Value::is_object)
+                    || object
+                        .get("message")
+                        .and_then(|message| message.get("usage"))
+                        .is_some_and(Value::is_object))
+        }
+        None => {
+            // Older Pi exports omitted the record type but retained this
+            // stable session/model/project/usage shape.
+            object
+                .get("session_id")
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.is_empty())
+                && object
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+                && object
+                    .get("projectPath")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+                && object.get("usage").is_some_and(Value::is_object)
+        }
+        _ => false,
+    }
+}
+
+fn hermes_record_signature(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let record_type = object.get("type").and_then(Value::as_str);
+    matches!(record_type, Some("session" | "metering" | "usage" | "turn"))
+        && object
+            .get("session_id")
+            .or_else(|| object.get("sessionId"))
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
 }
 
 pub fn parse_source_file_for_collector(
@@ -1181,16 +1310,24 @@ fn parse_codex_jsonl(
             }
         };
 
-        if let Some(model) = extract_string(&value, MODEL_KEYS) {
+        if let Some(model) =
+            extract_string_for_source(SourceKind::Codex, &value, MetadataField::Model)
+        {
             current_model = Some(model);
         }
-        if let Some(provider) = extract_string(&value, PROVIDER_KEYS) {
+        if let Some(provider) =
+            extract_string_for_source(SourceKind::Codex, &value, MetadataField::Provider)
+        {
             current_provider = Some(provider);
         }
-        if let Some(turn_id) = extract_string(&value, TURN_ID_KEYS) {
+        if let Some(turn_id) =
+            extract_string_for_source(SourceKind::Codex, &value, MetadataField::Turn)
+        {
             current_turn_id = Some(turn_id);
         }
-        if let Some(reasoning_effort) = extract_reasoning_effort(&value) {
+        if let Some(reasoning_effort) =
+            extract_reasoning_effort_for_source(SourceKind::Codex, &value)
+        {
             current_reasoning_effort = Some(reasoning_effort);
         }
 
@@ -1275,7 +1412,7 @@ fn event_from_value(
     fallback_reasoning_effort: Option<&str>,
     priority_evidence: Option<&CodexPriorityEvidence>,
 ) -> Result<Option<UsageEvent>> {
-    let usage = extract_usage_numbers(value);
+    let usage = extract_usage_numbers_for_source(source.kind, value);
     if !usage.has_usage() {
         return Ok(None);
     }
@@ -1316,24 +1453,27 @@ fn event_from_usage(
         return Ok(None);
     }
 
-    let provider = extract_string(value, PROVIDER_KEYS)
+    let provider = extract_string_for_source(source.kind, value, MetadataField::Provider)
         .unwrap_or_else(|| source.kind.default_provider().to_string());
-    let model = extract_string(value, MODEL_KEYS)
+    let model = extract_string_for_source(source.kind, value, MetadataField::Model)
         .map(|model| model.trim().to_string())
         .or_else(|| fallback_model.map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".to_string());
-    let session_id = extract_string(value, SESSION_KEYS).unwrap_or_else(|| {
-        file.file_stem_string()
-            .unwrap_or_else(|| "unknown-session".to_string())
-    });
-    let project_path =
-        extract_string(value, PROJECT_KEYS).unwrap_or_else(|| infer_project_path(source, file));
-    let turn_id =
-        extract_string(value, TURN_ID_KEYS).or_else(|| fallback_turn_id.map(ToOwned::to_owned));
-    let reasoning_effort = extract_reasoning_effort(value)
+    let session_id = extract_string_for_source(source.kind, value, MetadataField::Session)
+        .unwrap_or_else(|| {
+            file.file_stem_string()
+                .unwrap_or_else(|| "unknown-session".to_string())
+        });
+    let project_path = extract_string_for_source(source.kind, value, MetadataField::Project)
+        .unwrap_or_else(|| infer_project_path(source, file));
+    let turn_id = extract_string_for_source(source.kind, value, MetadataField::Turn)
+        .or_else(|| fallback_turn_id.map(ToOwned::to_owned));
+    let reasoning_effort = extract_reasoning_effort_for_source(source.kind, value)
         .or_else(|| fallback_reasoning_effort.map(ToOwned::to_owned));
-    let event_timestamp = extract_timestamp(value).or_else(|| file_modified_at(file));
-    let reported_cost = extract_reported_cost(value);
+    let event_timestamp = extract_string_for_source(source.kind, value, MetadataField::Timestamp)
+        .and_then(|raw| normalize_timestamp(&raw))
+        .or_else(|| file_modified_at(file));
+    let reported_cost = extract_reported_cost_for_source(source.kind, value);
     let requested_pricing_mode = if source.kind == SourceKind::Codex
         && turn_id.as_deref().is_some_and(|turn_id| {
             priority_evidence.is_some_and(|evidence| evidence.is_priority(turn_id))
@@ -1416,17 +1556,48 @@ fn event_from_usage(
     }))
 }
 
-fn extract_usage_numbers(value: &Value) -> UsageNumbers {
-    if let Some(usage) = extract_direct_usage_numbers(value) {
-        return usage;
+fn extract_usage_numbers_for_source(kind: SourceKind, value: &Value) -> UsageNumbers {
+    // Each parser owns the locations it is allowed to read. In particular,
+    // never walk conversation content looking for a nested `usage` object.
+    let candidates: &[&str] = match kind {
+        SourceKind::ClaudeCode => &["/message/usage", "/usage"],
+        SourceKind::OpenCode => &["/usage"],
+        SourceKind::PiAgent => &["/message/usage", "/usage"],
+        SourceKind::HermesAgent => &["/usage"],
+        SourceKind::Codex => &[],
+    };
+    for pointer in candidates {
+        if let Some(usage) = value.pointer(pointer) {
+            let parsed = extract_direct_usage_object(usage);
+            if parsed.has_usage() {
+                return parsed;
+            }
+        }
     }
 
+    // Hermes state.db rows are flattened columns, and Codex's token-count
+    // payloads are passed through this helper by the Codex-specific parser.
+    if matches!(kind, SourceKind::HermesAgent | SourceKind::Codex) {
+        return extract_usage_numbers_direct(value);
+    }
+    UsageNumbers::default()
+}
+
+fn extract_usage_numbers(value: &Value) -> UsageNumbers {
+    extract_usage_numbers_direct(value)
+}
+
+fn extract_usage_numbers_direct(value: &Value) -> UsageNumbers {
+    let usage = extract_direct_usage_object(value.get("usage").unwrap_or(value));
+    if usage.has_usage() {
+        return usage;
+    }
     UsageNumbers {
-        prompt_tokens: extract_u64(value, PROMPT_KEYS).unwrap_or(0),
-        completion_tokens: extract_u64(value, COMPLETION_KEYS).unwrap_or(0),
-        cache_read_tokens: extract_u64(value, CACHE_READ_KEYS).unwrap_or(0),
-        cache_write_tokens: extract_u64(value, CACHE_WRITE_KEYS).unwrap_or(0),
-        reasoning_tokens: extract_u64(value, REASONING_KEYS).unwrap_or(0),
+        prompt_tokens: extract_direct_u64(value, PROMPT_KEYS).unwrap_or(0),
+        completion_tokens: extract_direct_u64(value, COMPLETION_KEYS).unwrap_or(0),
+        cache_read_tokens: extract_direct_u64(value, CACHE_READ_KEYS).unwrap_or(0),
+        cache_write_tokens: extract_direct_u64(value, CACHE_WRITE_KEYS).unwrap_or(0),
+        reasoning_tokens: extract_direct_u64(value, REASONING_KEYS).unwrap_or(0),
     }
 }
 
@@ -1466,28 +1637,13 @@ fn split_codex_cached_input(mut usage: UsageNumbers) -> UsageNumbers {
     usage
 }
 
-fn extract_direct_usage_numbers(value: &Value) -> Option<UsageNumbers> {
-    match value {
-        Value::Object(map) => {
-            if let Some(usage) = map.get("usage") {
-                let usage = UsageNumbers {
-                    prompt_tokens: extract_direct_u64(usage, DIRECT_PROMPT_KEYS).unwrap_or(0),
-                    completion_tokens: extract_direct_u64(usage, DIRECT_COMPLETION_KEYS)
-                        .unwrap_or(0),
-                    cache_read_tokens: extract_direct_u64(usage, DIRECT_CACHE_READ_KEYS)
-                        .unwrap_or(0),
-                    cache_write_tokens: extract_direct_u64(usage, DIRECT_CACHE_WRITE_KEYS)
-                        .unwrap_or(0),
-                    reasoning_tokens: extract_direct_u64(usage, DIRECT_REASONING_KEYS).unwrap_or(0),
-                };
-                if usage.has_usage() {
-                    return Some(usage);
-                }
-            }
-            map.values().find_map(extract_direct_usage_numbers)
-        }
-        Value::Array(items) => items.iter().find_map(extract_direct_usage_numbers),
-        _ => None,
+fn extract_direct_usage_object(value: &Value) -> UsageNumbers {
+    UsageNumbers {
+        prompt_tokens: extract_direct_u64(value, DIRECT_PROMPT_KEYS).unwrap_or(0),
+        completion_tokens: extract_direct_u64(value, DIRECT_COMPLETION_KEYS).unwrap_or(0),
+        cache_read_tokens: extract_direct_u64(value, DIRECT_CACHE_READ_KEYS).unwrap_or(0),
+        cache_write_tokens: extract_direct_u64(value, DIRECT_CACHE_WRITE_KEYS).unwrap_or(0),
+        reasoning_tokens: extract_direct_u64(value, DIRECT_REASONING_KEYS).unwrap_or(0),
     }
 }
 
@@ -1572,56 +1728,7 @@ const REASONING_KEYS: &[&str] = &[
     "reasoning_output_tokens",
     "reasoningOutputTokens",
 ];
-const MODEL_KEYS: &[&str] = &["model", "model_id", "modelID", "modelId", "active_model"];
-const PROVIDER_KEYS: &[&str] = &["provider", "provider_id", "providerID", "providerId"];
-const REASONING_EFFORT_KEYS: &[&str] =
-    &["reasoning_effort", "reasoningEffort", "reasoning", "effort"];
-const SESSION_KEYS: &[&str] = &[
-    "session_id",
-    "sessionId",
-    "conversation_id",
-    "conversationId",
-    "id",
-    "thread_id",
-    "threadId",
-];
 const TURN_ID_KEYS: &[&str] = &["turn_id", "turnId"];
-const PROJECT_KEYS: &[&str] = &[
-    "project_path",
-    "projectPath",
-    "cwd",
-    "working_dir",
-    "workingDirectory",
-];
-const TIMESTAMP_KEYS: &[&str] = &[
-    "timestamp",
-    "created_at",
-    "createdAt",
-    "time",
-    "lastActivity",
-    "updated_at",
-    "updatedAt",
-];
-
-fn extract_u64(value: &Value, keys: &[&str]) -> Option<u64> {
-    match value {
-        Value::Object(map) => {
-            for key in keys {
-                if let Some(found) = map.get(*key).and_then(value_to_u64) {
-                    return Some(found);
-                }
-            }
-            for child in map.values() {
-                if let Some(found) = extract_u64(child, keys) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(|item| extract_u64(item, keys)),
-        _ => None,
-    }
-}
 
 fn extract_direct_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     let Value::Object(map) = value else {
@@ -1649,72 +1756,163 @@ fn value_to_f64(value: &Value) -> Option<f64> {
     }
 }
 
-fn extract_reported_cost(value: &Value) -> Option<f64> {
-    match value {
-        Value::Object(map) => {
-            if let Some(cost) = map
-                .get("usage")
-                .and_then(|usage| usage.pointer("/cost/total"))
-                .and_then(value_to_f64)
-                .filter(|cost| cost.is_finite() && *cost >= 0.0)
-            {
-                return Some(cost);
-            }
-            for key in ["total_cost", "totalCost", "cost_usd", "costUsd", "cost"] {
-                if let Some(cost) = map
-                    .get(key)
-                    .and_then(|value| match value {
-                        Value::Object(object) => object
-                            .get("total")
-                            .or_else(|| object.get("value"))
-                            .and_then(value_to_f64),
-                        scalar => value_to_f64(scalar),
-                    })
-                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
-                {
-                    return Some(cost);
-                }
-            }
-            map.values().find_map(extract_reported_cost)
-        }
-        Value::Array(items) => items.iter().find_map(extract_reported_cost),
-        _ => None,
-    }
+#[derive(Debug, Clone, Copy)]
+enum MetadataField {
+    Provider,
+    Model,
+    Session,
+    Project,
+    Turn,
+    Timestamp,
 }
 
+fn extract_string_for_source(
+    kind: SourceKind,
+    value: &Value,
+    field: MetadataField,
+) -> Option<String> {
+    let paths: &[&str] = match (kind, field) {
+        (SourceKind::ClaudeCode, MetadataField::Provider) => &["/message/provider", "/provider"],
+        (SourceKind::ClaudeCode, MetadataField::Model) => &["/message/model", "/model"],
+        (SourceKind::ClaudeCode, MetadataField::Session) => &[
+            "/sessionId",
+            "/session_id",
+            "/conversationId",
+            "/conversation_id",
+        ],
+        (SourceKind::ClaudeCode, MetadataField::Project) => {
+            &["/cwd", "/projectPath", "/project_path"]
+        }
+        (SourceKind::ClaudeCode, MetadataField::Turn) => &["/turnId", "/turn_id", "/message/id"],
+        (SourceKind::ClaudeCode, MetadataField::Timestamp) => &[
+            "/timestamp",
+            "/created_at",
+            "/createdAt",
+            "/message/timestamp",
+        ],
+        (SourceKind::Codex, MetadataField::Provider) => &["/payload/provider", "/provider"],
+        (SourceKind::Codex, MetadataField::Model) => &["/payload/model", "/model"],
+        (SourceKind::Codex, MetadataField::Session) => {
+            &["/payload/session_id", "/session_id", "/sessionId"]
+        }
+        (SourceKind::Codex, MetadataField::Project) => &["/payload/cwd", "/cwd"],
+        (SourceKind::Codex, MetadataField::Turn) => {
+            &["/payload/turn_id", "/payload/turnId", "/turn_id", "/turnId"]
+        }
+        (SourceKind::Codex, MetadataField::Timestamp) => &[
+            "/timestamp",
+            "/created_at",
+            "/createdAt",
+            "/payload/timestamp",
+        ],
+        (SourceKind::OpenCode, MetadataField::Provider) => {
+            &["/providerID", "/provider_id", "/provider"]
+        }
+        (SourceKind::OpenCode, MetadataField::Model) => &["/modelID", "/model_id", "/model"],
+        (SourceKind::OpenCode, MetadataField::Session) => &["/sessionID", "/session_id"],
+        (SourceKind::OpenCode, MetadataField::Project) => {
+            &["/projectPath", "/project_path", "/cwd"]
+        }
+        (SourceKind::OpenCode, MetadataField::Turn) => &["/turnID", "/turn_id", "/id"],
+        (SourceKind::OpenCode, MetadataField::Timestamp) => {
+            &["/time", "/timestamp", "/createdAt", "/created_at"]
+        }
+        (SourceKind::PiAgent, MetadataField::Provider) => {
+            &["/provider", "/providerID", "/message/provider"]
+        }
+        (SourceKind::PiAgent, MetadataField::Model) => &["/model", "/modelID", "/message/model"],
+        (SourceKind::PiAgent, MetadataField::Session) => {
+            &["/session_id", "/sessionId", "/sessionID"]
+        }
+        (SourceKind::PiAgent, MetadataField::Project) => &["/cwd", "/projectPath", "/project_path"],
+        (SourceKind::PiAgent, MetadataField::Turn) => &["/turn_id", "/turnId", "/id"],
+        (SourceKind::PiAgent, MetadataField::Timestamp) => &[
+            "/timestamp",
+            "/created_at",
+            "/createdAt",
+            "/message/timestamp",
+        ],
+        (SourceKind::HermesAgent, MetadataField::Provider) => &["/provider", "/provider_id"],
+        (SourceKind::HermesAgent, MetadataField::Model) => &["/model", "/model_id"],
+        (SourceKind::HermesAgent, MetadataField::Session) => &["/session_id", "/sessionId", "/id"],
+        (SourceKind::HermesAgent, MetadataField::Project) => {
+            &["/project_path", "/projectPath", "/cwd"]
+        }
+        (SourceKind::HermesAgent, MetadataField::Turn) => &["/turn_id", "/turnId"],
+        (SourceKind::HermesAgent, MetadataField::Timestamp) => {
+            &["/timestamp", "/created_at", "/createdAt", "/time"]
+        }
+    };
+    for path in paths {
+        if let Some(found) = value.pointer(path).and_then(Value::as_str) {
+            if !found.trim().is_empty() {
+                return Some(found.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_reasoning_effort_for_source(kind: SourceKind, value: &Value) -> Option<String> {
+    let paths: &[&str] = match kind {
+        SourceKind::ClaudeCode => &["/message/reasoning_effort", "/reasoning_effort"],
+        SourceKind::Codex => &[
+            "/payload/reasoning_effort",
+            "/payload/effort",
+            "/payload/collaboration_mode/settings/reasoning_effort",
+            "/reasoning_effort",
+        ],
+        SourceKind::OpenCode => &["/reasoning_effort", "/reasoningEffort"],
+        SourceKind::PiAgent => &[
+            "/reasoning_effort",
+            "/reasoningEffort",
+            "/message/reasoning_effort",
+        ],
+        SourceKind::HermesAgent => &["/reasoning_tokens", "/reasoning_effort"],
+    };
+    paths.iter().find_map(|path| {
+        value.pointer(path).and_then(Value::as_str).and_then(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "minimal" | "low" | "medium" | "high" => Some(normalized),
+                _ => None,
+            }
+        })
+    })
+}
+
+fn extract_reported_cost_for_source(kind: SourceKind, value: &Value) -> Option<f64> {
+    let paths: &[&str] = match kind {
+        SourceKind::ClaudeCode => &["/message/usage/cost/total", "/usage/cost/total"],
+        SourceKind::Codex => &["/payload/cost", "/cost"],
+        SourceKind::OpenCode => &["/usage/cost/total", "/cost"],
+        SourceKind::PiAgent => &["/message/usage/cost/total", "/usage/cost/total"],
+        SourceKind::HermesAgent => &["/cost", "/usage/cost/total"],
+    };
+    paths
+        .iter()
+        .find_map(|path| {
+            value.pointer(path).and_then(|found| match found {
+                Value::Object(object) => object
+                    .get("total")
+                    .or_else(|| object.get("value"))
+                    .and_then(value_to_f64),
+                scalar => value_to_f64(scalar),
+            })
+        })
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
+// Kept as a private direct-only helper for Codex trace metadata. It never
+// traverses arbitrary nested prompt/tool content.
 fn extract_string(value: &Value, keys: &[&str]) -> Option<String> {
-    match value {
-        Value::Object(map) => {
-            for key in keys {
-                if let Some(found) = map.get(*key).and_then(Value::as_str) {
-                    if !found.trim().is_empty() {
-                        return Some(found.to_string());
-                    }
-                }
-            }
-            for child in map.values() {
-                if let Some(found) = extract_string(child, keys) {
-                    return Some(found);
-                }
-            }
-            None
-        }
-        Value::Array(items) => items.iter().find_map(|item| extract_string(item, keys)),
-        _ => None,
-    }
-}
-
-fn extract_timestamp(value: &Value) -> Option<String> {
-    extract_string(value, TIMESTAMP_KEYS).and_then(|raw| normalize_timestamp(&raw))
-}
-
-fn extract_reasoning_effort(value: &Value) -> Option<String> {
-    extract_string(value, REASONING_EFFORT_KEYS).and_then(|raw| {
-        let normalized = raw.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "minimal" | "low" | "medium" | "high" => Some(normalized),
-            _ => None,
-        }
+    let Value::Object(map) = value else {
+        return None;
+    };
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(Value::as_str)
+            .and_then(|found| (!found.trim().is_empty()).then(|| found.to_string()))
     })
 }
 
@@ -1759,18 +1957,15 @@ fn infer_project_path(source: &DetectedSource, file: &Path) -> String {
 fn raw_hash(
     source: SourceKind,
     _file: &Path,
-    raw_span: Option<&str>,
+    _raw_span: Option<&str>,
     value: &Value,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(source.as_str().as_bytes());
     hasher.update(b"\n");
-    // Exclude the local absolute path: this hash seeds the Collector
-    // fingerprint and must survive source relocation.
-    if let Some(raw_span) = raw_span {
-        hasher.update(raw_span.as_bytes());
-    }
-    hasher.update(b"\n");
+    // Positional line/row spans are parser observations, not record identity.
+    // Hash only the canonical source record so inserting an unrelated line or
+    // moving a row cannot create a duplicate Collector event.
     hasher.update(serde_json::to_vec(value)?);
     Ok(hex::encode(hasher.finalize()))
 }
@@ -1782,11 +1977,9 @@ pub fn stable_event_fingerprint(event: &UsageEvent) -> String {
     let mut hasher = Sha256::new();
     hasher.update(event.source.as_str().as_bytes());
     hasher.update(b"\n");
-    // raw_event_hash is canonical source-record content plus parser span; it
-    // deliberately contains no local path. Do not include fallback session
-    // names, model/pricing fields, or parser-version labels here.
-    hasher.update(event.raw_span.as_deref().unwrap_or("").as_bytes());
-    hasher.update(b"\n");
+    // raw_event_hash is canonical source-record content. It deliberately
+    // contains no local path or positional line/row span. Do not include
+    // fallback session names, model/pricing fields, or parser-version labels.
     hasher.update(event.raw_event_hash.as_bytes());
     hex::encode(hasher.finalize())
 }
@@ -1916,6 +2109,56 @@ mod tests {
         .unwrap();
         assert_eq!(report.inserted_events, 1);
         assert_eq!(report.parse_errors, 1);
+    }
+
+    #[test]
+    fn parser_signatures_reject_cross_format_usage_records() {
+        let generic = serde_json::json!({
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "model": "not-an-agent-record"
+        });
+        for kind in SourceKind::all() {
+            assert!(!value_is_source_evidence(kind, &generic));
+        }
+
+        let claude = serde_json::json!({
+            "sessionId": "claude-signature",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        });
+        assert!(value_is_source_evidence(SourceKind::ClaudeCode, &claude));
+        assert!(!value_is_source_evidence(SourceKind::Codex, &claude));
+        assert!(!value_is_source_evidence(SourceKind::OpenCode, &claude));
+        assert!(!value_is_source_evidence(SourceKind::PiAgent, &claude));
+        assert!(!value_is_source_evidence(SourceKind::HermesAgent, &claude));
+    }
+
+    #[test]
+    fn nested_metadata_is_not_a_parser_metadata_location() {
+        let value = serde_json::json!({
+            "sessionId": "claude-nested",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+                "content": {
+                    "model": "sk-nested-secret",
+                    "provider": "ssh-rsa nested-secret",
+                    "authorization": "Bearer nested-secret",
+                    "sudo": "sudo nested-secret"
+                }
+            }
+        });
+        assert_eq!(
+            extract_string_for_source(SourceKind::ClaudeCode, &value, MetadataField::Model)
+                .as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            extract_string_for_source(SourceKind::ClaudeCode, &value, MetadataField::Provider),
+            None
+        );
     }
 
     #[test]

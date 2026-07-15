@@ -131,6 +131,7 @@ pub(crate) fn validate_ingest_batch(
             parser_name: validate_identifier(&event.parser_name, "parser_name")?,
             parser_version: validate_identifier(&event.parser_version, "parser_version")?,
             pricing_version: validate_identifier(&event.pricing_version, "pricing_version")?,
+            pricing_mode: event.pricing_mode,
         });
     }
 

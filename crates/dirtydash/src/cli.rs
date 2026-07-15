@@ -92,10 +92,21 @@ pub struct CollectorCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum CollectorSubcommand {
+    /// Run the outbound-only Collector daemon (startup, watcher, delivery, and command poller).
+    Run(CollectorRunArgs),
     /// Reconcile local harness sources and queue one durable outbound batch.
     Reconcile(CollectorReconcileArgs),
     /// Print metadata-only Collector diagnostics.
     Diagnostics(CollectorDiagnosticsArgs),
+    /// Explicitly recover one terminal/dead-lettered outbox batch.
+    Recover(CollectorRecoverArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorRunArgs {
+    /// Perform startup reconciliation and one delivery pass, then exit.
+    #[arg(long)]
+    pub once: bool,
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +117,14 @@ pub struct CollectorReconcileArgs {
 
 #[derive(Debug, Args)]
 pub struct CollectorDiagnosticsArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorRecoverArgs {
+    #[arg(long)]
+    pub batch_id: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -341,6 +360,27 @@ fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) 
     let collector_db = Database::open(&paths.collector_db_path)?;
     let mut runtime = collector::Collector::from_config(usage_db, collector_db, config)?;
     match args.command {
+        CollectorSubcommand::Run(run_args) => {
+            if run_args.once {
+                let report = runtime.reconcile_startup(chrono::Utc::now())?;
+                let hub_url = config
+                    .collector
+                    .hub_url
+                    .as_deref()
+                    .context("collector.hub_url is required for `collector run --once`")?;
+                let mut transport = collector::CollectorHttpTransport::new(hub_url)?;
+                let delivery = runtime.deliver_pending(&mut transport, chrono::Utc::now())?;
+                println!(
+                    "collector run once: batch={} acknowledged={} pending={} terminal={}",
+                    report.batch_id.as_deref().unwrap_or("none"),
+                    delivery.acknowledged,
+                    delivery.pending,
+                    delivery.terminal
+                );
+            } else {
+                collector::run_daemon(paths, config)?;
+            }
+        }
         CollectorSubcommand::Reconcile(reconcile_args) => {
             let report = runtime.reconcile_manual(chrono::Utc::now())?;
             if reconcile_args.json {
@@ -362,6 +402,29 @@ fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) 
                 println!(
                     "collector machine={} pending={} watcher_degraded={}",
                     report.machine_id, report.pending_outbox, report.watcher.degraded
+                );
+                if report.terminal_outbox > 0 {
+                    println!(
+                        "collector terminal outbox batches={}",
+                        report.terminal_outbox
+                    );
+                }
+            }
+        }
+        CollectorSubcommand::Recover(recover_args) => {
+            let recovered =
+                runtime.recover_outbox_batch(&recover_args.batch_id, chrono::Utc::now())?;
+            if recover_args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"batch_id": recover_args.batch_id, "recovered": recovered})
+                );
+            } else if recovered {
+                println!("collector recovered outbox batch {}", recover_args.batch_id);
+            } else {
+                println!(
+                    "collector outbox batch {} was not terminal",
+                    recover_args.batch_id
                 );
             }
         }

@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::db::Database;
+pub use crate::pricing::PricingMode;
 
 mod auth;
 mod errors;
@@ -283,6 +285,7 @@ struct HubState {
 pub struct HubRepository {
     db: Database,
     write_guard: Arc<Mutex<()>>,
+    command_notify: Arc<Notify>,
     #[cfg(test)]
     final_insert_failure: Arc<Mutex<bool>>,
 }
@@ -394,6 +397,11 @@ pub struct CollectorUsageEvent {
     pub parser_name: String,
     pub parser_version: String,
     pub pricing_version: String,
+    /// Provenance of the cost value. This is part of the wire contract so a
+    /// reported provider cost and a locally computed Codex priority estimate
+    /// survive Collector -> Hub round trips.
+    #[serde(default)]
+    pub pricing_mode: PricingMode,
     #[serde(default = "default_metadata_only_true")]
     pub metadata_only: bool,
 }
@@ -482,7 +490,7 @@ pub struct RotateCollectorCredentialResponse {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IngestBatchResponse {
     pub batch_id: String,
     pub inserted_events: u64,
@@ -602,6 +610,7 @@ pub(crate) struct ValidatedCollectorUsageEvent {
     parser_name: String,
     parser_version: String,
     pricing_version: String,
+    pricing_mode: PricingMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

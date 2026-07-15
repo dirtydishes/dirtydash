@@ -199,7 +199,11 @@ async fn collector_poll_command(
     }
     let wait_seconds = query.wait_seconds.unwrap_or(20).min(20);
     if wait_seconds > 0 {
-        tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)).await;
+        let notification = state.repo.command_notification();
+        tokio::select! {
+            _ = notification.notified() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)) => {},
+        }
     }
     Ok(Json(CollectorCommandPollResponse {
         command: state.repo.poll_collector_command(&auth)?,

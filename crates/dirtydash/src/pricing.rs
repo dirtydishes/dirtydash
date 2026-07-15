@@ -24,7 +24,7 @@ pub struct PricingRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PricingMode {
     Reported,
@@ -33,6 +33,7 @@ pub enum PricingMode {
     Standard,
     LongContext,
     Priority,
+    #[default]
     Unpriced,
 }
 

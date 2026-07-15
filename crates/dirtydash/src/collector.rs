@@ -7,7 +7,15 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
+
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -90,6 +98,18 @@ pub enum RetryClass {
 }
 
 impl RetryClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate-limited",
+            Self::Server => "server",
+            Self::Unauthorized => "unauthorized",
+            Self::Protocol => "protocol",
+            Self::Permanent => "permanent",
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
@@ -163,10 +183,222 @@ pub trait CollectorTransport {
     }
 }
 
+/// Production outbound-only HTTP transport. TLS is provided by reqwest's
+/// rustls backend; no listener or inbound socket is created by this type.
+pub struct CollectorHttpTransport {
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl CollectorHttpTransport {
+    pub fn new(hub_url: &str) -> Result<Self> {
+        let parsed = reqwest::Url::parse(hub_url).context("parsing collector hub_url")?;
+        if !matches!(parsed.scheme(), "https" | "http") {
+            anyhow::bail!("collector hub_url must use https or explicit http loopback transport");
+        }
+        if parsed.scheme() == "http"
+            && !parsed
+                .host_str()
+                .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+        {
+            anyhow::bail!("collector hub_url must use TLS unless it targets loopback");
+        }
+        let client = reqwest::blocking::Client::builder()
+            .use_rustls_tls()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(35))
+            .build()
+            .context("building Collector TLS HTTP client")?;
+        Ok(Self {
+            base_url: hub_url.trim_end_matches('/').to_string(),
+            client,
+        })
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    fn classify_status(status: reqwest::StatusCode) -> RetryClass {
+        match status.as_u16() {
+            401 | 403 => RetryClass::Unauthorized,
+            408 => RetryClass::Timeout,
+            429 => RetryClass::RateLimited,
+            500..=599 => RetryClass::Server,
+            400..=499 => RetryClass::Permanent,
+            _ => RetryClass::Protocol,
+        }
+    }
+
+    fn transport_error(error: reqwest::Error) -> TransportError {
+        let class = if error.is_timeout() {
+            RetryClass::Timeout
+        } else if error.is_connect() {
+            RetryClass::Offline
+        } else {
+            RetryClass::Protocol
+        };
+        TransportError::new(
+            class,
+            format!("HTTP transport failed: {}", error.is_timeout()),
+        )
+    }
+
+    fn response_error(response: &reqwest::blocking::Response) -> TransportError {
+        TransportError::new(
+            Self::classify_status(response.status()),
+            format!("Hub HTTP status {}", response.status().as_u16()),
+        )
+    }
+}
+
+impl CollectorTransport for CollectorHttpTransport {
+    fn send_batch(
+        &mut self,
+        credential_token: &str,
+        request: &IngestBatchRequest,
+    ) -> std::result::Result<IngestBatchResponse, TransportError> {
+        let response = self
+            .client
+            .post(self.endpoint("/api/v1/ingest/batches"))
+            .bearer_auth(credential_token)
+            .json(request)
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        response
+            .json::<IngestBatchResponse>()
+            .map_err(|_| TransportError::protocol("Hub returned an invalid ingest response"))
+    }
+
+    fn poll_owner_command(
+        &mut self,
+        credential_token: &str,
+        machine_id: &str,
+        wait: Duration,
+    ) -> std::result::Result<Option<OwnerCommand>, TransportError> {
+        let wait_seconds = wait.as_secs().min(20);
+        let response = self
+            .client
+            .get(self.endpoint("/api/v1/collector/commands"))
+            .query(&[("wait_seconds", wait_seconds)])
+            .bearer_auth(credential_token)
+            .header("x-dirtydash-collector-machine", machine_id)
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        response
+            .json::<crate::hub::CollectorCommandPollResponse>()
+            .map(|body| body.command)
+            .map_err(|_| TransportError::protocol("Hub returned an invalid command poll response"))
+    }
+
+    fn acknowledge_owner_command(
+        &mut self,
+        credential_token: &str,
+        _machine_id: &str,
+        command_id: &str,
+        result: &CommandOutcome,
+    ) -> std::result::Result<(), TransportError> {
+        let result = serde_json::to_value(result)
+            .map_err(|_| TransportError::protocol("Collector command result is not JSON"))?;
+        let response = self
+            .client
+            .post(self.endpoint("/api/v1/collector/commands/ack"))
+            .bearer_auth(credential_token)
+            .json(&crate::hub::CollectorCommandAckRequest {
+                command_id: command_id.to_string(),
+                result,
+            })
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovedUpdate {
     pub version: String,
     pub sha256: String,
+}
+
+/// Restricted update seam. Implementations receive already-approved bytes,
+/// never a command or URL. The stock implementation atomically replaces one
+/// configured target file after verifying its digest.
+pub trait RestrictedUpdater: Send + Sync {
+    fn apply(&self, version: &str, expected_sha256: &str, artifact: &[u8]) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicFileUpdater {
+    target: PathBuf,
+}
+
+impl AtomicFileUpdater {
+    pub fn new(target: impl Into<PathBuf>) -> Self {
+        Self {
+            target: target.into(),
+        }
+    }
+}
+
+impl RestrictedUpdater for AtomicFileUpdater {
+    fn apply(&self, version: &str, expected_sha256: &str, artifact: &[u8]) -> Result<()> {
+        if version.is_empty()
+            || !version.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+            })
+        {
+            anyhow::bail!("update version contains unsupported path characters");
+        }
+        let expected = expected_sha256.trim().to_ascii_lowercase();
+        if expected.len() != 64
+            || !expected
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            anyhow::bail!("update digest is not a SHA-256 hex digest");
+        }
+        let actual = hex::encode(Sha256::digest(artifact));
+        if actual != expected {
+            anyhow::bail!("update artifact digest does not match the approved digest");
+        }
+        let parent = self
+            .target
+            .parent()
+            .context("configured update target has no parent directory")?;
+        fs::create_dir_all(parent)?;
+        let temp = parent.join(format!(
+            ".{}.{}.tmp",
+            self.target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("dirtydash-update"),
+            random_hex(8)
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(artifact)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, &self.target).with_context(|| {
+            format!(
+                "atomically applying approved update {} to {}",
+                version,
+                self.target.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +410,8 @@ pub struct CollectorOptions {
     pub watcher_debounce: Duration,
     pub retry_policy: RetryPolicy,
     pub approved_updates: Vec<ApprovedUpdate>,
+    pub update_artifact_dir: Option<PathBuf>,
+    pub update_target: Option<PathBuf>,
 }
 
 impl Default for CollectorOptions {
@@ -190,6 +424,8 @@ impl Default for CollectorOptions {
             watcher_debounce: DEFAULT_WATCHER_DEBOUNCE,
             retry_policy: RetryPolicy::default(),
             approved_updates: Vec::new(),
+            update_artifact_dir: None,
+            update_target: None,
         }
     }
 }
@@ -203,6 +439,16 @@ impl CollectorOptions {
             credential_token: file.credential_token.clone(),
             reconcile_interval: Duration::from_secs(file.reconcile_seconds.max(1)),
             watcher_debounce: Duration::from_millis(file.watcher_debounce_millis),
+            approved_updates: file
+                .approved_updates
+                .iter()
+                .map(|entry| ApprovedUpdate {
+                    version: entry.version.clone(),
+                    sha256: entry.sha256.clone(),
+                })
+                .collect(),
+            update_artifact_dir: file.update_artifact_dir.clone(),
+            update_target: file.update_target.clone(),
             ..Self::default()
         }
     }
@@ -238,8 +484,19 @@ pub struct DeliveryReport {
     pub acknowledged: usize,
     pub failed: usize,
     pub pending: u64,
+    pub terminal: u64,
     pub next_retry_at: Option<String>,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutboxDiagnostic {
+    pub batch_id: String,
+    pub status: String,
+    pub retry_class: Option<String>,
+    pub attempts: u32,
+    pub next_attempt_at: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,6 +508,8 @@ pub struct CollectorDiagnostics {
     pub watcher: WatcherStatus,
     pub credential_configured: bool,
     pub credential_rotation_pending: bool,
+    pub terminal_outbox: u64,
+    pub outbox_diagnostics: Vec<OutboxDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,12 +521,14 @@ pub enum CommandOutcome {
     Rejected { reason: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Collector {
     usage_db: Database,
     store: Database,
     options: CollectorOptions,
     identity: CollectorIdentityRecord,
+    command_owner_id: String,
+    updater: Arc<dyn RestrictedUpdater>,
     next_reconciliation_at: DateTime<Utc>,
     hint_pending: bool,
     debounce_until: Option<DateTime<Utc>>,
@@ -343,12 +604,18 @@ impl Collector {
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
             .map(|value| value.with_timezone(&Utc))
             .unwrap_or(now);
+        let updater_target = options
+            .update_target
+            .clone()
+            .unwrap_or_else(|| store.path().with_extension("update-artifact"));
 
         Ok(Self {
             usage_db,
             store,
             options,
             identity,
+            command_owner_id: format!("command-owner-{}", random_hex(12)),
+            updater: Arc::new(AtomicFileUpdater::new(updater_target)),
             next_reconciliation_at,
             hint_pending: false,
             debounce_until: None,
@@ -367,6 +634,11 @@ impl Collector {
             collector_db,
             CollectorOptions::from_config(config),
         )
+    }
+
+    pub fn with_updater(mut self, updater: Arc<dyn RestrictedUpdater>) -> Self {
+        self.updater = updater;
+        self
     }
 
     pub fn machine_id(&self) -> &str {
@@ -402,8 +674,24 @@ impl Collector {
             pending_outbox: self.store.collector_outbox_count()?,
             last_reconciliation_at: self.store.collector_state("last_reconciliation_at")?,
             watcher: self.watcher_status(),
-            credential_configured: identity.credential_token.is_some(),
+            credential_configured: identity.credential_token.is_some()
+                || identity.pending_credential_token.is_some(),
             credential_rotation_pending: identity.pending_credential_token.is_some(),
+            terminal_outbox: self.store.collector_outbox_dead_letter_count()?,
+            outbox_diagnostics: self
+                .store
+                .collector_outbox_records(true)?
+                .into_iter()
+                .filter(|record| record.status == "dead-letter")
+                .map(|record| OutboxDiagnostic {
+                    batch_id: record.batch_id,
+                    status: record.status,
+                    retry_class: record.retry_class,
+                    attempts: record.attempts,
+                    next_attempt_at: record.next_attempt_at,
+                    last_error: record.last_error,
+                })
+                .collect(),
         })
     }
 
@@ -501,6 +789,7 @@ impl Collector {
         let mut payload_manifests = Vec::new();
         let mut payload_events = Vec::new();
         let mut seen_event_ids = BTreeSet::new();
+        let pending_event_ids = self.pending_collector_event_ids()?;
         let mut seen_source_keys = BTreeSet::new();
         let mut files_reprocessed = 0;
         let mut parse_errors = 0;
@@ -535,7 +824,7 @@ impl Collector {
                 "cursor",
                 &parsed_file.file_fingerprint,
             ));
-            manifests.push(CollectorManifestRecord {
+            let manifest = CollectorManifestRecord {
                 source_key: source_key.clone(),
                 agent: parsed_file.source.kind.as_str().to_string(),
                 local_path: parsed_file.file.display().to_string(),
@@ -545,39 +834,48 @@ impl Collector {
                 cursor: cursor.clone(),
                 parse_error: parsed_file.parse_error.clone(),
                 last_reconciled_at: imported_at.clone(),
-            });
-            payload_manifests.push(SourceManifestInput {
-                source_key: source_key.clone(),
-                agent: parsed_file.source.kind.as_str().to_string(),
-                display_path: format!(
-                    "{}/{}",
-                    parsed_file.source.kind.as_str(),
-                    redacted_identifier(
-                        &self.identity.project_salt,
-                        "display-path",
-                        &parsed_file.file.display().to_string(),
-                    )
-                ),
-                item_count,
-                cursor,
-                manifest_fingerprint: parsed_file.file_fingerprint.clone(),
-            });
+            };
+            let changed = manifest_changed(previous.as_ref(), &manifest);
+            manifests.push(manifest);
+            if changed {
+                payload_manifests.push(SourceManifestInput {
+                    source_key: source_key.clone(),
+                    agent: parsed_file.source.kind.as_str().to_string(),
+                    display_path: format!(
+                        "{}/{}",
+                        parsed_file.source.kind.as_str(),
+                        redacted_identifier(
+                            &self.identity.project_salt,
+                            "display-path",
+                            &parsed_file.file.display().to_string(),
+                        )
+                    ),
+                    item_count,
+                    cursor,
+                    manifest_fingerprint: parsed_file.file_fingerprint.clone(),
+                });
+            }
 
             if !should_reprocess {
                 continue;
             }
             files_reprocessed += 1;
             for event in &parsed_file.events {
-                match self.usage_db.upsert_usage_event(event)? {
-                    UsageEventWrite::Inserted
-                    | UsageEventWrite::Updated
-                    | UsageEventWrite::Skipped => {}
-                }
+                let write = self.usage_db.upsert_usage_event(event)?;
                 let event_id = format!(
                     "{}:{}",
                     event.source.as_str(),
                     stable_event_fingerprint(event)
                 );
+                // If the unchanged event is already represented by durable
+                // pending bytes, a resumed Refresh must not append another
+                // copy. Otherwise preserve the first-Collector send path even
+                // when the dashboard DB already contained the event.
+                if matches!(write, UsageEventWrite::Skipped)
+                    && pending_event_ids.contains(&event_id)
+                {
+                    continue;
+                }
                 if seen_event_ids.insert(event_id) {
                     payload_events.push(self.redact_event(event, &source_key, now));
                 }
@@ -592,7 +890,7 @@ impl Collector {
                 continue;
             }
             current_agents.insert(stale.agent.clone());
-            manifests.push(CollectorManifestRecord {
+            let manifest = CollectorManifestRecord {
                 source_key: stale.source_key.clone(),
                 agent: stale.agent.clone(),
                 local_path: stale.local_path.clone(),
@@ -602,26 +900,30 @@ impl Collector {
                 cursor: None,
                 parse_error: Some("source missing".to_string()),
                 last_reconciled_at: imported_at.clone(),
-            });
-            payload_manifests.push(SourceManifestInput {
-                source_key: stale.source_key.clone(),
-                agent: stale.agent,
-                display_path: format!(
-                    "source/{}",
-                    redacted_identifier(
+            };
+            let changed = manifest_changed(Some(&stale), &manifest);
+            manifests.push(manifest);
+            if changed {
+                payload_manifests.push(SourceManifestInput {
+                    source_key: stale.source_key.clone(),
+                    agent: stale.agent,
+                    display_path: format!(
+                        "source/{}",
+                        redacted_identifier(
+                            &self.identity.project_salt,
+                            "missing-source",
+                            &stale.local_path,
+                        )
+                    ),
+                    item_count: 0,
+                    cursor: None,
+                    manifest_fingerprint: redacted_identifier(
                         &self.identity.project_salt,
-                        "missing-source",
-                        &stale.local_path,
-                    )
-                ),
-                item_count: 0,
-                cursor: None,
-                manifest_fingerprint: redacted_identifier(
-                    &self.identity.project_salt,
-                    "missing-manifest",
-                    &stale.source_key,
-                ),
-            });
+                        "missing-manifest",
+                        &stale.source_key,
+                    ),
+                });
+            }
         }
 
         if !payload_manifests.is_empty() || !payload_events.is_empty() {
@@ -721,21 +1023,84 @@ impl Collector {
         Ok((reconciliation, delivery))
     }
 
+    fn pending_collector_event_ids(&self) -> Result<BTreeSet<String>> {
+        let mut event_ids = BTreeSet::new();
+        for record in self.store.collector_outbox_records(false)? {
+            let Ok(request) = serde_json::from_str::<IngestBatchRequest>(&record.payload_json)
+            else {
+                continue;
+            };
+            event_ids.extend(
+                request
+                    .events
+                    .into_iter()
+                    .map(|event| format!("{}:{}", event.agent, event.collector_event_fingerprint)),
+            );
+        }
+        Ok(event_ids)
+    }
+
+    fn credential_candidates(&self) -> Result<Vec<(String, bool)>> {
+        let identity = self
+            .store
+            .collector_identity()?
+            .context("Collector identity is missing")?;
+        let mut candidates = Vec::new();
+        if let Some(pending) = identity.pending_credential_token {
+            candidates.push((pending, true));
+        }
+        if let Some(current) = identity.credential_token {
+            if candidates
+                .first()
+                .is_none_or(|(pending, _)| pending != &current)
+            {
+                candidates.push((current, false));
+            }
+        }
+        if candidates.is_empty() {
+            anyhow::bail!("Collector credential is not configured");
+        }
+        Ok(candidates)
+    }
+
+    fn send_batch_with_fallback<T: CollectorTransport>(
+        &self,
+        transport: &mut T,
+        request: &IngestBatchRequest,
+    ) -> std::result::Result<(IngestBatchResponse, bool), TransportError> {
+        let candidates = self
+            .credential_candidates()
+            .map_err(|error| TransportError::new(RetryClass::Permanent, error.to_string()))?;
+        let mut last_error = None;
+        for (credential, pending) in candidates {
+            match transport.send_batch(&credential, request) {
+                Ok(response) => return Ok((response, pending)),
+                Err(error) if error.class == RetryClass::Unauthorized && pending => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            TransportError::new(
+                RetryClass::Unauthorized,
+                "all Collector credentials rejected",
+            )
+        }))
+    }
+
+    /// Explicit operator recovery for a terminal/dead-lettered batch. It is
+    /// never part of automatic retry selection.
+    pub fn recover_outbox_batch(&self, batch_id: &str, now: DateTime<Utc>) -> Result<bool> {
+        self.store
+            .recover_collector_batch(batch_id, &now.to_rfc3339())
+    }
+
     pub fn deliver_pending<T: CollectorTransport>(
         &mut self,
         transport: &mut T,
         now: DateTime<Utc>,
     ) -> Result<DeliveryReport> {
-        let identity = self
-            .store
-            .collector_identity()?
-            .context("Collector identity is missing")?;
-        let credential = identity
-            .pending_credential_token
-            .as_deref()
-            .or(identity.credential_token.as_deref())
-            .context("Collector credential is not configured")?
-            .to_string();
         let records = self
             .store
             .collector_outbox_ready(&now.to_rfc3339(), DEFAULT_OUTBOX_BATCH_LIMIT)?;
@@ -744,6 +1109,7 @@ impl Collector {
             acknowledged: 0,
             failed: 0,
             pending: 0,
+            terminal: 0,
             next_retry_at: None,
             errors: Vec::new(),
         };
@@ -768,17 +1134,22 @@ impl Collector {
             };
             let attempt = record.attempts.saturating_add(1);
             // No SQLite connection is held across this potentially long call.
-            match transport.send_batch(&credential, &request) {
-                Ok(response) if response.batch_id == request.batch_id => {
+            let sent = self.send_batch_with_fallback(transport, &request);
+            match sent {
+                Ok((response, used_pending)) if response.batch_id == request.batch_id => {
                     if self.store.acknowledge_collector_batch_if_matching(
                         &request.batch_id,
                         &response.batch_id,
                     )? {
-                        let _ = self.store.commit_staged_collector_credential()?;
+                        // A successful request with the pending token is the
+                        // rotation proof; old remains available on fallback.
+                        if used_pending {
+                            let _ = self.store.commit_staged_collector_credential()?;
+                        }
                         report.acknowledged += 1;
                     }
                 }
-                Ok(response) => {
+                Ok((response, _)) => {
                     self.record_delivery_failure(
                         &record,
                         now,
@@ -802,21 +1173,86 @@ impl Collector {
                     )?;
                     report.failed += 1;
                     report.errors.push(safe_diagnostic(error.to_string()));
-                    let retry_at =
-                        now + chrono_from_std(self.options.retry_policy.delay_for(attempt));
-                    let retry_at = retry_at.to_rfc3339();
-                    if report
-                        .next_retry_at
-                        .as_deref()
-                        .is_none_or(|current| retry_at.as_str() < current)
-                    {
-                        report.next_retry_at = Some(retry_at);
+                    if error.class.is_retryable() {
+                        let retry_at =
+                            now + chrono_from_std(self.options.retry_policy.delay_for(attempt));
+                        let retry_at = retry_at.to_rfc3339();
+                        if report
+                            .next_retry_at
+                            .as_deref()
+                            .is_none_or(|current| retry_at.as_str() < current)
+                        {
+                            report.next_retry_at = Some(retry_at);
+                        }
                     }
                 }
             }
         }
         report.pending = self.store.collector_outbox_count()?;
+        report.terminal = self.store.collector_outbox_dead_letter_count()?;
         Ok(report)
+    }
+
+    fn poll_command_with_fallback<T: CollectorTransport>(
+        &self,
+        transport: &mut T,
+    ) -> Result<(Option<OwnerCommand>, String, bool)> {
+        let candidates = self.credential_candidates()?;
+        let mut last_error = None;
+        for (credential, pending) in candidates {
+            match transport.poll_owner_command(
+                &credential,
+                &self.identity.machine_id,
+                OWNER_COMMAND_LONG_POLL,
+            ) {
+                Ok(command) => return Ok((command, credential, pending)),
+                Err(error) if error.class == RetryClass::Unauthorized && pending => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
+        }
+        Err(anyhow::anyhow!(last_error.unwrap_or_else(|| {
+            TransportError::new(
+                RetryClass::Unauthorized,
+                "all Collector credentials rejected",
+            )
+        })))
+    }
+
+    fn acknowledge_command_with_fallback<T: CollectorTransport>(
+        &self,
+        transport: &mut T,
+        credential: &str,
+        used_pending: bool,
+        command_id: &str,
+        outcome: &CommandOutcome,
+    ) -> Result<bool> {
+        match transport.acknowledge_owner_command(
+            credential,
+            &self.identity.machine_id,
+            command_id,
+            outcome,
+        ) {
+            Ok(()) => Ok(used_pending),
+            Err(error) if error.class == RetryClass::Unauthorized && used_pending => {
+                let candidates = self.credential_candidates()?;
+                let (current, _) = candidates
+                    .into_iter()
+                    .find(|(_, pending)| !*pending)
+                    .context("current Collector credential is unavailable")?;
+                transport
+                    .acknowledge_owner_command(
+                        &current,
+                        &self.identity.machine_id,
+                        command_id,
+                        outcome,
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok(false)
+            }
+            Err(error) => Err(anyhow::anyhow!(error)),
+        }
     }
 
     pub fn poll_owner_command<T: CollectorTransport>(
@@ -824,68 +1260,87 @@ impl Collector {
         transport: &mut T,
         now: DateTime<Utc>,
     ) -> Result<Option<CommandOutcome>> {
-        let identity = self
-            .store
-            .collector_identity()?
-            .context("Collector identity is missing")?;
-        let credential = identity
-            .pending_credential_token
-            .as_deref()
-            .or(identity.credential_token.as_deref())
-            .context("Collector credential is not configured")?
-            .to_string();
-        let command = transport
-            .poll_owner_command(
-                &credential,
-                &self.identity.machine_id,
-                OWNER_COMMAND_LONG_POLL,
-            )
-            .map_err(|error| anyhow::anyhow!(error))?;
+        let (command, credential, used_pending) = self.poll_command_with_fallback(transport)?;
         let Some(command) = command else {
             return Ok(None);
         };
         let command_id = command.command_id().to_string();
+        let mut reclaimed = false;
         if let Some(receipt) = self.store.collector_command_result(&command_id)? {
-            let outcome = if receipt.status == "completed" {
-                serde_json::from_str(&receipt.result_json)
-                    .context("stored Collector command receipt is invalid")?
+            if receipt.status != "completed" {
+                // A different process may have crashed after the started
+                // receipt. The command-specific handlers below are replay
+                // safe, so reclaim it instead of permanently rejecting it.
+                reclaimed = self.store.reclaim_collector_command(
+                    &command_id,
+                    &now.to_rfc3339(),
+                    &self.command_owner_id,
+                )?;
             } else {
-                CommandOutcome::Rejected {
-                    reason: "command execution was already started before a Collector restart"
-                        .to_string(),
-                }
-            };
-            transport
-                .acknowledge_owner_command(
+                let outcome: CommandOutcome = serde_json::from_str(&receipt.result_json)
+                    .context("stored Collector command receipt is invalid")?;
+                let acknowledged_with_pending = self.acknowledge_command_with_fallback(
+                    transport,
                     &credential,
-                    &self.identity.machine_id,
+                    used_pending,
                     &command_id,
                     &outcome,
-                )
-                .map_err(|error| anyhow::anyhow!(error))?;
-            return Ok(Some(outcome));
+                )?;
+                if acknowledged_with_pending {
+                    let _ = self.store.commit_staged_collector_credential()?;
+                }
+                return Ok(Some(outcome));
+            }
         }
-        if !self
-            .store
-            .begin_collector_command(&command_id, &now.to_rfc3339())?
+        if !reclaimed
+            && !self.store.begin_collector_command_owned(
+                &command_id,
+                &now.to_rfc3339(),
+                &self.command_owner_id,
+            )?
         {
             return Ok(Some(CommandOutcome::Rejected {
-                reason: "command receipt was claimed by another Collector instance".to_string(),
+                reason: "command receipt is currently leased by another Collector instance"
+                    .to_string(),
             }));
         }
         let outcome = self.handle_owner_command(command, now)?;
         let result_json = serde_json::to_string(&outcome)?;
         self.store
             .save_collector_command_result(&command_id, &result_json, &now.to_rfc3339())?;
-        transport
-            .acknowledge_owner_command(
-                &credential,
-                &self.identity.machine_id,
-                &command_id,
-                &outcome,
-            )
-            .map_err(|error| anyhow::anyhow!(error))?;
+        let acknowledged_with_pending = self.acknowledge_command_with_fallback(
+            transport,
+            &credential,
+            used_pending,
+            &command_id,
+            &outcome,
+        )?;
+        if acknowledged_with_pending {
+            let _ = self.store.commit_staged_collector_credential()?;
+        }
         Ok(Some(outcome))
+    }
+
+    pub fn apply_approved_update_artifact(
+        &self,
+        version: &str,
+        expected_sha256: &str,
+        artifact: &[u8],
+    ) -> Result<()> {
+        let digest = expected_sha256.trim().to_ascii_lowercase();
+        let approved =
+            self.options.approved_updates.iter().any(|entry| {
+                entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest)
+            });
+        if !approved || !is_sha256_hex(&digest) {
+            anyhow::bail!("artifact is not approved by the configured version/digest allowlist");
+        }
+        self.updater.apply(version, &digest, artifact)?;
+        self.store
+            .set_collector_state("applied_update_version", version)?;
+        self.store
+            .set_collector_state("applied_update_sha256", &digest)?;
+        Ok(())
     }
 
     pub fn handle_owner_command(
@@ -919,23 +1374,42 @@ impl Collector {
                 version, sha256, ..
             } => {
                 let digest = sha256.trim().to_ascii_lowercase();
-                let approved = self.options.approved_updates.iter().any(|entry| {
-                    entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest)
-                });
-                let digest_valid = digest.len() == 64
-                    && digest
-                        .chars()
-                        .all(|character| character.is_ascii_hexdigit());
-                if !approved || !digest_valid {
+                let Some(approved) = self
+                    .options
+                    .approved_updates
+                    .iter()
+                    .find(|entry| {
+                        entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest)
+                    })
+                    .cloned()
+                else {
                     return Ok(CommandOutcome::Rejected {
                         reason: "update is not present in the approved version/digest allowlist"
                             .to_string(),
                     });
+                };
+                if !is_sha256_hex(&digest) || !is_safe_update_version(&version) {
+                    return Ok(CommandOutcome::Rejected {
+                        reason: "approved update version or digest is invalid".to_string(),
+                    });
                 }
-                self.store
-                    .set_collector_state("approved_update_version", &version)?;
-                self.store
-                    .set_collector_state("approved_update_sha256", &digest)?;
+                if let Some(directory) = &self.options.update_artifact_dir {
+                    let artifact_name = format!("{}.artifact", version);
+                    let artifact_path = directory.join(&artifact_name);
+                    let artifact = match fs::read(&artifact_path) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            return Ok(CommandOutcome::Rejected {
+                                reason: "approved update artifact is unavailable".to_string(),
+                            })
+                        }
+                    };
+                    self.apply_approved_update_artifact(&approved.version, &digest, &artifact)?;
+                } else {
+                    return Ok(CommandOutcome::Rejected {
+                        reason: "approved update artifact directory is not configured".to_string(),
+                    });
+                }
                 Ok(CommandOutcome::UpdateAccepted {
                     version,
                     sha256: digest,
@@ -952,18 +1426,21 @@ impl Collector {
         message: String,
     ) -> Result<()> {
         let attempt = record.attempts.saturating_add(1);
-        let delay = if class.is_retryable() {
-            self.options.retry_policy.delay_for(attempt)
+        let terminal = !class.is_retryable();
+        let delay = if terminal {
+            Duration::ZERO
         } else {
-            self.options.retry_policy.max_delay
+            self.options.retry_policy.delay_for(attempt)
         };
         let next_attempt_at = (now + chrono_from_std(delay)).to_rfc3339();
-        self.store.fail_collector_batch(
+        self.store.fail_collector_batch_with_class(
             &record.batch_id,
             attempt,
             &next_attempt_at,
             &now.to_rfc3339(),
             &safe_diagnostic(message),
+            class.as_str(),
+            terminal,
         )?;
         Ok(())
     }
@@ -1017,6 +1494,7 @@ impl Collector {
             parser_name: safe_identifier(&event.parser_name, "collector-parser"),
             parser_version: safe_identifier(&event.parser_version, "unknown-parser-version"),
             pricing_version: safe_identifier(&event.pricing_version, "unpriced"),
+            pricing_mode: event.pricing_mode,
             // This is a transport invariant, not a copy of a local import flag.
             metadata_only: true,
         }
@@ -1026,6 +1504,21 @@ impl Collector {
 pub struct CollectorInstanceGuard {
     db: Database,
     owner_id: String,
+}
+
+impl CollectorInstanceGuard {
+    pub fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    pub fn renew(&self, now: DateTime<Utc>, lease_for: Duration) -> Result<bool> {
+        let lease_until = now + chrono_from_std(lease_for);
+        self.db.renew_collector_instance_lock(
+            &self.owner_id,
+            &now.to_rfc3339(),
+            &lease_until.to_rfc3339(),
+        )
+    }
 }
 
 impl Drop for CollectorInstanceGuard {
@@ -1066,6 +1559,21 @@ pub fn redacted_identifier(project_salt: &str, namespace: &str, value: &str) -> 
     format!("{}-{}", namespace, hex::encode(hasher.finalize()))
 }
 
+fn manifest_changed(
+    previous: Option<&CollectorManifestRecord>,
+    current: &CollectorManifestRecord,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.agent != current.agent
+        || previous.file_fingerprint != current.file_fingerprint
+        || previous.parser_version != current.parser_version
+        || previous.item_count != current.item_count
+        || previous.cursor != current.cursor
+        || previous.parse_error != current.parse_error
+}
+
 fn build_checkpoints(
     manifests: &[SourceManifestInput],
     agents: &BTreeSet<String>,
@@ -1102,8 +1610,14 @@ fn chrono_from_std(duration: Duration) -> ChronoDuration {
 }
 
 fn safe_identifier(value: &str, fallback: &str) -> String {
-    let mut result = value
-        .trim()
+    let trimmed = value.trim();
+    if looks_like_secret_identifier(trimmed) {
+        return format!(
+            "redacted-{}",
+            &hex::encode(Sha256::digest(trimmed.as_bytes()))[..24]
+        );
+    }
+    let mut result = trimmed
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '@')
@@ -1120,6 +1634,32 @@ fn safe_identifier(value: &str, fallback: &str) -> String {
     } else {
         result
     }
+}
+
+fn looks_like_secret_identifier(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    value.starts_with("sk-")
+        || value.starts_with("sk_")
+        || value.starts_with("ghp_")
+        || value.starts_with("github_pat_")
+        || value.starts_with("xoxb-")
+        || value.starts_with("AKIA")
+        || lower.starts_with("bearer ")
+        || lower.contains("authorization:")
+        || lower.contains("private key")
+        || lower.starts_with("ssh-")
+        || lower.starts_with("sudo ")
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
+fn is_safe_update_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
 }
 
 fn safe_diagnostic(value: String) -> String {
@@ -1140,4 +1680,208 @@ fn random_hex(bytes: usize) -> String {
 
 fn local_machine_bytes() -> Vec<u8> {
     crate::db::local_machine().into_bytes()
+}
+
+/// Run the operational outbound Collector. The main thread owns reconciliation
+/// and watcher state; delivery and command polling are independent workers so
+/// a 20-second long poll never holds a SQLite connection or blocks file
+/// notification handling.
+pub fn run_daemon(paths: &crate::app_paths::AppPaths, config: &Config) -> Result<()> {
+    let hub_url = config
+        .collector
+        .hub_url
+        .as_deref()
+        .context("collector.hub_url is required for `collector run`")?;
+    // Validate the configured endpoint before acquiring the durable lease.
+    let _ = CollectorHttpTransport::new(hub_url)?;
+    let usage_db = Database::open(&paths.db_path)?;
+    let collector_db = Database::open(&paths.collector_db_path)?;
+    let mut runtime = Collector::from_config(usage_db, collector_db, config)?;
+    let guard = runtime.acquire_instance(Utc::now())?;
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Signal handling is deliberately outside the transport workers so every
+    // worker can observe cancellation between network calls.
+    let signal_stop = Arc::clone(&stop);
+    thread::spawn(move || {
+        if let Ok(runtime) = tokio::runtime::Runtime::new() {
+            let _ = runtime.block_on(async { tokio::signal::ctrl_c().await });
+            signal_stop.store(true, Ordering::SeqCst);
+        }
+    });
+
+    runtime.reconcile_startup(Utc::now())?;
+
+    let (watch_tx, watch_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = match RecommendedWatcher::new(
+        move |event| {
+            let _ = watch_tx.send(event);
+        },
+        notify::Config::default(),
+    ) {
+        Ok(mut watcher) => {
+            let sources = if config.source_roots.is_empty() {
+                importers::scan_sources(config)
+            } else {
+                importers::scan_configured_sources(config)
+            };
+            match sources {
+                Ok(sources) => {
+                    let mut watched = BTreeSet::new();
+                    for source in sources {
+                        if watched.insert(source.path.clone()) {
+                            if let Err(error) =
+                                watcher.watch(&source.path, RecursiveMode::Recursive)
+                            {
+                                runtime.watcher_failed(
+                                    Utc::now(),
+                                    format!("watcher initialization failed: {error}"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Some(watcher)
+                }
+                Err(error) => {
+                    runtime.watcher_failed(
+                        Utc::now(),
+                        format!("watcher source discovery failed: {error}"),
+                    );
+                    Some(watcher)
+                }
+            }
+        }
+        Err(error) => {
+            runtime.watcher_failed(
+                Utc::now(),
+                format!("watcher initialization failed: {error}"),
+            );
+            None
+        }
+    };
+
+    let worker_stop = Arc::clone(&stop);
+    let worker_paths = paths.clone();
+    let worker_config = config.clone();
+    let delivery_worker = thread::spawn(move || {
+        let usage_db = match Database::open(&worker_paths.db_path) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let collector_db = match Database::open(&worker_paths.collector_db_path) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let mut collector = match Collector::from_config(usage_db, collector_db, &worker_config) {
+            Ok(collector) => collector,
+            Err(_) => return,
+        };
+        let mut transport = match CollectorHttpTransport::new(
+            worker_config
+                .collector
+                .hub_url
+                .as_deref()
+                .unwrap_or_default(),
+        ) {
+            Ok(transport) => transport,
+            Err(_) => return,
+        };
+        while !worker_stop.load(Ordering::SeqCst) {
+            let _ = collector.deliver_pending(&mut transport, Utc::now());
+            sleep_until_or_stop(&worker_stop, Duration::from_secs(1));
+        }
+    });
+
+    let command_stop = Arc::clone(&stop);
+    let command_paths = paths.clone();
+    let command_config = config.clone();
+    let command_worker = thread::spawn(move || {
+        let usage_db = match Database::open(&command_paths.db_path) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let collector_db = match Database::open(&command_paths.collector_db_path) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let mut collector = match Collector::from_config(usage_db, collector_db, &command_config) {
+            Ok(collector) => collector,
+            Err(_) => return,
+        };
+        let mut transport = match CollectorHttpTransport::new(
+            command_config
+                .collector
+                .hub_url
+                .as_deref()
+                .unwrap_or_default(),
+        ) {
+            Ok(transport) => transport,
+            Err(_) => return,
+        };
+        while !command_stop.load(Ordering::SeqCst) {
+            let _ = collector.poll_owner_command(&mut transport, Utc::now());
+            // The transport performs the bounded 20-second poll. A short
+            // cancellation check keeps shutdown clean after an empty result.
+            sleep_until_or_stop(&command_stop, Duration::from_millis(50));
+        }
+    });
+
+    let mut next_renewal = Utc::now() + ChronoDuration::seconds(30);
+    let result = loop {
+        if stop.load(Ordering::SeqCst) {
+            break Ok(());
+        }
+        while let Ok(event) = watch_rx.try_recv() {
+            match event {
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_)
+                            | EventKind::Modify(_)
+                            | EventKind::Remove(_)
+                            | EventKind::Other
+                    ) =>
+                {
+                    runtime.notify_watcher_hint(Utc::now())
+                }
+                Ok(_) => {}
+                Err(error) => runtime.watcher_failed(Utc::now(), error.to_string()),
+            }
+        }
+        let now = Utc::now();
+        if now >= next_renewal {
+            match guard.renew(now, Duration::from_secs(90)) {
+                Ok(true) => next_renewal = now + ChronoDuration::seconds(30),
+                Ok(false) => {
+                    stop.store(true, Ordering::SeqCst);
+                    break Err(anyhow::anyhow!("Collector instance lease was lost"));
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::SeqCst);
+                    break Err(error.context("renewing Collector instance lease"));
+                }
+            }
+        }
+        let _ = runtime.reconcile_if_due(now)?;
+        sleep_until_or_stop(&stop, Duration::from_millis(100));
+    };
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = delivery_worker.join();
+    let _ = command_worker.join();
+    drop(watcher.take());
+    drop(guard);
+    result
+}
+
+fn sleep_until_or_stop(stop: &AtomicBool, duration: Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    while !stop.load(Ordering::SeqCst) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
 }

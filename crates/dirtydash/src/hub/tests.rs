@@ -1,4 +1,8 @@
 use super::*;
+use crate::collector::{
+    Collector, CollectorOptions, CollectorTransport, RetryClass, TransportError,
+};
+use crate::config::SourceRoot;
 use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::header;
@@ -7,6 +11,7 @@ use axum::response::Response;
 use axum::{Extension, Router};
 use rusqlite::params;
 use serde_json::{json, Value};
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
@@ -168,6 +173,7 @@ fn ingest_request(protocol_version: u32) -> IngestBatchRequest {
             parser_name: "codex".to_string(),
             parser_version: "v1".to_string(),
             pricing_version: "pricing-v1".to_string(),
+            pricing_mode: PricingMode::Priority,
             metadata_only: true,
         }],
     }
@@ -201,6 +207,50 @@ async fn ingest_raw(app: &Router, token: &str, body: Value) -> Response {
         )
         .await
         .unwrap()
+}
+
+struct CommitThenResponseLossTransport {
+    repo: HubRepository,
+    token: String,
+    lose_next_response: bool,
+    request_bytes: Vec<Vec<u8>>,
+    replay_flags: Vec<bool>,
+}
+
+impl CollectorTransport for CommitThenResponseLossTransport {
+    fn send_batch(
+        &mut self,
+        _credential_token: &str,
+        request: &IngestBatchRequest,
+    ) -> Result<IngestBatchResponse, TransportError> {
+        self.request_bytes
+            .push(serde_json::to_vec(request).unwrap());
+        let auth = self
+            .repo
+            .authenticate_collector_bearer(&self.token)
+            .map_err(|_| {
+                TransportError::new(RetryClass::Unauthorized, "Hub authentication failed")
+            })?;
+        let response = self
+            .repo
+            .ingest_batch(&auth, request.clone())
+            .map_err(|_| TransportError::protocol("Hub ingest failed"))?;
+        self.replay_flags.push(response.idempotent_replay);
+        if self.lose_next_response {
+            self.lose_next_response = false;
+            return Err(TransportError::offline("response lost after Hub commit"));
+        }
+        Ok(response)
+    }
+
+    fn poll_owner_command(
+        &mut self,
+        _credential_token: &str,
+        _machine_id: &str,
+        _wait: std::time::Duration,
+    ) -> Result<Option<OwnerCommand>, TransportError> {
+        Ok(None)
+    }
 }
 
 #[tokio::test]
@@ -717,11 +767,16 @@ async fn collector_credential_rotation_and_revocation_work() {
     assert_ne!(first.credential_id, second.credential_id);
 
     let initial = ingest_request(SUPPORTED_PROTOCOL_VERSION);
-    let first_rejected = ingest(&app, &first.token, &initial).await;
-    assert_eq!(first_rejected.status(), StatusCode::UNAUTHORIZED);
+    // The old token remains usable during the overlap window.
+    let first_overlap = ingest(&app, &first.token, &initial).await;
+    assert_eq!(first_overlap.status(), StatusCode::OK);
 
+    // A successful request with the newest token proves rotation and retires
+    // the old token atomically.
     let second_ok = ingest(&app, &second.token, &initial).await;
     assert_eq!(second_ok.status(), StatusCode::OK);
+    let first_rejected = ingest(&app, &first.token, &initial).await;
+    assert_eq!(first_rejected.status(), StatusCode::UNAUTHORIZED);
 
     let revoke = app
         .clone()
@@ -813,6 +868,143 @@ async fn duplicate_batches_and_retries_are_idempotent() {
         .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn collector_pricing_mode_round_trips_reported_and_codex_priority() {
+    let repo = test_repo();
+    let app = test_app(repo.clone(), ListenerTrustMode::Public);
+    let (cookie, csrf) = bootstrap_session(&app).await;
+    let issued = rotate_credential(&app, &cookie, &csrf).await;
+
+    let mut reported = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    reported.batch_id = "batch-reported".to_string();
+    reported.sync_run.sync_run_id = "sync-reported".to_string();
+    reported.events[0].collector_event_fingerprint = "fingerprint-reported".to_string();
+    reported.events[0].pricing_mode = PricingMode::Reported;
+    reported.events[0].pricing_version = "reported-cost".to_string();
+    assert_eq!(
+        ingest(&app, &issued.token, &reported).await.status(),
+        StatusCode::OK
+    );
+
+    let mut priority = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    priority.batch_id = "batch-priority".to_string();
+    priority.sync_run.sync_run_id = "sync-priority".to_string();
+    priority.events[0].collector_event_fingerprint = "fingerprint-priority".to_string();
+    priority.events[0].pricing_mode = PricingMode::Priority;
+    assert_eq!(
+        ingest(&app, &issued.token, &priority).await.status(),
+        StatusCode::OK
+    );
+
+    let conn = repo.db.connection().unwrap();
+    let modes = conn
+        .prepare(
+            "SELECT collector_event_fingerprint, pricing_mode FROM usage_events ORDER BY collector_event_fingerprint",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        modes,
+        vec![
+            ("fingerprint-priority".to_string(), "priority".to_string()),
+            ("fingerprint-reported".to_string(), "reported".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn collector_replays_byte_identical_batch_after_commit_response_loss() {
+    let dir = tempdir().unwrap();
+    let source_root = dir.path().join("claude/projects/project-a");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        source_root.join("session.jsonl"),
+        r#"{"sessionId":"response-loss-session","cwd":"/private/project","timestamp":"2026-07-15T00:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":20}}}"#,
+    )
+    .unwrap();
+
+    let repo = test_repo();
+    let issued = repo
+        .rotate_collector_credential(RotateCollectorCredentialRequest {
+            machine_id: "machine-response-loss".to_string(),
+            display_name: "Response Loss Machine".to_string(),
+            credential_label: "default".to_string(),
+        })
+        .unwrap();
+    let options = CollectorOptions {
+        source_roots: vec![SourceRoot {
+            kind: "claude-code".to_string(),
+            path: dir.path().join("claude/projects"),
+        }],
+        machine_id: Some("machine-response-loss".to_string()),
+        credential_token: Some(issued.token.clone()),
+        ..CollectorOptions::default()
+    };
+    let usage_path = dir.path().join("usage.sqlite3");
+    let collector_path = dir.path().join("collector.sqlite3");
+    let mut collector = Collector::with_databases(
+        Database::open(&usage_path).unwrap(),
+        Database::open(&collector_path).unwrap(),
+        options.clone(),
+    )
+    .unwrap();
+    collector
+        .reconcile_startup(
+            chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+        .unwrap();
+    let mut first_transport = CommitThenResponseLossTransport {
+        repo: repo.clone(),
+        token: issued.token.clone(),
+        lose_next_response: true,
+        request_bytes: Vec::new(),
+        replay_flags: Vec::new(),
+    };
+    let first = collector
+        .deliver_pending(
+            &mut first_transport,
+            chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+        .unwrap();
+    assert_eq!(first.failed, 1);
+    assert_eq!(first.pending, 1);
+
+    let mut restarted = Collector::with_databases(
+        Database::open(&usage_path).unwrap(),
+        Database::open(&collector_path).unwrap(),
+        options,
+    )
+    .unwrap();
+    let mut second_transport = CommitThenResponseLossTransport {
+        repo,
+        token: issued.token,
+        lose_next_response: false,
+        request_bytes: Vec::new(),
+        replay_flags: Vec::new(),
+    };
+    let second = restarted
+        .deliver_pending(
+            &mut second_transport,
+            chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:02Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+        .unwrap();
+    assert_eq!(second.acknowledged, 1);
+    assert_eq!(
+        first_transport.request_bytes,
+        second_transport.request_bytes
+    );
+    assert_eq!(second_transport.replay_flags, vec![true]);
 }
 
 #[tokio::test]
@@ -1636,6 +1828,144 @@ async fn collector_command_endpoints_poll_and_ack_typed_owner_commands() {
         .await
         .unwrap();
     assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+
+    let duplicate_ack = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/commands/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.token),
+                )
+                .body(Body::from(
+                    json!({
+                        "command_id": "command-refresh-1",
+                        "result": {"status": "queued"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate_ack.status(), StatusCode::NO_CONTENT);
+
+    let conflicting_ack = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/commands/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.token),
+                )
+                .body(Body::from(
+                    json!({
+                        "command_id": "command-refresh-1",
+                        "result": {"status": "different"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflicting_ack.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn collector_long_poll_wakes_without_holding_database_lock() {
+    let repo = test_repo();
+    let app = test_app(repo, ListenerTrustMode::Public);
+    let (cookie, csrf) = bootstrap_session(&app).await;
+    let credential = rotate_credential(&app, &cookie, &csrf).await;
+
+    let poll_app = app.clone();
+    let poll_token = credential.token.clone();
+    let started = std::time::Instant::now();
+    let poll = tokio::spawn(async move {
+        poll_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/collector/commands?wait_seconds=2")
+                    .header(header::AUTHORIZATION, format!("Bearer {poll_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let issue = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/collector-commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header(OWNER_CSRF_HEADER, &csrf)
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "command": {"type": "diagnostics", "command_id": "wake-1"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issue.status(), StatusCode::OK);
+    let response = poll.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_response(response).await;
+    assert_eq!(body["command"]["command_id"], "wake-1");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    let ack = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/commands/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.token),
+                )
+                .body(Body::from(
+                    json!({"command_id": "wake-1", "result": {"status": "done"}}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+
+    let timeout_started = std::time::Instant::now();
+    let timeout = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/collector/commands?wait_seconds=1")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(timeout.status(), StatusCode::OK);
+    assert!(timeout_started.elapsed() >= std::time::Duration::from_millis(900));
 }
 
 #[tokio::test]
