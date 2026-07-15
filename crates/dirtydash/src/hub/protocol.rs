@@ -11,10 +11,10 @@ pub(crate) fn validate_ingest_batch(
     request: IngestBatchRequest,
     authenticated_machine_id: &str,
 ) -> Result<ValidatedIngestBatch, HubError> {
-    if request.protocol_version != SUPPORTED_PROTOCOL_VERSION {
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
         return Err(HubError::conflict(
             "incompatible-protocol-version",
-            "this Hub only accepts protocol_version=1 for /api/v1 requests",
+            "this Hub accepts only the current and previous Collector protocol versions",
         ));
     }
     let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
@@ -33,6 +33,12 @@ pub(crate) fn validate_ingest_batch(
             .collector_version
             .as_deref()
             .map(|value| validate_non_empty(value, "collector_version"))
+            .transpose()?,
+        runtime_generation: request
+            .sync_run
+            .runtime_generation
+            .as_deref()
+            .map(|value| validate_identifier(value, "runtime_generation"))
             .transpose()?,
         started_at: normalize_utc_timestamp(&request.sync_run.started_at)?,
         finished_at: normalize_utc_timestamp(&request.sync_run.finished_at)?,
@@ -146,6 +152,7 @@ pub(crate) fn validate_ingest_batch(
     Ok(ValidatedIngestBatch {
         batch_id,
         machine_id,
+        protocol_version: request.protocol_version,
         sync_run,
         source_manifests,
         checkpoints,
@@ -201,16 +208,6 @@ pub(crate) fn validate_command_has_no_secret(value: &serde_json::Value) -> Resul
         return Err(HubError::unprocessable(
             "collector-command-secret-forbidden",
             "collector commands must contain only non-secret rotation instructions",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_ack_result_has_no_secret(value: &serde_json::Value) -> Result<(), HubError> {
-    if command_value_contains_secret(value, true) {
-        return Err(HubError::unprocessable(
-            "collector-command-secret-forbidden",
-            "collector command acknowledgements must not contain credentials",
         ));
     }
     Ok(())

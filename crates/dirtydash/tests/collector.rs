@@ -775,7 +775,10 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
         .poll_owner_command(&mut transport, now)
         .unwrap()
         .unwrap();
-    assert!(matches!(outcome, CommandOutcome::Diagnostics(_)));
+    assert!(matches!(
+        outcome,
+        CommandOutcome::Diagnostics { diagnostics: _ }
+    ));
     assert_eq!(transport.poll_wait, Some(OWNER_COMMAND_LONG_POLL));
     assert_eq!(transport.acknowledgements, 1);
     transport.command = Some(OwnerCommand::Diagnostics {
@@ -783,12 +786,13 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
     });
     assert!(matches!(
         collector.poll_owner_command(&mut transport, now).unwrap(),
-        Some(CommandOutcome::Diagnostics(_))
+        Some(CommandOutcome::Diagnostics { diagnostics: _ })
     ));
     assert_eq!(transport.acknowledgements, 2);
 
     transport.command = Some(OwnerCommand::ApprovedUpdate {
         command_id: "update-1".to_string(),
+        update_id: "update-test-1".to_string(),
         version: "0.1.2".to_string(),
         sha256: "a".repeat(64),
     });
@@ -798,6 +802,7 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
     ));
     transport.command = Some(OwnerCommand::ApprovedUpdate {
         command_id: "update-2".to_string(),
+        update_id: "update-test-2".to_string(),
         version: "0.1.2".to_string(),
         sha256: "b".repeat(64),
     });
@@ -986,7 +991,10 @@ fn started_command_is_reclaimed_and_resumed_after_lease_expiry() {
         .poll_owner_command(&mut transport, at("2026-07-15T00:02:00Z"))
         .unwrap()
         .unwrap();
-    assert!(matches!(outcome, CommandOutcome::Diagnostics(_)));
+    assert!(matches!(
+        outcome,
+        CommandOutcome::Diagnostics { diagnostics: _ }
+    ));
     assert_eq!(transport.acknowledgements, 1);
 }
 

@@ -29,8 +29,11 @@ use crate::db::{
     CollectorOutboxRecord, Database,
 };
 use crate::hub::{
-    CheckpointInput, CollectorUsageEvent, IngestBatchRequest, IngestBatchResponse, OwnerCommand,
-    SourceManifestInput, SyncRunInput, API_V1_PROTOCOL_VERSION,
+    CheckpointInput, CollectorCommandAckRequest, CollectorCommandResult,
+    CollectorDiagnosticsReceipt, CollectorOutboxDiagnosticReceipt, CollectorUpdateReceipt,
+    CollectorUpdateReceiptRequest, CollectorUsageEvent, CollectorWatcherReceipt,
+    IngestBatchRequest, IngestBatchResponse, OwnerCommand, SourceManifestInput, SyncRunInput,
+    API_V1_PROTOCOL_VERSION,
 };
 use crate::importers::{
     self, parse_sources_for_collector, stable_event_fingerprint, SourceKind, UsageEvent,
@@ -180,6 +183,17 @@ pub trait CollectorTransport {
     ) -> std::result::Result<(), TransportError> {
         let _ = (credential_token, machine_id, command_id, result);
         Ok(())
+    }
+
+    fn report_collector_update_receipt(
+        &mut self,
+        credential_token: &str,
+        receipt: &CollectorUpdateReceipt,
+    ) -> std::result::Result<(), TransportError> {
+        let _ = (credential_token, receipt);
+        Err(TransportError::protocol(
+            "Collector update receipts are unsupported by this transport",
+        ))
     }
 
     /// Activate one locally generated replacement. Implementations must send
@@ -338,15 +352,36 @@ impl CollectorTransport for CollectorHttpTransport {
         command_id: &str,
         result: &CommandOutcome,
     ) -> std::result::Result<(), TransportError> {
-        let result = serde_json::to_value(result)
-            .map_err(|_| TransportError::protocol("Collector command result is not JSON"))?;
+        result.validate().map_err(|_| {
+            TransportError::protocol("Collector command result failed local validation")
+        })?;
         let response = self
             .client
             .post(self.endpoint("/api/v1/collector/commands/ack"))
             .bearer_auth(credential_token)
-            .json(&crate::hub::CollectorCommandAckRequest {
+            .json(&CollectorCommandAckRequest {
                 command_id: command_id.to_string(),
-                result,
+                result: result.clone(),
+            })
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        Ok(())
+    }
+
+    fn report_collector_update_receipt(
+        &mut self,
+        credential_token: &str,
+        receipt: &CollectorUpdateReceipt,
+    ) -> std::result::Result<(), TransportError> {
+        let response = self
+            .client
+            .post(self.endpoint("/api/v1/collector/updates/receipt"))
+            .bearer_auth(credential_token)
+            .json(&CollectorUpdateReceiptRequest {
+                receipt: receipt.clone(),
             })
             .send()
             .map_err(Self::transport_error)?;
@@ -420,6 +455,10 @@ pub struct ApprovedUpdate {
 /// configured target file after verifying its digest.
 pub trait RestrictedUpdater: Send + Sync {
     fn apply(&self, version: &str, expected_sha256: &str, artifact: &[u8]) -> Result<()>;
+
+    fn rollback(&self, _version: &str, _expected_sha256: &str) -> Result<()> {
+        anyhow::bail!("the configured Collector updater does not support rollback")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -461,6 +500,15 @@ impl RestrictedUpdater for AtomicFileUpdater {
             .parent()
             .context("configured update target has no parent directory")?;
         fs::create_dir_all(parent)?;
+        let backup = self.target.with_extension("previous");
+        if self.target.exists() {
+            fs::copy(&self.target, &backup).with_context(|| {
+                format!(
+                    "snapshotting the current Collector release at {}",
+                    self.target.display()
+                )
+            })?;
+        }
         let temp = parent.join(format!(
             ".{}.{}.tmp",
             self.target
@@ -483,6 +531,19 @@ impl RestrictedUpdater for AtomicFileUpdater {
                 self.target.display()
             )
         })?;
+        Ok(())
+    }
+
+    fn rollback(&self, version: &str, expected_sha256: &str) -> Result<()> {
+        if !is_safe_update_version(version) || !is_sha256_hex(expected_sha256) {
+            anyhow::bail!("rollback evidence is invalid");
+        }
+        let backup = self.target.with_extension("previous");
+        if !backup.exists() {
+            anyhow::bail!("Collector rollback snapshot is unavailable");
+        }
+        fs::rename(&backup, &self.target)
+            .with_context(|| format!("restoring the Collector rollback snapshot for {version}"))?;
         Ok(())
     }
 }
@@ -541,16 +602,6 @@ impl CollectorOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WatcherStatus {
-    pub enabled: bool,
-    pub degraded: bool,
-    pub last_error: Option<String>,
-    pub hint_pending: bool,
-    pub debounce_until: Option<String>,
-    pub next_reconciliation_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReconciliationReport {
     pub reason: String,
     pub sync_run_id: String,
@@ -575,37 +626,10 @@ pub struct DeliveryReport {
     pub errors: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OutboxDiagnostic {
-    pub batch_id: String,
-    pub status: String,
-    pub retry_class: Option<String>,
-    pub attempts: u32,
-    pub next_attempt_at: String,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CollectorDiagnostics {
-    pub machine_id: String,
-    pub parser_versions: Vec<String>,
-    pub pending_outbox: u64,
-    pub last_reconciliation_at: Option<String>,
-    pub watcher: WatcherStatus,
-    pub credential_configured: bool,
-    pub credential_rotation_pending: bool,
-    pub terminal_outbox: u64,
-    pub outbox_diagnostics: Vec<OutboxDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum CommandOutcome {
-    Refreshed { batch_id: Option<String> },
-    CredentialRotationStaged,
-    Diagnostics(CollectorDiagnostics),
-    UpdateAccepted { version: String, sha256: String },
-    Rejected { reason: String },
-}
+pub type CollectorDiagnostics = CollectorDiagnosticsReceipt;
+pub type CommandOutcome = CollectorCommandResult;
+pub type WatcherStatus = CollectorWatcherReceipt;
+pub type OutboxDiagnostic = CollectorOutboxDiagnosticReceipt;
 
 #[derive(Clone)]
 pub struct Collector {
@@ -730,6 +754,89 @@ impl Collector {
 
     pub fn machine_id(&self) -> &str {
         &self.identity.machine_id
+    }
+
+    /// Record the process generation that owns the current Collector runtime.
+    /// Update receipts are emitted only after a subsequent generation starts,
+    /// so an owner cannot turn an artifact write into restart proof.
+    pub fn mark_runtime_started(&self, now: DateTime<Utc>) -> Result<()> {
+        self.store
+            .set_collector_state("runtime_generation", &format!("runtime-{}", random_hex(16)))?;
+        self.store
+            .set_collector_state("runtime_started_at", &now.to_rfc3339())?;
+        self.store
+            .set_collector_state("restart_requested", "false")?;
+        Ok(())
+    }
+
+    pub fn report_pending_update_receipt<T: CollectorTransport>(
+        &mut self,
+        transport: &mut T,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(update_id) = self.store.collector_state("pending_update_id")? else {
+            return Ok(false);
+        };
+        if update_id.is_empty() {
+            return Ok(false);
+        }
+        let command_id = self
+            .store
+            .collector_state("pending_update_command_id")?
+            .context("pending Collector update command ID is missing")?;
+        let version = self
+            .store
+            .collector_state("pending_update_version")?
+            .context("pending Collector update version is missing")?;
+        let sha256 = self
+            .store
+            .collector_state("pending_update_sha256")?
+            .context("pending Collector update digest is missing")?;
+        let runtime_generation = self
+            .store
+            .collector_state("runtime_generation")?
+            .context("Collector runtime generation is missing")?;
+        let restarted_at = self
+            .store
+            .collector_state("runtime_started_at")?
+            .context("Collector runtime start time is missing")?;
+        let diagnostics = self.diagnostics()?;
+        if diagnostics.watcher.degraded || diagnostics.terminal_outbox > 0 {
+            return Err(anyhow::anyhow!("Collector health proof is not ready"));
+        }
+        let receipt = CollectorUpdateReceipt {
+            update_id,
+            command_id,
+            version,
+            sha256,
+            collector_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: API_V1_PROTOCOL_VERSION,
+            runtime_generation,
+            restarted_at,
+            health_checked_at: now.to_rfc3339(),
+        };
+        let candidates = self.credential_candidates()?;
+        let mut last_error = None;
+        for (credential, pending) in candidates {
+            match transport.report_collector_update_receipt(&credential, &receipt) {
+                Ok(()) => {
+                    self.store.set_collector_state("pending_update_id", "")?;
+                    self.store
+                        .set_collector_state("restart_requested", "false")?;
+                    return Ok(true);
+                }
+                Err(error) if error.class == RetryClass::Unauthorized && pending => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
+        }
+        Err(anyhow::anyhow!(last_error.unwrap_or_else(|| {
+            TransportError::new(
+                RetryClass::Unauthorized,
+                "all Collector credentials rejected",
+            )
+        })))
     }
 
     pub fn project_salt(&self) -> &str {
@@ -1037,6 +1144,7 @@ impl Collector {
                 sync_run: SyncRunInput {
                     sync_run_id: sync_run_id.clone(),
                     collector_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    runtime_generation: self.store.collector_state("runtime_generation")?,
                     started_at: imported_at.clone(),
                     finished_at: imported_at.clone(),
                 },
@@ -1474,6 +1582,18 @@ impl Collector {
         Ok(())
     }
 
+    fn rollback_approved_update(&self, version: &str, expected_sha256: &str) -> Result<()> {
+        if !is_safe_update_version(version) || !is_sha256_hex(expected_sha256) {
+            anyhow::bail!("rollback evidence is invalid");
+        }
+        self.updater.rollback(version, expected_sha256)?;
+        self.store
+            .set_collector_state("rollback_version", version)?;
+        self.store
+            .set_collector_state("rollback_sha256", expected_sha256)?;
+        Ok(())
+    }
+
     fn stage_local_credential_rotation(&self, rotation_id: &str) -> Result<String> {
         if !is_safe_rotation_id(rotation_id) {
             anyhow::bail!("credential rotation ID is invalid");
@@ -1599,15 +1719,26 @@ impl Collector {
                     batch_id: report.batch_id,
                 })
             }
+            OwnerCommand::Repair { .. } => {
+                // Repair deliberately reuses the complete reconciliation path;
+                // it does not create a second SSH or parser state machine.
+                let report = self.reconcile_manual(now)?;
+                Ok(CommandOutcome::Repaired {
+                    batch_id: report.batch_id,
+                })
+            }
             OwnerCommand::RotateCredential { rotation_id, .. } => {
                 self.stage_local_credential_rotation(&rotation_id)?;
                 Ok(CommandOutcome::CredentialRotationStaged)
             }
-            OwnerCommand::Diagnostics { .. } => {
-                Ok(CommandOutcome::Diagnostics(self.diagnostics()?))
-            }
+            OwnerCommand::Diagnostics { .. } => Ok(CommandOutcome::Diagnostics {
+                diagnostics: self.diagnostics()?,
+            }),
             OwnerCommand::ApprovedUpdate {
-                version, sha256, ..
+                update_id,
+                command_id,
+                version,
+                sha256,
             } => {
                 let digest = sha256.trim().to_ascii_lowercase();
                 let Some(approved) = self
@@ -1646,9 +1777,38 @@ impl Collector {
                         reason: "approved update artifact directory is not configured".to_string(),
                     });
                 }
-                Ok(CommandOutcome::UpdateAccepted {
+                self.store
+                    .set_collector_state("pending_update_id", &update_id)?;
+                self.store
+                    .set_collector_state("pending_update_command_id", &command_id)?;
+                self.store
+                    .set_collector_state("pending_update_version", &version)?;
+                self.store
+                    .set_collector_state("pending_update_sha256", &digest)?;
+                self.store
+                    .set_collector_state("restart_requested", "true")?;
+                Ok(CommandOutcome::UpdateApplied {
+                    update_id,
+                    command_id,
                     version,
                     sha256: digest,
+                })
+            }
+            OwnerCommand::RollbackUpdate {
+                update_id,
+                command_id,
+                version,
+                sha256,
+            } => {
+                self.rollback_approved_update(&version, &sha256)?;
+                self.store.set_collector_state("pending_update_id", "")?;
+                self.store
+                    .set_collector_state("restart_requested", "false")?;
+                Ok(CommandOutcome::UpdateRolledBack {
+                    update_id,
+                    command_id,
+                    version,
+                    sha256,
                 })
             }
         }
@@ -1978,7 +2138,13 @@ pub fn run_daemon(paths: &crate::app_paths::AppPaths, config: &Config) -> Result
         }
     });
 
+    runtime.mark_runtime_started(Utc::now())?;
     runtime.reconcile_startup(Utc::now())?;
+    // A restart proof is sent from the new process generation, never from the
+    // command handler that wrote the replacement artifact.
+    if let Ok(mut transport) = CollectorHttpTransport::new(hub_url) {
+        let _ = runtime.report_pending_update_receipt(&mut transport, Utc::now());
+    }
 
     let (watch_tx, watch_rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = match RecommendedWatcher::new(
@@ -2098,6 +2264,15 @@ pub fn run_daemon(paths: &crate::app_paths::AppPaths, config: &Config) -> Result
     let mut next_renewal = Utc::now() + ChronoDuration::seconds(30);
     let result = loop {
         if stop.load(Ordering::SeqCst) {
+            break Ok(());
+        }
+        if runtime
+            .store
+            .collector_state("restart_requested")?
+            .as_deref()
+            == Some("true")
+        {
+            stop.store(true, Ordering::SeqCst);
             break Ok(());
         }
         while let Ok(event) = watch_rx.try_recv() {

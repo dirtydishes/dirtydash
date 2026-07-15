@@ -8,9 +8,22 @@ The fleet deployment path is separate from the historical Docker/Nginx helper be
 [hub]
 allowed_publisher_key_id = "release-key-2026"
 allowed_publisher_fingerprint = "sha256:<64 lowercase hexadecimal characters>"
+# Required by hosted Hub enrollment and fleet-update APIs.
+allowed_publisher_public_key = "<32-byte Ed25519 public key as 64 hexadecimal characters>"
 ```
 
-If either value is absent, deployment fails closed. The manifest and public-key files are release evidence only; replacing either file, or supplying replacement publisher flags, cannot authorize a different publisher.
+If either trust-anchor value is absent, deployment fails closed; hosted enrollment and fleet-update APIs additionally require the pinned public key. The manifest and public-key files are release evidence only; replacing either file, or supplying replacement publisher flags, cannot authorize a different publisher.
+
+Server-owned fleet execution is opt-in and fail-closed. Configure all three fields together; the Hub reads `<version>.artifact` from the administrator-owned directory, atomically replaces the configured Hub target, and requests only the fixed user service manager. The browser can submit a verified plan and request execution/reconciliation, but cannot submit Hub health, publisher verification, or Collector completion evidence:
+
+```toml
+[hub]
+fleet_update_artifact_dir = "/srv/dirtydash/releases"
+fleet_update_target = "/home/me/.local/bin/dirtydash"
+fleet_update_service_manager = "systemd-user" # or "launchd"
+```
+
+The Hub records a durable snapshot before the restart boundary. The replacement Hub records a new runtime generation and version; each Collector acknowledges its deterministic update command and posts its authenticated post-restart receipt before the run can complete. A typed Collector rejection transitions only that node to rolled back and restores its prior desired version; other nodes remain isolated from the failure.
 
 Run the concrete read-only probe first. It resolves the target with `ssh -G`, observes the effective host key, verifies the pinned publisher, probes target facts, and persists a secret-free plan/checkpoint:
 

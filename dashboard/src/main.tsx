@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { MachinesWorkspace } from "./machines";
 import {
   AlertTriangle,
   BadgeDollarSign,
@@ -15,7 +16,8 @@ import {
   Settings,
   ShieldCheck,
   Terminal,
-  Zap
+  Zap,
+  type LucideIcon
 } from "lucide-react";
 import "./styles.css";
 
@@ -98,7 +100,7 @@ type DoctorReport = {
   warnings: string[];
 };
 
-type WorkspaceId = "ledger" | "sources" | "sessions" | "ops";
+type WorkspaceId = "ledger" | "sources" | "sessions" | "machines" | "ops";
 type LedgerPaneId = "daily" | "chart" | "sessions" | "inspector";
 type SortMode = "day" | "cost" | "tokens";
 type ViewMode = "inspect" | "trace" | "compare";
@@ -138,11 +140,12 @@ const workspaces: {
   label: string;
   command: string;
   tabs: string[];
-  icon: React.ComponentType<{ size?: number; "aria-hidden"?: string | boolean }>;
+  icon: LucideIcon;
 }[] = [
   { id: "ledger", label: "Ledger", command: "daily", tabs: ["daily", "sessions", "inspector"], icon: Gauge },
   { id: "sources", label: "Sources", command: "matrix", tabs: ["matrix", "imports", "freshness"], icon: HardDrive },
   { id: "sessions", label: "Sessions", command: "search", tabs: ["search", "provenance", "trace"], icon: Terminal },
+  { id: "machines", label: "Machines", command: "machines", tabs: ["fleet", "enroll", "updates", "history"], icon: Network },
   { id: "ops", label: "Ops", command: "doctor", tabs: ["import", "pricing", "privacy", "settings", "doctor"], icon: Settings }
 ];
 
@@ -157,6 +160,7 @@ function App() {
     ledger: "daily",
     sources: "matrix",
     sessions: "search",
+    machines: "fleet",
     ops: "import"
   });
   const [summary, setSummary] = useState<DashboardSummary>(emptySummary);
@@ -186,11 +190,11 @@ function App() {
       try {
         const [summaryData, sourcesData, sessionsData, pricingData, doctorData] =
           await Promise.all([
-            fetchJson<DashboardSummary>("/api/summary"),
-            fetchJson<SourceSummary[]>("/api/sources"),
-            fetchJson<SessionSummary[]>("/api/sessions"),
-            fetchJson<PricingRecord[]>("/api/pricing"),
-            fetchJson<DoctorReport>("/api/doctor")
+            fetchJson<DashboardSummary>("/api/summary").catch(() => emptySummary),
+            fetchJson<SourceSummary[]>("/api/sources").catch(() => []),
+            fetchJson<SessionSummary[]>("/api/sessions").catch(() => []),
+            fetchJson<PricingRecord[]>("/api/pricing").catch(() => []),
+            fetchJson<DoctorReport>("/api/doctor").catch(() => null)
           ]);
         if (!active) return;
         setSummary(summaryData);
@@ -230,8 +234,10 @@ function App() {
     async function loadDaySessions() {
       setDayLoading(true);
       try {
+        const day = selectedDay;
+        if (!day) return;
         const rows = await fetchJson<SessionSummary[]>(
-          `/api/days/${encodeURIComponent(selectedDay)}/sessions`
+          `/api/days/${encodeURIComponent(day)}/sessions`
         );
         if (active) {
           setDaySessions(rows);
@@ -347,16 +353,15 @@ function App() {
     }
 
     function onKeyDown(event: KeyboardEvent) {
+      if (document.querySelector('[aria-modal="true"]')) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
-      if (event.key === "Tab" && !shortcutsOpen) {
-        event.preventDefault();
-        if (activeWorkspace === "ledger") movePane(event.shiftKey ? -1 : 1);
-        else moveTab(event.shiftKey ? -1 : 1);
-        return;
-      }
+      // Keep native Tab order. Workspace tablists implement roving focus for
+      // arrow/Home/End while Tab remains the user's escape hatch through the
+      // complete administrative surface.
       if (isTypingTarget(event.target)) return;
+      if (event.target instanceof HTMLElement && event.target.closest('[role="tablist"]')) return;
 
-      if (event.key >= "1" && event.key <= "4") {
+      if (event.key >= "1" && event.key <= String(workspaces.length)) {
         event.preventDefault();
         const target = workspaces[Number(event.key) - 1];
         if (target) setActiveWorkspace(target.id);
@@ -490,7 +495,7 @@ function App() {
         </div>
       </aside>
 
-      <section className="dashboard">
+      <section className="dashboard" aria-busy={loading}>
         <header className="command-bar">
           <div className="command-line" aria-label="Command context">
             <span className="prompt">:</span>
@@ -530,6 +535,7 @@ function App() {
             </div>
           </div>
           <Tabs
+            workspaceId={activeWorkspace}
             tabs={activeConfig.tabs}
             activeTab={activeTab}
             onSelect={(tab) =>
@@ -541,6 +547,14 @@ function App() {
         {loading ? <Skeleton /> : null}
         {error ? <Notice tone="danger" text={error} /> : null}
         {!loading && !error ? (
+          <section
+            id={`workspace-panel-${activeWorkspace}-${activeTab}`}
+            role="tabpanel"
+            tabIndex={0}
+            aria-labelledby={`workspace-tab-${activeWorkspace}-${activeTab}`}
+            aria-busy={loading}
+            className="workspace-panel"
+          >
           <Workspace
             activeWorkspace={activeWorkspace}
             activeTab={activeTab}
@@ -564,6 +578,7 @@ function App() {
             pricing={pricing}
             doctor={doctor}
           />
+          </section>
         ) : null}
       </section>
 
@@ -597,6 +612,7 @@ function Workspace(props: {
 }) {
   if (props.activeWorkspace === "sources") return <SourcesWorkspace {...props} />;
   if (props.activeWorkspace === "sessions") return <SessionsWorkspace {...props} />;
+  if (props.activeWorkspace === "machines") return <MachinesWorkspace activeTab={props.activeTab} />;
   if (props.activeWorkspace === "ops") return <OpsWorkspace {...props} />;
   return <LedgerWorkspace {...props} />;
 }
@@ -1425,32 +1441,68 @@ function DoctorOps({ doctor }: { doctor: DoctorReport | null }) {
 }
 
 function Tabs({
+  workspaceId,
   tabs,
   activeTab,
   onSelect
 }: {
+  workspaceId: WorkspaceId;
   tabs: string[];
   activeTab: string;
   onSelect: (tab: string) => void;
 }) {
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const activeIndex = Math.max(0, tabs.indexOf(activeTab));
+
+  useEffect(() => {
+    tabRefs.current[activeIndex]?.focus({ preventScroll: true });
+  }, [activeIndex]);
+
+  function moveTab(index: number) {
+    const next = (index + tabs.length) % tabs.length;
+    const tab = tabs[next];
+    if (tab) onSelect(tab);
+  }
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      event.preventDefault();
+      moveTab(activeIndex + 1);
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveTab(activeIndex - 1);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      moveTab(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      moveTab(tabs.length - 1);
+    }
+  }
+
   return (
     <div className="tabs-wrap">
-      <div className="tabs" role="tablist" aria-label="Workspace views" title="Cycle views with Tab">
-        {tabs.map((tab) => (
+      <div className="tabs" role="tablist" aria-label="Workspace views" title="Arrow keys move views; Tab leaves the tablist">
+        {tabs.map((tab, index) => (
           <button
             key={tab}
+            id={`workspace-tab-${workspaceId}-${tab}`}
+            ref={(element: HTMLButtonElement | null) => { tabRefs.current[index] = element; }}
             type="button"
             role="tab"
+            aria-controls={activeTab === tab ? `workspace-panel-${workspaceId}-${tab}` : undefined}
             aria-selected={activeTab === tab}
+            tabIndex={activeTab === tab ? 0 : -1}
             className={activeTab === tab ? "active" : ""}
+            onKeyDown={onKeyDown}
             onClick={() => onSelect(tab)}
-            title={`${tab}. Shortcut: Tab`}
+            title={`${tab}. Arrow keys move views`}
           >
             {tab}
           </button>
         ))}
       </div>
-      <span className="tab-hint"><kbd>Tab</kbd> cycles views</span>
+      <span className="tab-hint"><kbd>←</kbd><kbd>→</kbd> move · <kbd>Tab</kbd> continue</span>
     </div>
   );
 }
@@ -1481,7 +1533,7 @@ function Status({ value, tone }: { value: string; tone: Tone }) {
   return <span className={`status ${tone}`}>{value}</span>;
 }
 
-function Notice({ text, tone }: { text: string; tone: "good" | "warn" | "danger" }) {
+function Notice({ text, tone }: { text: string; tone: "good" | "warn" | "danger"; key?: React.Key }) {
   return <div className={`notice ${tone}`}>{text}</div>;
 }
 
@@ -1538,10 +1590,12 @@ function DirtydashMark() {
 }
 
 function ShortcutOverlay({ onClose }: { onClose: () => void }) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
   const rows = [
-    ["1-4", "switch workspace"],
+    ["1-5", "switch workspace"],
     ["/", "focus search"],
-    ["Tab", "select next pane"],
+    ["Tab", "native focus order"],
     ["↑/↓", "move row or scroll pane"],
     ["←/→", "move day or scroll pane"],
     ["PgUp/PgDn", "scroll active pane"],
@@ -1552,9 +1606,31 @@ function ShortcutOverlay({ onClose }: { onClose: () => void }) {
     ["?", "shortcuts"],
     ["Esc", "clear or close"]
   ];
+
+  useEffect(() => {
+    previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        closeRef.current?.focus();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      previousFocus.current?.focus();
+    };
+  }, [onClose]);
+
   return (
     <div className="overlay" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
-      <div className="shortcut-pane">
+      <div className="shortcut-pane" tabIndex={-1}>
         <PaneTitle title="shortcuts" meta="keyboard-first" />
         <dl>
           {rows.map(([key, value]) => (
@@ -1564,7 +1640,7 @@ function ShortcutOverlay({ onClose }: { onClose: () => void }) {
             </div>
           ))}
         </dl>
-        <button type="button" onClick={onClose}>close</button>
+        <button ref={closeRef} type="button" onClick={onClose}>close</button>
       </div>
     </div>
   );
@@ -1572,7 +1648,7 @@ function ShortcutOverlay({ onClose }: { onClose: () => void }) {
 
 function Skeleton() {
   return (
-    <div className="ledger-grid">
+    <div className="ledger-grid" role="status" aria-live="polite" aria-label="Loading dashboard">
       <div className="skeleton pane" />
       <div className="skeleton pane" />
       <div className="skeleton pane" />
@@ -1675,7 +1751,7 @@ function sessionLabel(session: SessionSummary) {
 function isTypingTarget(target: EventTarget | null) {
   if (!(target instanceof HTMLElement)) return false;
   const tag = target.tagName.toLowerCase();
-  return tag === "input" || tag === "textarea" || target.isContentEditable;
+  return tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
 }
 
 function compact(value: number) {

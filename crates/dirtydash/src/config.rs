@@ -45,6 +45,19 @@ pub struct HubConfig {
     pub allowed_publisher_key_id: Option<String>,
     #[serde(default)]
     pub allowed_publisher_fingerprint: Option<String>,
+    /// Hex-encoded Ed25519 publisher key used by hosted enrollment and fleet updates.
+    /// It is public trust material, never a signing secret.
+    #[serde(default)]
+    pub allowed_publisher_public_key: Option<String>,
+    /// Local, administrator-owned signed release bytes used by the server-side
+    /// fleet executor. URLs and shell commands are intentionally not config.
+    #[serde(default)]
+    pub fleet_update_artifact_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub fleet_update_target: Option<PathBuf>,
+    /// Fixed service manager used for the server-owned Hub restart proof.
+    #[serde(default)]
+    pub fleet_update_service_manager: Option<String>,
     /// One-time setup secret for bootstrap when the local setup route is not available.
     ///
     /// This value is loaded from [`SecretStore`].  It is deliberately skipped
@@ -79,8 +92,11 @@ impl HubConfig {
         if let Some(proxy) = &self.trusted_proxy {
             proxy.validate()?;
         }
-        if self.allowed_publisher_key_id.is_some() != self.allowed_publisher_fingerprint.is_some() {
-            bail!("publisher allowlist requires both key ID and fingerprint");
+        if self.allowed_publisher_key_id.is_some() != self.allowed_publisher_fingerprint.is_some()
+            || (self.allowed_publisher_public_key.is_some()
+                && self.allowed_publisher_key_id.is_none())
+        {
+            bail!("publisher allowlist requires a key ID and fingerprint; public key is required for hosted signed operations");
         }
         if self
             .allowed_publisher_key_id
@@ -92,6 +108,37 @@ impl HubConfig {
                 .is_some_and(|value| value.trim().is_empty())
         {
             bail!("publisher allowlist values cannot be empty");
+        }
+        let fleet_runtime_fields = [
+            self.fleet_update_artifact_dir.is_some(),
+            self.fleet_update_target.is_some(),
+            self.fleet_update_service_manager.is_some(),
+        ];
+        let configured_fleet_runtime_fields = fleet_runtime_fields
+            .iter()
+            .filter(|present| **present)
+            .count();
+        if configured_fleet_runtime_fields != 0 && configured_fleet_runtime_fields != 3 {
+            bail!("fleet update execution requires an artifact directory, update target, and service manager");
+        }
+        if let Some(manager) = &self.fleet_update_service_manager {
+            if !matches!(manager.as_str(), "systemd-user" | "launchd") {
+                bail!("fleet_update_service_manager must be systemd-user or launchd");
+            }
+        }
+        if let Some(public_key) = &self.allowed_publisher_public_key {
+            let bytes =
+                hex::decode(public_key).context("publisher public key must be hexadecimal")?;
+            let key_id = self
+                .allowed_publisher_key_id
+                .as_deref()
+                .context("publisher public key requires a key ID")?;
+            let fingerprint = self
+                .allowed_publisher_fingerprint
+                .as_deref()
+                .context("publisher public key requires a fingerprint")?;
+            crate::deployment::PublisherTrustPolicy::new(key_id, fingerprint, &bytes)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         Ok(())
     }
@@ -183,6 +230,16 @@ impl fmt::Debug for HubConfig {
             .field(
                 "allowed_publisher_fingerprint",
                 &self.allowed_publisher_fingerprint,
+            )
+            .field(
+                "allowed_publisher_public_key",
+                &self.allowed_publisher_public_key,
+            )
+            .field("fleet_update_artifact_dir", &self.fleet_update_artifact_dir)
+            .field("fleet_update_target", &self.fleet_update_target)
+            .field(
+                "fleet_update_service_manager",
+                &self.fleet_update_service_manager,
             )
             .field(
                 "bootstrap_setup_token",

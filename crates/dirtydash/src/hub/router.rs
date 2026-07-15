@@ -1,12 +1,28 @@
 use super::*;
 
+use axum::body::Body;
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
-use axum::extract::{ConnectInfo, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
+use axum::http::{
+    header, HeaderMap, HeaderName, HeaderValue, Response as HttpResponse, StatusCode, Uri,
+};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use include_dir::{include_dir, Dir};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+
+use crate::deployment::SignedArtifactManifest;
+use crate::enrollment::{
+    AuthMethod, ConnectionSpec, EnrollmentDraft, EnrollmentSecrets, EnrollmentStore,
+    EnrollmentWorkflow, HostTrustOutcome, KnownHostStore, PersistedAuthMethod,
+    SshEnrollmentBackend,
+};
+use base64::Engine;
+use std::path::PathBuf;
+
+static DASHBOARD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../dashboard/dist");
 
 /// Backwards-compatible router builder for composition and in-process tests.
 ///
@@ -30,10 +46,16 @@ pub fn build_router_with_config_and_connect_info(
 }
 
 pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) -> Router {
+    let db_path = repo.db_path();
+    let root = db_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/admin/bootstrap", post(admin_bootstrap))
         .route("/api/v1/admin/session", get(admin_session))
+        .route("/api/v1/admin/session/csrf", get(admin_csrf))
         .route("/api/v1/admin/session/login", post(admin_login))
         .route(
             "/api/v1/admin/session/tailscale",
@@ -52,10 +74,115 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             "/api/v1/admin/collector-commands",
             post(admin_issue_collector_command),
         )
+        .route("/api/v1/admin/machines", get(admin_list_machines))
+        .route("/api/v1/admin/machines/:machine_id", get(admin_get_machine))
+        .route(
+            "/api/v1/admin/machines/:machine_id/refresh",
+            post(admin_refresh_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/repair",
+            post(admin_repair_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/diagnostics",
+            post(admin_diagnostics_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/rotate",
+            post(admin_rotate_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/credentials/rotate",
+            post(admin_rotate_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/archive",
+            post(admin_archive_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/remove",
+            post(admin_remove_machine),
+        )
+        .route(
+            "/api/v1/admin/machines/:machine_id/delete",
+            post(admin_delete_machine),
+        )
+        .route("/api/v1/admin/updates", get(admin_list_updates))
+        .route("/api/v1/admin/updates/:update_id", get(admin_get_update))
+        .route("/api/v1/admin/updates/plan", post(admin_plan_update))
+        .route(
+            "/api/v1/admin/updates/:update_id/execute",
+            post(admin_execute_update),
+        )
+        .route(
+            "/api/v1/admin/updates/:update_id/reconcile",
+            post(admin_reconcile_update),
+        )
+        .route(
+            "/api/v1/admin/enrollment",
+            get(admin_list_enrollment).post(admin_create_enrollment),
+        )
+        .route(
+            "/api/v1/admin/enrollments",
+            get(admin_list_enrollment).post(admin_create_enrollment),
+        )
+        .route(
+            "/api/v1/admin/enrollment/:enrollment_id",
+            get(admin_get_enrollment),
+        )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id",
+            get(admin_get_enrollment),
+        )
+        .route(
+            "/api/v1/admin/enrollment/:enrollment_id/trust",
+            post(admin_enrollment_trust),
+        )
+        .route(
+            "/api/v1/admin/enrollment/:enrollment_id/probe",
+            post(admin_enrollment_probe),
+        )
+        .route(
+            "/api/v1/admin/enrollment/:enrollment_id/review",
+            post(admin_enrollment_review),
+        )
+        .route(
+            "/api/v1/admin/enrollment/:enrollment_id/execute",
+            post(admin_enrollment_execute),
+        )
+        .route(
+            "/api/v1/admin/enrollment/:enrollment_id/cleanup",
+            post(admin_enrollment_cleanup),
+        )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id/trust",
+            post(admin_enrollment_trust),
+        )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id/probe",
+            post(admin_enrollment_probe),
+        )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id/review",
+            post(admin_enrollment_review),
+        )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id/execute",
+            post(admin_enrollment_execute),
+        )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id/cleanup",
+            post(admin_enrollment_cleanup),
+        )
         .route("/api/v1/collector/commands", get(collector_poll_command))
         .route(
             "/api/v1/collector/commands/ack",
             post(collector_ack_command),
+        )
+        .route(
+            "/api/v1/collector/updates/receipt",
+            post(collector_update_receipt),
         )
         .route(
             "/api/v1/collector/credentials/rotation/activate",
@@ -66,7 +193,13 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             post(collector_prove_credential_rotation),
         )
         .route("/api/v1/ingest/batches", post(collector_ingest_batch))
-        .with_state(HubState { repo, config })
+        .fallback(static_asset)
+        .with_state(HubState {
+            repo,
+            config,
+            enrollment_root: root.join("enrollments"),
+            known_hosts_path: root.join("known_hosts"),
+        })
 }
 
 async fn admin_bootstrap(
@@ -153,6 +286,20 @@ async fn admin_session(
     }))
 }
 
+async fn admin_csrf(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, HubError> {
+    let session_id = owner_session_cookie(&headers).ok_or_else(|| {
+        HubError::unauthorized(
+            "owner-session-required",
+            "a valid owner session is required",
+        )
+    })?;
+    let token = state.repo.issue_owner_csrf(&session_id)?;
+    Ok(Json(serde_json::json!({ "csrf_token": token })))
+}
+
 async fn admin_logout(
     State(state): State<HubState>,
     headers: HeaderMap,
@@ -195,6 +342,561 @@ async fn admin_issue_collector_command(
     Ok(Json(state.repo.issue_collector_command(request)?))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineActionRequest {
+    pub expected_state_revision: i64,
+}
+
+async fn admin_list_machines(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MachineRecord>>, HubError> {
+    let _session = require_owner_session(&state, &headers, false)?;
+    Ok(Json(state.repo.list_machines()?))
+}
+
+async fn admin_get_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+) -> Result<Json<MachineRecord>, HubError> {
+    let _session = require_owner_session(&state, &headers, false)?;
+    Ok(Json(state.repo.machine(&machine_id)?))
+}
+
+async fn admin_machine_action(
+    state: HubState,
+    headers: HeaderMap,
+    machine_id: String,
+    request: MachineActionRequest,
+    action: &str,
+) -> Result<Json<MachineActionResponse>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.queue_machine_action(
+        &machine_id,
+        action,
+        request.expected_state_revision,
+    )?))
+}
+
+async fn admin_refresh_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<MachineActionRequest>,
+) -> Result<Json<MachineActionResponse>, HubError> {
+    admin_machine_action(state, headers, machine_id, request, "refresh").await
+}
+
+async fn admin_repair_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<MachineActionRequest>,
+) -> Result<Json<MachineActionResponse>, HubError> {
+    admin_machine_action(state, headers, machine_id, request, "repair").await
+}
+
+async fn admin_diagnostics_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<MachineActionRequest>,
+) -> Result<Json<MachineActionResponse>, HubError> {
+    admin_machine_action(state, headers, machine_id, request, "diagnostics").await
+}
+
+async fn admin_rotate_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<MachineActionRequest>,
+) -> Result<Json<MachineActionResponse>, HubError> {
+    admin_machine_action(state, headers, machine_id, request, "rotate").await
+}
+
+async fn admin_archive_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<MachineLifecycleRequest>,
+) -> Result<Json<MachineRecord>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.archive_machine(&machine_id, request)?))
+}
+
+async fn admin_remove_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<MachineLifecycleRequest>,
+) -> Result<Json<MachineRecord>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.remove_machine(&machine_id, request)?))
+}
+
+async fn admin_delete_machine(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(machine_id): AxumPath<String>,
+    Json(request): Json<PermanentDeleteMachineRequest>,
+) -> Result<StatusCode, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    state.repo.permanent_delete_machine(&machine_id, request)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_list_updates(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<FleetUpdateRun>>, HubError> {
+    let _session = require_owner_session(&state, &headers, false)?;
+    Ok(Json(state.repo.list_fleet_updates()?))
+}
+
+async fn admin_get_update(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(update_id): AxumPath<String>,
+) -> Result<Json<FleetUpdateRun>, HubError> {
+    let _session = require_owner_session(&state, &headers, false)?;
+    Ok(Json(state.repo.fleet_update(&update_id)?))
+}
+
+fn require_signed_update_policy(
+    config: &HubRouterConfig,
+    request: &FleetUpdateRequest,
+) -> Result<(), HubError> {
+    let Some(policy) = &config.publisher_policy else {
+        return Err(HubError::forbidden(
+            "publisher-policy-required",
+            "signed fleet updates require a configured publisher trust policy",
+        ));
+    };
+    if policy.key_id() != request.publisher_key_id
+        || !policy
+            .fingerprint_value()
+            .eq_ignore_ascii_case(&request.publisher_fingerprint)
+    {
+        return Err(HubError::forbidden(
+            "signed-update-untrusted",
+            "signed update evidence is not anchored to the configured publisher",
+        ));
+    }
+    let signed = request.signed_manifest.as_ref().ok_or_else(|| {
+        HubError::unprocessable(
+            "signed-manifest-required",
+            "fleet updates require the complete signed release manifest",
+        )
+    })?;
+    let verified = policy.verify(signed).map_err(|_| {
+        HubError::unprocessable(
+            "signed-manifest-invalid",
+            "release manifest signature verification failed",
+        )
+    })?;
+    if signed.manifest.release != request.version
+        || verified.manifest_sha256() != request.manifest_sha256
+        || signed.key_id != request.publisher_key_id
+        || !signed.manifest.artifacts.iter().any(|artifact| {
+            artifact
+                .sha256
+                .eq_ignore_ascii_case(&request.artifact_sha256)
+        })
+    {
+        return Err(HubError::unprocessable(
+            "signed-update-mismatch",
+            "signed release evidence does not match the requested update",
+        ));
+    }
+    Ok(())
+}
+
+async fn admin_plan_update(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<FleetUpdateRequest>,
+) -> Result<Json<FleetUpdatePlanResponse>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    require_signed_update_policy(&state.config, &request)?;
+    Ok(Json(state.repo.create_fleet_update(request)?))
+}
+
+async fn admin_execute_update(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(update_id): AxumPath<String>,
+) -> Result<Json<FleetUpdateRun>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.execute_server_fleet_update(
+        &update_id,
+        state.config.fleet_update_artifact_dir.as_ref(),
+        state.config.fleet_update_target.as_ref(),
+        state.config.fleet_update_service_manager.as_deref(),
+    )?))
+}
+
+async fn admin_reconcile_update(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(update_id): AxumPath<String>,
+) -> Result<Json<FleetUpdateRun>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.reconcile_server_fleet_update(
+        &update_id,
+        state.config.fleet_update_target.as_ref(),
+    )?))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum HostedConnection {
+    Alias {
+        alias: String,
+    },
+    Manual {
+        user: String,
+        host: String,
+        port: u16,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+enum HostedAuth {
+    Password,
+    KeyPath { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateEnrollmentRequest {
+    pub id: String,
+    pub machine_id: String,
+    pub display_name: String,
+    pub connection: HostedConnection,
+    pub auth: HostedAuth,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct HostedSecrets {
+    password: Option<String>,
+    key_passphrase: Option<String>,
+    sudo_password: Option<String>,
+}
+
+impl HostedSecrets {
+    fn materialize(&self) -> EnrollmentSecrets {
+        let mut secrets = self
+            .password
+            .as_deref()
+            .map(EnrollmentSecrets::password)
+            .unwrap_or_else(EnrollmentSecrets::none);
+        if let Some(passphrase) = &self.key_passphrase {
+            secrets = secrets.with_key_passphrase(passphrase);
+        }
+        if let Some(password) = &self.sudo_password {
+            secrets = secrets.with_sudo_password(password);
+        }
+        secrets
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentTrustRequest {
+    #[serde(flatten)]
+    secrets: HostedSecrets,
+    confirm_fingerprint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentStepRequest {
+    #[serde(flatten)]
+    secrets: HostedSecrets,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollmentArtifactRequest {
+    signed_manifest: SignedArtifactManifest,
+    artifact_base64: String,
+    #[serde(default)]
+    database_seed_base64: Option<String>,
+}
+
+fn enrollment_store(state: &HubState) -> EnrollmentStore {
+    EnrollmentStore::new(state.enrollment_root.clone())
+}
+
+fn enrollment_auth(draft: &EnrollmentDraft) -> Result<AuthMethod, HubError> {
+    match &draft.auth_method {
+        PersistedAuthMethod::Password => Ok(AuthMethod::password()),
+        PersistedAuthMethod::KeyPath { path } => AuthMethod::key_path(path.clone())
+            .map_err(|error| HubError::unprocessable("invalid-enrollment-auth", error.to_string())),
+    }
+}
+
+fn enrollment_workflow(
+    state: &HubState,
+    draft: &EnrollmentDraft,
+) -> Result<EnrollmentWorkflow<SshEnrollmentBackend>, HubError> {
+    let Some(policy) = state.config.publisher_policy.clone() else {
+        return Err(HubError::forbidden(
+            "publisher-policy-required",
+            "hosted enrollment requires the Hub publisher trust policy",
+        ));
+    };
+    let backend = SshEnrollmentBackend::new(
+        draft.connection.display_endpoint(),
+        state.known_hosts_path.clone(),
+        policy.clone(),
+    )
+    .map_err(|error| HubError::unprocessable("invalid-enrollment-target", error.to_string()))?;
+    Ok(EnrollmentWorkflow::new(
+        enrollment_store(state),
+        KnownHostStore::new(state.known_hosts_path.clone()),
+        backend,
+        policy,
+    ))
+}
+
+fn enrollment_step_error(error: anyhow::Error) -> HubError {
+    HubError::unprocessable("enrollment-step-failed", error.to_string())
+}
+
+fn verified_enrollment_artifact(
+    state: &HubState,
+    draft: &EnrollmentDraft,
+    request: &EnrollmentArtifactRequest,
+) -> Result<(crate::deployment::VerifiedArtifact, Option<Vec<u8>>), HubError> {
+    let Some(policy) = state.config.publisher_policy.as_ref() else {
+        return Err(HubError::forbidden(
+            "publisher-policy-required",
+            "hosted enrollment requires the Hub publisher trust policy",
+        ));
+    };
+    let manifest = policy
+        .verify(&request.signed_manifest)
+        .map_err(|error| HubError::unprocessable("invalid-signed-artifact", error.to_string()))?;
+    let facts = draft.facts.as_ref().ok_or_else(|| {
+        HubError::conflict(
+            "enrollment-order",
+            "probe must complete before artifact review",
+        )
+    })?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&request.artifact_base64)
+        .map_err(|_| HubError::unprocessable("invalid-artifact", "artifact_base64 is invalid"))?;
+    let artifact = manifest
+        .verify_artifact(facts.platform, bytes)
+        .map_err(|error| HubError::unprocessable("invalid-signed-artifact", error.to_string()))?;
+    let seed = request
+        .database_seed_base64
+        .as_deref()
+        .map(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| {
+                    HubError::unprocessable(
+                        "invalid-database-seed",
+                        "database_seed_base64 is invalid",
+                    )
+                })
+        })
+        .transpose()?;
+    Ok((artifact, seed))
+}
+
+async fn admin_list_enrollment(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EnrollmentDraft>>, HubError> {
+    let _session = require_owner_session(&state, &headers, false)?;
+    enrollment_store(&state)
+        .list()
+        .map(Json)
+        .map_err(|error| HubError::internal(error.to_string()))
+}
+
+async fn admin_create_enrollment(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateEnrollmentRequest>,
+) -> Result<Json<EnrollmentDraft>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    validate_identifier(&request.machine_id, "machine_id")?;
+    validate_non_empty(&request.display_name, "display_name")?;
+    let connection = match request.connection {
+        HostedConnection::Alias { alias } => ConnectionSpec::alias(alias),
+        HostedConnection::Manual { user, host, port } => ConnectionSpec::manual(user, host, port),
+    }
+    .map_err(|error| HubError::unprocessable("invalid-enrollment-target", error.to_string()))?;
+    let auth = match request.auth {
+        HostedAuth::Password => AuthMethod::password(),
+        HostedAuth::KeyPath { path } => AuthMethod::key_path(path).map_err(|error| {
+            HubError::unprocessable("invalid-enrollment-auth", error.to_string())
+        })?,
+    };
+    let mut draft = EnrollmentDraft::new(request.id, connection, auth)
+        .map_err(|error| HubError::unprocessable("invalid-enrollment-id", error.to_string()))?;
+    draft.machine_id = Some(request.machine_id);
+    draft.display_name = Some(request.display_name);
+    enrollment_store(&state)
+        .save(&draft)
+        .map_err(|error| HubError::internal(error.to_string()))?;
+    Ok(Json(draft))
+}
+
+async fn admin_get_enrollment(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+) -> Result<Json<EnrollmentDraft>, HubError> {
+    let _session = require_owner_session(&state, &headers, false)?;
+    enrollment_store(&state)
+        .load(&enrollment_id)
+        .map(Json)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))
+}
+
+async fn admin_enrollment_trust(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+    Json(request): Json<EnrollmentTrustRequest>,
+) -> Result<Json<HostTrustOutcome>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    let draft = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
+    let auth = enrollment_auth(&draft)?;
+    let mut workflow = enrollment_workflow(&state, &draft)?;
+    let secrets = request.secrets.materialize();
+    workflow
+        .trust_and_auth(
+            &enrollment_id,
+            &auth,
+            &secrets,
+            request.confirm_fingerprint.as_deref(),
+        )
+        .map(Json)
+        .map_err(enrollment_step_error)
+}
+
+async fn admin_enrollment_probe(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+    Json(request): Json<EnrollmentStepRequest>,
+) -> Result<Json<crate::deployment::DeploymentPlan>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    let draft = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
+    let auth = enrollment_auth(&draft)?;
+    let mut workflow = enrollment_workflow(&state, &draft)?;
+    let secrets = request.secrets.materialize();
+    workflow
+        .probe_and_plan(&enrollment_id, &auth, &secrets)
+        .map(Json)
+        .map_err(enrollment_step_error)
+}
+
+async fn admin_enrollment_review(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+    Json(request): Json<EnrollmentArtifactRequest>,
+) -> Result<Json<EnrollmentDraft>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    let draft = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
+    let plan = draft.plan.clone().ok_or_else(|| {
+        HubError::conflict("enrollment-order", "probe must complete before review")
+    })?;
+    let (artifact, seed) = verified_enrollment_artifact(&state, &draft, &request)?;
+    let mut workflow = enrollment_workflow(&state, &draft)?;
+    workflow
+        .review_with_artifact(&enrollment_id, &plan, &artifact, seed.as_deref())
+        .map_err(enrollment_step_error)?;
+    enrollment_store(&state)
+        .load(&enrollment_id)
+        .map(Json)
+        .map_err(|error| HubError::internal(error.to_string()))
+}
+
+async fn admin_enrollment_cleanup(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+    Json(request): Json<EnrollmentStepRequest>,
+) -> Result<Json<EnrollmentDraft>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    let draft = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
+    let mut workflow = enrollment_workflow(&state, &draft)?;
+    workflow
+        .retry_cleanup(&enrollment_id, &request.secrets.materialize())
+        .map_err(enrollment_step_error)?;
+    enrollment_store(&state)
+        .load(&enrollment_id)
+        .map(Json)
+        .map_err(|error| HubError::internal(error.to_string()))
+}
+
+async fn admin_enrollment_execute(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+    Json(request): Json<HostedExecuteEnrollmentRequest>,
+) -> Result<Json<EnrollmentDraft>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    let draft = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
+    let plan = draft.plan.clone().ok_or_else(|| {
+        HubError::conflict("enrollment-order", "review must complete before execute")
+    })?;
+    let (artifact, seed) = verified_enrollment_artifact(&state, &draft, &request.artifact)?;
+    let listener = plan.listener().clone();
+    let mut workflow = enrollment_workflow(&state, &draft)?;
+    let secrets = request.secrets.materialize();
+    workflow
+        .execute(
+            &enrollment_id,
+            &plan,
+            &artifact,
+            seed.as_deref(),
+            &listener,
+            &secrets,
+        )
+        .map_err(enrollment_step_error)?;
+    let completed = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::internal(error.to_string()))?;
+    if let (Some(machine_id), Some(display_name)) = (
+        completed.machine_id.as_deref(),
+        completed.display_name.as_deref(),
+    ) {
+        state.repo.ensure_machine(machine_id, display_name)?;
+    }
+    Ok(Json(completed))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostedExecuteEnrollmentRequest {
+    artifact: EnrollmentArtifactRequest,
+    #[serde(flatten)]
+    secrets: HostedSecrets,
+}
+
 async fn collector_poll_command(
     State(state): State<HubState>,
     headers: HeaderMap,
@@ -227,6 +929,17 @@ async fn collector_ack_command(
     let auth = collector_auth(&state.repo, &headers)?;
     state.repo.acknowledge_collector_command(&auth, request)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn collector_update_receipt(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorUpdateReceiptRequest>,
+) -> Result<Json<FleetUpdateRun>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    Ok(Json(
+        state.repo.record_collector_update_receipt(&auth, request)?,
+    ))
 }
 
 async fn collector_activate_credential_rotation(
@@ -267,6 +980,32 @@ async fn collector_ingest_batch(
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok", "service": "dirtydash-hub"}))
+}
+
+async fn static_asset(uri: Uri) -> HttpResponse<Body> {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let file = DASHBOARD_DIR
+        .get_file(path)
+        .or_else(|| DASHBOARD_DIR.get_file("index.html"));
+    match file {
+        Some(file) => {
+            let mime = mime_guess::from_path(file.path()).first_or_octet_stream();
+            HttpResponse::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_str(mime.as_ref())
+                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+                )
+                .body(Body::from(file.contents().to_vec()))
+                .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
+        }
+        None => HttpResponse::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("not found"))
+            .unwrap_or_else(|_| HttpResponse::new(Body::empty())),
+    }
 }
 
 fn bootstrap_allowed(
@@ -395,12 +1134,20 @@ fn trusted_tailscale_identity(
     match config.trust_mode {
         ListenerTrustMode::Public | ListenerTrustMode::LoopbackHttp => Ok(None),
         ListenerTrustMode::PrivateTailscale => {
-            // Production Hub sockets are loopback-only in private mode; the
-            // Tailscale Serve process is the transport-authenticated peer.
-            // Keep a missing peer usable for the in-process router seam, but
-            // never accept a forged header from a concrete non-loopback peer.
-            if peer.is_some_and(|peer| !peer.ip().is_loopback()) {
-                return Ok(None);
+            // Private mode is a transport-authenticated boundary.  A router
+            // without ConnectInfo is only an in-process composition seam and
+            // must never become a production identity-injection path.
+            let Some(peer) = peer else {
+                return Err(HubError::unauthorized(
+                    "trusted-tailscale-peer-required",
+                    "private Tailscale identity requires transport connection information",
+                ));
+            };
+            if !peer.ip().is_loopback() {
+                return Err(HubError::unauthorized(
+                    "trusted-tailscale-peer-untrusted",
+                    "private Tailscale requests must arrive through the loopback Serve boundary",
+                ));
             }
             let Some(login) = exact_header_value(headers, TAILSCALE_USER_LOGIN)? else {
                 return Ok(None);

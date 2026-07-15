@@ -184,6 +184,25 @@ impl HubRepository {
         Ok(())
     }
 
+    pub(crate) fn issue_owner_csrf(&self, session_id: &str) -> Result<String, HubError> {
+        let session = self.authenticate_owner_session(session_id)?;
+        let token = random_token(24);
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        let changed = conn
+            .execute(
+                "UPDATE owner_sessions SET csrf_token_hash = ?2, last_seen_at = ?3 WHERE session_id = ?1 AND revoked_at IS NULL",
+                params![session.session_id, sha256_hex(&token), now_utc()],
+            )
+            .map_err(HubError::internal)?;
+        if changed == 0 {
+            return Err(HubError::unauthorized(
+                "owner-session-required",
+                "a valid owner session is required",
+            ));
+        }
+        Ok(token)
+    }
+
     pub(crate) fn logout_owner(&self, session_id: &str) -> Result<(), HubError> {
         let conn = self.db.connection().map_err(HubError::internal)?;
         conn.execute(

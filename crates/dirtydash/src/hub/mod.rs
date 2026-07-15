@@ -14,6 +14,7 @@ pub use crate::pricing::PricingMode;
 
 mod auth;
 mod errors;
+mod fleet;
 mod ingestion;
 mod protocol;
 mod repository;
@@ -21,6 +22,14 @@ mod router;
 #[cfg(test)]
 mod tests;
 
+pub use fleet::{
+    derive_machine_health, CollectorCompatibility, FleetHubHealthRequest, FleetUpdateCoordinator,
+    FleetUpdateEvidence, FleetUpdateExecutor, FleetUpdateNodeCompletion, FleetUpdateNodeResult,
+    FleetUpdatePlanResponse, FleetUpdateReport, FleetUpdateRequest, FleetUpdateRequestNode,
+    FleetUpdateRun, FleetUpdateSnapshotResponse, MachineActionResponse, MachineHealth,
+    MachineHealthInput, MachineLifecycle, MachineLifecycleRequest, MachineRecord, MachineStatus,
+    PermanentDeleteMachineRequest, ProtocolCompatibility,
+};
 pub use router::{
     build_router, build_router_with_config, build_router_with_config_and_connect_info,
 };
@@ -39,8 +48,11 @@ pub fn serve(
     runtime.block_on(async move {
         let db = Database::open(&db_path)?;
         db.migrate()?;
-        let repository = HubRepository::new(db);
         hub_config.validate()?;
+        let repository = HubRepository::new(db);
+        repository
+            .mark_hub_runtime_started(env!("CARGO_PKG_VERSION"))
+            .map_err(|_| anyhow::anyhow!("recording Hub runtime startup"))?;
         let listener_plan = &hub_config.listener;
         if trust_mode == ListenerTrustMode::PrivateTailscale {
             listener_plan.validate_bind_host(&host)?;
@@ -73,9 +85,8 @@ pub(crate) use errors::{
 };
 pub(crate) use ingestion::upsert_usage_event_tx;
 pub(crate) use protocol::{
-    canonical_event_identity, validate_ack_result_has_no_secret, validate_command_has_no_secret,
-    validate_identifier, validate_ingest_batch, validate_non_empty, validate_tailscale_identity,
-    validate_time_zone,
+    canonical_event_identity, validate_command_has_no_secret, validate_identifier,
+    validate_ingest_batch, validate_non_empty, validate_tailscale_identity, validate_time_zone,
 };
 
 const OWNER_SESSION_COOKIE: &str = "dirtydash_owner_session";
@@ -83,8 +94,10 @@ const OWNER_CSRF_HEADER: &str = "x-csrf-token";
 const BOOTSTRAP_SETUP_TOKEN_HEADER: &str = "x-dirtydash-setup-token";
 const TAILSCALE_USER_LOGIN: &str = "tailscale-user-login";
 pub const API_V1_PROTOCOL_VERSION: u32 = 1;
-// Internal compatibility alias for the Phase 2 test/repository code.
-const SUPPORTED_PROTOCOL_VERSION: u32 = API_V1_PROTOCOL_VERSION;
+/// The one previous wire version retained for staged Collector rollouts.
+pub const API_PREVIOUS_PROTOCOL_VERSION: u32 = 0;
+pub const SUPPORTED_PROTOCOL_VERSIONS: [u32; 2] =
+    [API_V1_PROTOCOL_VERSION, API_PREVIOUS_PROTOCOL_VERSION];
 const OWNER_SESSION_TTL_SECONDS: i64 = 60 * 60 * 12;
 const DEFAULT_CREDENTIAL_LABEL: &str = "default";
 
@@ -242,6 +255,10 @@ pub struct HubRouterConfig {
     trusted_proxy: Option<TrustedProxyConfig>,
     bootstrap_boundary: BootstrapBoundary,
     bootstrap_setup_token: Option<String>,
+    publisher_policy: Option<crate::deployment::PublisherTrustPolicy>,
+    fleet_update_artifact_dir: Option<PathBuf>,
+    fleet_update_target: Option<PathBuf>,
+    fleet_update_service_manager: Option<String>,
 }
 
 impl std::fmt::Debug for HubRouterConfig {
@@ -257,8 +274,21 @@ impl std::fmt::Debug for HubRouterConfig {
                 "bootstrap_setup_token",
                 &self.bootstrap_setup_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "publisher_policy_configured",
+                &self.publisher_policy.is_some(),
+            )
             .finish()
     }
+}
+
+fn publisher_policy_from_config(
+    config: &crate::config::HubConfig,
+) -> Option<crate::deployment::PublisherTrustPolicy> {
+    let key_id = config.allowed_publisher_key_id.as_deref()?;
+    let fingerprint = config.allowed_publisher_fingerprint.as_deref()?;
+    let public_key = hex::decode(config.allowed_publisher_public_key.as_deref()?).ok()?;
+    crate::deployment::PublisherTrustPolicy::new(key_id, fingerprint, &public_key).ok()
 }
 
 impl HubRouterConfig {
@@ -279,6 +309,10 @@ impl HubRouterConfig {
                 | ListenerTrustMode::TrustedProxy => BootstrapBoundary::Disabled,
             },
             bootstrap_setup_token: None,
+            publisher_policy: None,
+            fleet_update_artifact_dir: None,
+            fleet_update_target: None,
+            fleet_update_service_manager: None,
         }
     }
 
@@ -316,6 +350,26 @@ impl HubRouterConfig {
         self.trusted_proxy = Some(trusted_proxy);
         self.trust_mode = ListenerTrustMode::TrustedProxy;
         self.cookie_transport = CookieTransportSecurity::Secure;
+        self
+    }
+
+    pub fn with_publisher_policy(
+        mut self,
+        publisher_policy: crate::deployment::PublisherTrustPolicy,
+    ) -> Self {
+        self.publisher_policy = Some(publisher_policy);
+        self
+    }
+
+    pub fn with_fleet_update_runtime(
+        mut self,
+        artifact_dir: impl Into<PathBuf>,
+        update_target: impl Into<PathBuf>,
+        service_manager: impl Into<String>,
+    ) -> Self {
+        self.fleet_update_artifact_dir = Some(artifact_dir.into());
+        self.fleet_update_target = Some(update_target.into());
+        self.fleet_update_service_manager = Some(service_manager.into());
         self
     }
 
@@ -370,6 +424,10 @@ impl HubRouterConfig {
         if let Some(setup_token) = &config.bootstrap_setup_token {
             router_config = router_config.with_bootstrap_setup_token(setup_token.clone());
         }
+        router_config.publisher_policy = publisher_policy_from_config(config);
+        router_config.fleet_update_artifact_dir = config.fleet_update_artifact_dir.clone();
+        router_config.fleet_update_target = config.fleet_update_target.clone();
+        router_config.fleet_update_service_manager = config.fleet_update_service_manager.clone();
         router_config
     }
 }
@@ -378,6 +436,8 @@ impl HubRouterConfig {
 struct HubState {
     repo: HubRepository,
     config: HubRouterConfig,
+    enrollment_root: PathBuf,
+    known_hosts_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +509,8 @@ pub struct IngestBatchRequest {
 pub struct SyncRunInput {
     pub sync_run_id: String,
     pub collector_version: Option<String>,
+    #[serde(default)]
+    pub runtime_generation: Option<String>,
     pub started_at: String,
     pub finished_at: String,
 }
@@ -511,6 +573,9 @@ pub enum OwnerCommand {
     Refresh {
         command_id: String,
     },
+    Repair {
+        command_id: String,
+    },
     RotateCredential {
         command_id: String,
         rotation_id: String,
@@ -520,6 +585,13 @@ pub enum OwnerCommand {
     },
     ApprovedUpdate {
         command_id: String,
+        update_id: String,
+        version: String,
+        sha256: String,
+    },
+    RollbackUpdate {
+        command_id: String,
+        update_id: String,
         version: String,
         sha256: String,
     },
@@ -529,11 +601,282 @@ impl OwnerCommand {
     pub fn command_id(&self) -> &str {
         match self {
             Self::Refresh { command_id }
+            | Self::Repair { command_id }
             | Self::RotateCredential { command_id, .. }
             | Self::Diagnostics { command_id }
-            | Self::ApprovedUpdate { command_id, .. } => command_id,
+            | Self::ApprovedUpdate { command_id, .. }
+            | Self::RollbackUpdate { command_id, .. } => command_id,
         }
     }
+}
+
+const MAX_COLLECTOR_RECEIPT_BYTES: usize = 16 * 1024;
+const MAX_COLLECTOR_DIAGNOSTIC_ITEMS: usize = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorWatcherReceipt {
+    pub enabled: bool,
+    pub degraded: bool,
+    pub last_error: Option<String>,
+    pub hint_pending: bool,
+    pub debounce_until: Option<String>,
+    pub next_reconciliation_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorOutboxDiagnosticReceipt {
+    pub batch_id: String,
+    pub status: String,
+    pub retry_class: Option<String>,
+    pub attempts: u32,
+    pub next_attempt_at: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorDiagnosticsReceipt {
+    pub machine_id: String,
+    pub parser_versions: Vec<String>,
+    pub pending_outbox: u64,
+    pub last_reconciliation_at: Option<String>,
+    pub watcher: CollectorWatcherReceipt,
+    pub credential_configured: bool,
+    pub credential_rotation_pending: bool,
+    pub terminal_outbox: u64,
+    pub outbox_diagnostics: Vec<CollectorOutboxDiagnosticReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorUpdateReceipt {
+    pub update_id: String,
+    pub command_id: String,
+    pub version: String,
+    pub sha256: String,
+    pub collector_version: String,
+    pub protocol_version: u32,
+    pub runtime_generation: String,
+    pub restarted_at: String,
+    pub health_checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CollectorCommandResult {
+    Refreshed {
+        batch_id: Option<String>,
+    },
+    Repaired {
+        batch_id: Option<String>,
+    },
+    CredentialRotationStaged,
+    Diagnostics {
+        diagnostics: CollectorDiagnosticsReceipt,
+    },
+    UpdateApplied {
+        update_id: String,
+        command_id: String,
+        version: String,
+        sha256: String,
+    },
+    UpdateRolledBack {
+        update_id: String,
+        command_id: String,
+        version: String,
+        sha256: String,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+impl CollectorCommandResult {
+    pub(crate) fn matches_command(&self, command: &OwnerCommand) -> bool {
+        match (command, self) {
+            (_, Self::Rejected { .. }) => true,
+            (OwnerCommand::Refresh { .. }, Self::Refreshed { .. })
+            | (OwnerCommand::Repair { .. }, Self::Repaired { .. })
+            | (OwnerCommand::RotateCredential { .. }, Self::CredentialRotationStaged)
+            | (OwnerCommand::Diagnostics { .. }, Self::Diagnostics { .. }) => true,
+            (
+                OwnerCommand::ApprovedUpdate {
+                    command_id,
+                    update_id,
+                    version,
+                    sha256,
+                },
+                Self::UpdateApplied {
+                    command_id: result_command_id,
+                    update_id: result_update_id,
+                    version: result_version,
+                    sha256: result_sha256,
+                },
+            )
+            | (
+                OwnerCommand::RollbackUpdate {
+                    command_id,
+                    update_id,
+                    version,
+                    sha256,
+                },
+                Self::UpdateRolledBack {
+                    command_id: result_command_id,
+                    update_id: result_update_id,
+                    version: result_version,
+                    sha256: result_sha256,
+                },
+            ) => {
+                command_id == result_command_id
+                    && update_id == result_update_id
+                    && version == result_version
+                    && sha256.eq_ignore_ascii_case(result_sha256)
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), HubError> {
+        let json = serde_json::to_vec(self).map_err(HubError::internal)?;
+        if json.len() > MAX_COLLECTOR_RECEIPT_BYTES {
+            return Err(HubError::unprocessable(
+                "collector-receipt-too-large",
+                "Collector receipts exceed the bounded protocol size",
+            ));
+        }
+        match self {
+            Self::Diagnostics { diagnostics } => {
+                if diagnostics.parser_versions.len() > MAX_COLLECTOR_DIAGNOSTIC_ITEMS
+                    || diagnostics.outbox_diagnostics.len() > MAX_COLLECTOR_DIAGNOSTIC_ITEMS
+                {
+                    return Err(HubError::unprocessable(
+                        "collector-diagnostics-too-large",
+                        "Collector diagnostics contain too many entries",
+                    ));
+                }
+                validate_safe_receipt_text(&diagnostics.machine_id, "machine_id")?;
+                for version in &diagnostics.parser_versions {
+                    validate_safe_receipt_text(version, "parser_version")?;
+                }
+                validate_optional_diagnostic(&diagnostics.watcher.last_error)?;
+                for diagnostic in &diagnostics.outbox_diagnostics {
+                    validate_safe_receipt_text(&diagnostic.batch_id, "batch_id")?;
+                    validate_safe_receipt_text(&diagnostic.status, "status")?;
+                    validate_optional_diagnostic(&diagnostic.last_error)?;
+                }
+            }
+            Self::Rejected { reason } => {
+                validate_safe_receipt_text(reason, "reason")?;
+                let lower = reason.to_ascii_lowercase();
+                if [
+                    "prompt",
+                    "response",
+                    "request body",
+                    "session",
+                    "token",
+                    "secret",
+                    "ddcol_",
+                    "stdin",
+                    "stdout",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker))
+                {
+                    return Err(HubError::unprocessable(
+                        "raw-command-content-forbidden",
+                        "Collector receipts cannot contain prompt, response, or secret content",
+                    ));
+                }
+            }
+            Self::Refreshed { batch_id } | Self::Repaired { batch_id } => {
+                if let Some(batch_id) = batch_id {
+                    validate_safe_receipt_text(batch_id, "batch_id")?;
+                }
+            }
+            Self::UpdateApplied {
+                update_id,
+                command_id,
+                version,
+                sha256,
+            } => {
+                validate_safe_receipt_text(update_id, "update_id")?;
+                validate_safe_receipt_text(command_id, "command_id")?;
+                validate_safe_receipt_text(version, "version")?;
+                validate_digest(sha256, "sha256")?;
+            }
+            Self::UpdateRolledBack {
+                update_id,
+                command_id,
+                version,
+                sha256,
+            } => {
+                validate_safe_receipt_text(update_id, "update_id")?;
+                validate_safe_receipt_text(command_id, "command_id")?;
+                validate_safe_receipt_text(version, "version")?;
+                validate_digest(sha256, "sha256")?;
+            }
+            Self::CredentialRotationStaged => {}
+        }
+        Ok(())
+    }
+}
+
+fn validate_safe_receipt_text(value: &str, field: &str) -> Result<(), HubError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.chars().any(|character| character.is_control())
+    {
+        return Err(HubError::unprocessable(
+            "invalid-collector-receipt",
+            format!("{field} is not a bounded display-safe value"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_diagnostic(value: &Option<String>) -> Result<(), HubError> {
+    if let Some(value) = value {
+        if value.len() != 34
+            || !value.starts_with("diagnostic-")
+            || !value[11..]
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(HubError::unprocessable(
+                "raw-diagnostic-forbidden",
+                "Collector diagnostics must use an opaque diagnostic marker",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, field: &str) -> Result<(), HubError> {
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err(HubError::unprocessable(
+            "invalid-collector-receipt",
+            format!("{field} must be a SHA-256 digest"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_update_receipt(receipt: &CollectorUpdateReceipt) -> Result<(), HubError> {
+    validate_safe_receipt_text(&receipt.update_id, "update_id")?;
+    validate_safe_receipt_text(&receipt.command_id, "command_id")?;
+    validate_safe_receipt_text(&receipt.version, "version")?;
+    validate_digest(&receipt.sha256, "sha256")?;
+    validate_safe_receipt_text(&receipt.collector_version, "collector_version")?;
+    validate_safe_receipt_text(&receipt.runtime_generation, "runtime_generation")?;
+    if receipt.protocol_version == 0 || receipt.protocol_version > 100 {
+        return Err(HubError::unprocessable(
+            "invalid-collector-receipt",
+            "Collector protocol version is outside the bounded range",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -542,9 +885,16 @@ pub struct CollectorCommandPollResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorCommandAckRequest {
     pub command_id: String,
-    pub result: serde_json::Value,
+    pub result: CollectorCommandResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorUpdateReceiptRequest {
+    pub receipt: CollectorUpdateReceipt,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -574,6 +924,8 @@ pub struct CollectorCredentialRotationResponse {
 pub struct IssueCollectorCommandRequest {
     pub machine_id: String,
     pub command: OwnerCommand,
+    #[serde(default)]
+    pub expected_state_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -676,6 +1028,7 @@ pub(crate) struct IssuedCollectorCredential {
 pub(crate) struct ValidatedIngestBatch {
     batch_id: String,
     machine_id: String,
+    protocol_version: u32,
     sync_run: ValidatedSyncRun,
     source_manifests: Vec<ValidatedSourceManifest>,
     checkpoints: Vec<ValidatedCheckpoint>,
@@ -687,6 +1040,7 @@ pub(crate) struct ValidatedIngestBatch {
 pub(crate) struct ValidatedSyncRun {
     sync_run_id: String,
     collector_version: Option<String>,
+    runtime_generation: Option<String>,
     started_at: String,
     finished_at: String,
 }
