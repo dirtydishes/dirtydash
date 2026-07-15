@@ -1,10 +1,10 @@
 # Loop State
 
-> **Superseded loop state:** preserved as a historical resume aid only. The active remote implementation stream is `dirtydash-px3` in `docs/implementation/remote-hub-collector-fleet/`.
+> **Superseded loop state — stop:** preserved as a historical resume aid only. Do not resume or advance work from this file. The active remote implementation stream is `dirtydash-px3` in `docs/implementation/remote-hub-collector-fleet/`.
 
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
 
-This file is a compact resume aid only. If this file disagrees with Beads, Beads wins.
+This file is a compact resume aid only. If this file disagrees with Beads, Beads wins. Do not treat the ledger below as an active queue.
 
 Status: superseded
 
@@ -43,11 +43,11 @@ Blocked: no
 
 | Phase | Beads Issue | Status | PR | Turn Doc |
 |---|---|---|---|---|
-| Refresh Foundation | `dirtydash-refresh-loop.1` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.1.md` |
-| Ledger Layout Reshape | `dirtydash-refresh-loop.2` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.2.md` |
-| Built-In Themes | `dirtydash-refresh-loop.3` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.3.md` |
-| Agentless SSH Remote Sync | `dirtydash-refresh-loop.4` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.4.md` |
-| OpenCode And Hermes Agent Harness Support | `dirtydash-refresh-loop.5` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.5.md` |
+| Refresh Foundation | `dirtydash-refresh-loop.1` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.1.md` |
+| Ledger Layout Reshape | `dirtydash-refresh-loop.2` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.2.md` |
+| Built-In Themes | `dirtydash-refresh-loop.3` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.3.md` |
+| Agentless SSH Remote Sync | `dirtydash-refresh-loop.4` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.4.md` |
+| OpenCode And Hermes Agent Harness Support | `dirtydash-refresh-loop.5` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.5.md` |
 
 ## Last Coordinator Update
 

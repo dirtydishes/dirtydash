@@ -43,6 +43,13 @@ The coordinator owns Beads, phase advancement, CI resolution, and the integratio
 
 - The user replaced the generated `main` PR target with the new integration branch `lavender/remote-hub-collector-fleet-implementation`; Beads metadata is canonical for this execution override.
 
+## Repair Trigger And Scout Evidence
+
+- Coordinator review finding for PR #8: runnable or prescriptive files under `docs/implementation/refresh-remote-harness-layout-theme/` could still route actors into obsolete agentless SSH-pull work and stale `main` targeting.
+- A completed read-only `pi-subagents` scout checklist was incorporated before finalization. The scout identified actionable stale surfaces in the old stream `IMPLEMENT.md`, `loop-state.md`, `00-roadmap.md`, all prompt run surfaces, `04-agentless-ssh-remote-sync.md`, and `turn-docs/dirtydash-refresh-loop.4.md`.
+- The same scout also flagged `01-refresh-foundation.md`, `02-ledger-layout-reshape.md`, `03-built-in-themes.md`, `05-opencode-and-hermes-agent-harness-support.md`, and turn docs `.1`, `.2`, `.3`, `.5` as still runnable-looking despite being historical, so this repair added stronger do-not-execute redirects there as well.
+- Scout evidence source: completed read-only `pi-subagents` run `79ffa927-2a48-4f37-b2e4-2ef7cef22385`, plus the coordinator summary delivered into this session.
+
 ## Discoveries And Decisions
 
 - The repository had no separate documentation-conventions file; this phase followed the existing Markdown conventions already used in `IMPLEMENT.md`, phase docs, `README.md`, and `PRODUCT.md`.
@@ -53,8 +60,10 @@ The coordinator owns Beads, phase advancement, CI resolution, and the integratio
 ## Implementation And Delegation Evidence
 
 - One durable implementation session owned `lavender/remote-hub-collector-fleet-1-docs` for the bounded documentation/tracker-record scope.
-- No helper swarms were used because the work was a tightly scoped documentation pass rather than multi-slice implementation.
+- The original phase-1 docs pass used no helper swarms because the work was a tightly scoped documentation pass rather than multi-slice implementation.
+- After the independent review blocker was reported, this repair pass incorporated a completed read-only `pi-subagents` scout checklist instead of launching new mutable helpers.
 - The session added the canonical glossary, four ADRs, `/api/v1` protocol/privacy invariants, product-positioning updates, and supersession notes on the old SSH-pull stream before preparing a single phase PR.
+- The repair pass then made every remaining old-stream run/selection/review/PR surface operationally non-runnable while preserving historical context and forwarding actors to `docs/implementation/remote-hub-collector-fleet/` and `dirtydash-px3`.
 
 ## Changed Behavior And Files
 
@@ -82,6 +91,21 @@ The coordinator owns Beads, phase advancement, CI resolution, and the integratio
   - `docs/implementation/refresh-remote-harness-layout-theme/loop-state.md`
   - `docs/implementation/refresh-remote-harness-layout-theme/04-agentless-ssh-remote-sync.md`
   - `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.4.md`
+- Strengthened the remaining historical phase and turn docs so they no longer look executable:
+  - `docs/implementation/refresh-remote-harness-layout-theme/01-refresh-foundation.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/02-ledger-layout-reshape.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/03-built-in-themes.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/05-opencode-and-hermes-agent-harness-support.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.1.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.2.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.3.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.5.md`
+- Neutralized old runnable prompt surfaces that could still launch obsolete work or stale `main` PR targeting:
+  - `docs/implementation/refresh-remote-harness-layout-theme/prompts/run-loop.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/prompts/implementation-thread.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/prompts/review-thread.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/prompts/selector-subagent.md`
+  - `docs/implementation/refresh-remote-harness-layout-theme/prompts/closeout-selector.md`
 - Preserved coordinator-owned run-context updates already present in:
   - `docs/implementation/remote-hub-collector-fleet/loop-state.md`
 
@@ -98,14 +122,16 @@ State: unresolved
 Evidence:
 
 - Environment verified before mutation: `pwd`, `git rev-parse --show-toplevel`, `git symbolic-ref --short HEAD`, `git status --short --branch` all matched the bound worktree and branch.
-- Documentation link check passed via a `python3` local-link validation over 20 touched Markdown files.
+- Comprehensive link check passed via a `python3` local-link validation over the touched Markdown set, including the old stream redirects and this active turn doc.
+- Stale-direction and terminology scan passed via targeted `grep` over `docs/implementation/refresh-remote-harness-layout-theme/`, `README.md`, `PRODUCT.md`, and the active stream docs to ensure no old runnable surface still directs actors toward agentless SSH-pull implementation or stale `main` PR targeting.
 - Documentation integrity check passed via `git diff --check`.
-- Terminology/roadmap scan passed via targeted `grep` across the active stream, product copy, and superseded SSH-pull docs.
 - `cargo test` and `npm --prefix dashboard run build` were intentionally not run because no executable or generated product surfaces changed in this docs-only phase.
+- Repair-pass commands recorded in this session included environment verification, scout-artifact review, targeted reads of superseded run surfaces, link validation, stale-direction `grep` scans, `git diff --check`, `git status --short --branch`, `git diff --name-only`, `git add`, `git commit`, and `git push`.
 
 ## PR And Commits
 
 - Commit: `b1f1483` — `docs: define remote hub collector phase-1 canon`
+- Repair commit on this branch: `docs: hard-stop superseded refresh loop`
 - Branch pushed: `lavender/remote-hub-collector-fleet-1-docs`
 - PR: #8 — `dirtydash-px3.1: define remote hub/collector docs canon`
 - PR URL: https://github.com/dirtydishes/dirtydash/pull/8
@@ -120,8 +146,9 @@ None. The work stayed within phase-1 documentation/tracker-record scope.
 
 ## Context To Keep
 
-- The old remote-pull roadmap is superseded, but its historical docs remain useful evidence.
+- The old remote-pull roadmap is superseded, but its historical docs remain useful evidence once clearly marked non-runnable.
 - `CONTEXT.md`, `API_V1_INVARIANTS.md`, and the four ADRs are the canonical phase-1 records that later phases should cite instead of restating the same decisions.
+- The completed read-only `pi-subagents` scout checklist should be treated as supporting evidence for the PR #8 repair, not as a mutable source artifact to commit.
 - Review, CI state, and Beads closeout remain coordinator-owned after this implementation handoff.
 
 ## Closeout

@@ -1,6 +1,6 @@
 # Refresh, Remote Sync, Harness, Layout, And Theme Roadmap
 
-> **Superseded roadmap:** preserved for historical context only. Active remote architecture planning moved to `docs/implementation/remote-hub-collector-fleet/` under Beads epic `dirtydash-px3`.
+> **Superseded roadmap — stop:** preserved for historical context only. Do not schedule or launch work from this plan. Active remote architecture planning moved to `docs/implementation/remote-hub-collector-fleet/` under Beads epic `dirtydash-px3`.
 
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
 

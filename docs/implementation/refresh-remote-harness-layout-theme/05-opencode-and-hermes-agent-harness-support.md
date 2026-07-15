@@ -1,14 +1,16 @@
 # Phase 5: OpenCode And Hermes Agent Harness Support
 
+> **Superseded phase record — stop:** preserved for historical context only. Do not launch, claim, or implement work from this doc. Active remote planning and execution live in `docs/implementation/remote-hub-collector-fleet/`.
+
 Canonical Beads issue: `dirtydash-refresh-loop.5`
 
 Epic: `dirtydash-refresh-loop`
 
-Status is tracked in Beads. This doc is implementation context.
+Status is tracked in Beads. This doc preserves historical implementation context only.
 
 ## Outcome
 
-Harden OpenCode support with real fixtures and add metadata-only Hermes Agent support through local refresh and remote sync.
+Historical outcome only: harden OpenCode support with real fixtures and add metadata-only Hermes Agent support through local refresh and remote sync.
 
 ## Scope
 

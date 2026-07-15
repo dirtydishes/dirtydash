@@ -1,12 +1,14 @@
 # Phase 4: Agentless SSH Remote Sync
 
+> **Superseded phase record — stop:** preserved for historical context only. Do not launch, claim, or implement work from this doc. The accepted Hub/Collector fleet in `docs/implementation/remote-hub-collector-fleet/` replaces this agentless SSH-pull direction.
+
 > **Superseded phase record:** preserved for historical context only. The active remote implementation stream is the Hub/Collector fleet in `docs/implementation/remote-hub-collector-fleet/`.
 
 Canonical Beads issue: `dirtydash-refresh-loop.4`
 
 Epic: `dirtydash-refresh-loop`
 
-Status is tracked in Beads. This doc is implementation context.
+Status is tracked in Beads. This doc preserves historical implementation context only.
 
 ## Outcome
 
