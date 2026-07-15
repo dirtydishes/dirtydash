@@ -1,10 +1,12 @@
 # Loop State
 
+> **Superseded loop state — stop:** preserved as a historical resume aid only. Do not resume or advance work from this file. The active remote implementation stream is `dirtydash-px3` in `docs/implementation/remote-hub-collector-fleet/`.
+
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
 
-This file is a compact resume aid only. If this file disagrees with Beads, Beads wins.
+This file is a compact resume aid only. If this file disagrees with Beads, Beads wins. Do not treat the ledger below as an active queue.
 
-Status: active
+Status: superseded
 
 Stream: `refresh-remote-harness-layout-theme`
 
@@ -22,7 +24,7 @@ Blocked: no
 
 ## Decisions
 
-- In-scope phases are plan phases 1-5: refresh foundation, Ledger layout reshape, themes, agentless SSH remote sync, and OpenCode/Hermes harness support.
+- Historical in-scope phases were plan phases 1-5: refresh foundation, Ledger layout reshape, themes, agentless SSH remote sync, and OpenCode/Hermes harness support.
 - Plan phase 6, live watcher/SSE, is explicitly future scope and filed as `dirtydash-live-watcher-future`.
 - The run orchestrator must capture its own concrete Codex thread id before launching child threads.
 - Child-thread prompt templates use `RUNTIME_ORCHESTRATOR_THREAD_ID` until the run orchestrator replaces it with that concrete id.
@@ -41,12 +43,12 @@ Blocked: no
 
 | Phase | Beads Issue | Status | PR | Turn Doc |
 |---|---|---|---|---|
-| Refresh Foundation | `dirtydash-refresh-loop.1` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.1.md` |
-| Ledger Layout Reshape | `dirtydash-refresh-loop.2` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.2.md` |
-| Built-In Themes | `dirtydash-refresh-loop.3` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.3.md` |
-| Agentless SSH Remote Sync | `dirtydash-refresh-loop.4` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.4.md` |
-| OpenCode And Hermes Agent Harness Support | `dirtydash-refresh-loop.5` | open | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.5.md` |
+| Refresh Foundation | `dirtydash-refresh-loop.1` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.1.md` |
+| Ledger Layout Reshape | `dirtydash-refresh-loop.2` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.2.md` |
+| Built-In Themes | `dirtydash-refresh-loop.3` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.3.md` |
+| Agentless SSH Remote Sync | `dirtydash-refresh-loop.4` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.4.md` |
+| OpenCode And Hermes Agent Harness Support | `dirtydash-refresh-loop.5` | superseded | none | `docs/implementation/refresh-remote-harness-layout-theme/turn-docs/dirtydash-refresh-loop.5.md` |
 
 ## Last Coordinator Update
 
-Loop scaffold created. Implementation has not started.
+Loop scaffold created. Remote sync planning in this stream was later superseded by the Hub/Collector fleet stream; preserve this file for history rather than execution.

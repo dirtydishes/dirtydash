@@ -10,6 +10,12 @@ User-supplied **Dirtydash Remote Hub and Collector Fleet** plan, accepted 2026-0
 
 Ship a self-hosted Hub plus push-based Collector fleet while preserving loopback-only local use and the metadata-only privacy boundary.
 
+Canonical supporting records for this roadmap:
+
+- `docs/implementation/remote-hub-collector-fleet/CONTEXT.md`
+- `docs/implementation/remote-hub-collector-fleet/API_V1_INVARIANTS.md`
+- `docs/implementation/remote-hub-collector-fleet/adr/`
+
 ## Phase Sequence
 
 1. `dirtydash-px3.1` — reset documentation and tracker language.

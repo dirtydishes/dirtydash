@@ -37,7 +37,7 @@ Out of scope:
 
 ## Settled Decisions
 
-Retention defaults are seven daily plus three pre-upgrade snapshots. Legacy remote pull remains for one compatibility release only.
+Retention defaults are seven daily plus three pre-upgrade snapshots. Legacy remote pull remains for one compatibility release only as a bounded deprecation path for historical commands; it is not an active implementation roadmap.
 
 ## Open Questions
 

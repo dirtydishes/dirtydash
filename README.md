@@ -2,7 +2,7 @@
 
 dirtydash is a local-first dashboard for inspecting AI coding usage across both terminal-native and GUI agent harnesses and tools, including Codex, T3 Code, Claude Code, OpenCode, pi, and others. It is built for developers who want to answer grounded questions about token volume, estimated cost, cache behavior, model usage, sessions, source files, and provenance without sending their activity to a hosted SaaS dashboard.
 
-The project is intentionally practical and a little blunt: scan the files your tools already write, import the usage metadata into local SQLite, and serve a dense dashboard from your own machine.
+The project is intentionally practical and a little blunt: scan the files your tools already write, import the usage metadata into local SQLite, and serve a dense dashboard from your own machine. The accepted next product step keeps that loopback-local experience while adding an optional self-hosted Hub plus per-machine Collectors for metadata-only fleet sync.
 
 ## Current State And Project Roadmap
 
@@ -33,15 +33,18 @@ Usage costs are estimates. dirtydash keeps provenance and confidence visible bec
 - [ ] Harden importer behavior with real-world fixtures and parser diagnostics
 - [ ] Polish first-run guidance, empty states, and setup repair
 
-### V1.1: Accuracy And Remote Pull
+### V1.1: Self-Hosted Hub And Collector Fleet
 
-- [ ] SSH pull-based remote machine sync that imports remote usage, not just file counts
-- [ ] Machines and Remotes dashboard pages
+- [ ] Self-hosted Hub with canonical fleet database, dashboard, and `/api/v1` ingestion
+- [ ] Outbound-only per-machine Collectors that push metadata-only usage events
+- [ ] Machines and Settings product surfaces, plus the redesigned fleet Usage workspace
 - [ ] Better model alias mapping and unknown-pricing warnings
 - [ ] Expanded cache and reasoning token accounting
 - [ ] More importer fixtures and cost regression tests
 - [ ] Bundled pricing updates from external model price sources
 - [ ] Reconciliation views that explain differences between dirtydash estimates and other tools
+
+Earlier roadmap work toward agentless SSH-pull usage import is now superseded by the Hub/Collector stream preserved in `docs/implementation/refresh-remote-harness-layout-theme/` for history.
 
 ### V2: Broader Harness Support
 
@@ -52,9 +55,8 @@ Usage costs are estimates. dirtydash keeps provenance and confidence visible bec
 - [ ] Advanced Burn Report insights
 - [ ] Export/import support for offline or airgapped machines
 
-### Post-V2: Fleet And Collaboration
+### Post-V2: Collaboration On Top Of The Fleet
 
-- [ ] Optional `dirtydash-agent` for remote hosts
 - [ ] Shared dashboards and team/workspace views
 - [ ] Role-based access and privacy-aware sharing
 - [ ] Alerts, budgets, anomaly detection, and usage recommendations
@@ -200,7 +202,9 @@ Useful global overrides:
 
 ## Remote Discovery
 
-V1 remote support is deliberately conservative. It stores remote definitions and can perform read-only SSH file discovery without installing an agent on the remote machine.
+Current shipped remote support is deliberately conservative. It stores remote definitions and can perform read-only SSH file discovery without installing an agent on the remote machine.
+
+That existing behavior is not the active sync roadmap. The accepted roadmap is the metadata-only Hub/Collector fleet in `docs/implementation/remote-hub-collector-fleet/`, and the older SSH-pull import plan is preserved only as superseded history.
 
 Add a remote:
 
@@ -221,7 +225,7 @@ Sync remote discovery metadata:
 cargo run -p dirtydash -- remote sync workstation
 ```
 
-This does not yet import remote usage events into the local database. That is part of the roadmap.
+This does not yet import remote usage events into the local database. The active roadmap replaces the old SSH-pull import direction with Hub/Collector push sync.
 
 ## Dashboard
 
@@ -250,8 +254,9 @@ dirtydash is local-first:
 - The database is local SQLite.
 - Import is metadata-only by default.
 - Stored events include usage numbers, model/provider data, project/session identifiers, parser metadata, raw path, raw span, event hash, import time, pricing version, and confidence.
-- The app does not require a hosted backend.
-- SSH remote behavior is pull-based discovery from the local machine.
+- The app does not require a hosted backend for the local experience.
+- Current SSH remote behavior is pull-based discovery from the local machine.
+- The accepted fleet roadmap keeps `/api/v1` and Hub persistence metadata-only as well.
 
 The project should continue to prefer visible provenance and honest uncertainty over hidden assumptions.
 

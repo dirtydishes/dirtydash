@@ -12,7 +12,7 @@ The Hub has a versioned, authenticated, metadata-only ingestion contract and a d
 
 ## Why This Phase Exists
 
-Collector delivery, enrollment, fleet operations, and the redesigned Usage surface all depend on stable identity, transaction, query, and access contracts.
+Collector delivery, enrollment, fleet operations, and the redesigned Usage surface all depend on stable identity, transaction, query, and access contracts defined by `CONTEXT.md`, `API_V1_INVARIANTS.md`, and the accepted ADRs.
 
 ## Scope
 

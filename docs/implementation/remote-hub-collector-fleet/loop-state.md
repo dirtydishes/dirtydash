@@ -14,13 +14,13 @@ Harness: `pi`
 
 Adapter contract: `dirtyloops-harness/1`
 
-Current phase: none
+Current phase: 1 — Documentation and tracker reset
 
-Current Beads issue: none
+Current Beads issue: `dirtydash-px3.1`
 
-Current PR: none
+Current PR: pending from `lavender/remote-hub-collector-fleet-1-docs` into `lavender/remote-hub-collector-fleet-implementation`
 
-Current execution strategy: none
+Current execution strategy: durable implementation session followed by an independent review session; coordinator owns Beads and CI
 
 Last completed phase: none
 
@@ -31,6 +31,7 @@ Blocked: no
 - Use the user-requested `orchestrator-callback` topology; bind callbacks at run time.
 - Keep model, effort, delegation, concurrency, and role decomposition adaptive.
 - Keep one active phase PR and one owner per mutable checkout.
+- The user overrode the generated PR target: phase PRs merge into `lavender/remote-hub-collector-fleet-implementation` before advancement.
 - Beads owns phase state and sequencing.
 
 ## Context To Keep
@@ -43,7 +44,7 @@ Blocked: no
 
 | Phase | Beads Issue | Status | PR | Turn Doc |
 |---|---|---|---|---|
-| 1 | `dirtydash-px3.1` | open | none | `turn-docs/dirtydash-px3.1.md` |
+| 1 | `dirtydash-px3.1` | in progress | pending | `turn-docs/dirtydash-px3.1.md` |
 | 2 | `dirtydash-px3.2` | open | none | `turn-docs/dirtydash-px3.2.md` |
 | 3 | `dirtydash-px3.3` | open | none | `turn-docs/dirtydash-px3.3.md` |
 | 4 | `dirtydash-px3.4` | open | none | `turn-docs/dirtydash-px3.4.md` |
@@ -53,4 +54,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Loop created; implementation has not started.
+Phase 1 claimed. The integration and phase branches are attached and verified; the orchestration brief is recorded before delegated implementation.
