@@ -77,6 +77,40 @@ The implementation session is sole mutable owner. The coordinator owns Beads, in
 
 The coordinator validated the Pi binding and certified adapter contract before resume, claimed `dirtydash-px3.8`, and transferred the clean phase checkout to the implementation session.
 
+### Slice brief — `dirtydash-px3.9`
+
+```json
+{
+  "phase_issue_id": "dirtydash-px3.5",
+  "active_slice": "dirtydash-px3.9",
+  "risk": "high",
+  "strategy": "sessions",
+  "implementation_owner": "one durable Pi session bound to the existing Phase 5 checkout and PR branch",
+  "review_independence": "a fresh read-only thermo-nuclear review session after implementation ownership returns",
+  "delegation_plan": [
+    "complete only executable Hub/Collector install and rollback acceptance",
+    "run focused production-path and regression gates",
+    "perform bounded independent review with at most two convergent repair cycles"
+  ],
+  "model_and_effort_rationale": "Atomic executable replacement, fsync, service restart, health proof, and rollback are high-consequence update seams requiring strong implementation and review reasoning.",
+  "required_evidence": [
+    "bounded and digest-verified artifacts",
+    "fsynced atomic executable replacement with executable permissions",
+    "Hub and Collector restart/health verification",
+    "verified rollback on apply or restart failure",
+    "production-path success, mode, restart-failure, and rollback tests"
+  ],
+  "user_constraints": [
+    "continue autonomously",
+    "structured completion callbacks without routine polling",
+    "one active PR and one mutable checkout owner",
+    "two-cycle non-convergence guard"
+  ]
+}
+```
+
+`dirtydash-px3.8` closed after two convergent repair cycles. The coordinator then claimed `dirtydash-px3.9` as the next dependency-unlocking ready slice.
+
 ## Adaptations
 
 - The phase PR targets the integration branch rather than `main`.
@@ -115,7 +149,7 @@ Slice `dirtydash-px3.8` tightens hosted enrollment through first Hub ingest: hos
 
 ## Review
 
-This bounded repair pass addresses the independent PR #12 security/correctness and accessibility findings in the same implementation checkout. Repair cycle 1 addresses the follow-up review findings for probe plaintext retention, production-path evidence, and wrong-Collector long-poll wakeups without widening the phase scope. Repair cycle 2 addresses the remaining high finding by ensuring a secret-bearing rendered retry handler's closure source contains `step(path, {})` and no `body` or `carriesSecret` reference. A fresh external browser/tailnet review remains an integration gate; local rendered modal/axe coverage and typed backend tests provide the available evidence.
+This bounded repair pass addresses the independent PR #12 security/correctness and accessibility findings in the same implementation checkout. Repair cycle 1 addresses the follow-up review findings for probe plaintext retention, production-path evidence, and wrong-Collector long-poll wakeups without widening the phase scope. Repair cycle 2 addresses the remaining high finding by ensuring a secret-bearing rendered retry handler's closure source contains `step(path, {})` and no `body` or `carriesSecret` reference. The final repair reviewer found the named code seam resolved; its only reported blocker was inability to run `git status` through its restricted read-only tool surface. The certified adapter had already verified a clean branch at launch, and the coordinator independently verified clean HEAD `9208aeb`. Slice `dirtydash-px3.8` therefore has no unresolved review finding. A fresh external browser/tailnet review remains an integration gate; local rendered modal/axe coverage and typed backend tests provide the available evidence.
 
 ## CI And Gates
 
@@ -173,11 +207,11 @@ Repair cycle 2 evidence:
 
 ## PR And Commits
 
-Base implementation commit `d2ace45` remains the PR #12 base. The bounded repair is kept on `lavender/remote-hub-collector-fleet-5-fleet`; commit and push evidence are recorded only after the final local gates pass. The PR target remains `lavender/remote-hub-collector-fleet-implementation`.
+Base implementation commit `d2ace45` remains the PR #12 base. Slice `dirtydash-px3.8` is pushed as commits `90d60a1`, `3070b74`, and `9208aeb` on `lavender/remote-hub-collector-fleet-5-fleet`. The branch is clean and up to date with origin. The PR target remains `lavender/remote-hub-collector-fleet-implementation`; GitHub reports no configured status checks.
 
 ## Beads Updates And Follow-Ups
 
-Beads was not mutated in this child session. The parent coordinator retains issue status, review callbacks, integration merge, and any follow-up issue filing.
+Child sessions did not mutate Beads. The coordinator closed `dirtydash-px3.8` after acceptance, bounded review, two convergent repairs, and green local gates; exported the tracked JSONL mirror; and claimed `dirtydash-px3.9` as the next ready slice. The coordinator retains integration merge and phase advancement authority.
 
 ## Plan Amendments
 
@@ -189,4 +223,6 @@ Archive and permanent deletion are deliberately separate operations. Hosted sign
 
 ## Closeout
 
-The long-running Pi coordinator was stopped at a file-stable boundary after the repair owner continued broadening scope beyond repeated green gates and the compacted parent session no longer exposed its steering tool. The preserved checkout passed the full external checkpoint gates after two repair-caused fixture/module-placement corrections. `.pi-subagents/` is absent, generated dashboard artifacts are refreshed, and external CI, browser, and real-tailnet checks remain integration-owned. Phase 5 stays open and PR #12 stays unmerged for the approved tracer-bullet closure plan.
+The long-running Pi coordinator was stopped at a file-stable boundary after the repair owner continued broadening scope beyond repeated green gates and the compacted parent session no longer exposed its steering tool. The preserved checkout passed the full external checkpoint gates after two repair-caused fixture/module-placement corrections. `.pi-subagents/` is absent, generated dashboard artifacts are refreshed, and external CI, browser, and real-tailnet checks remain integration-owned.
+
+Slice `dirtydash-px3.8` closed at `9208aeb` after its initial bounded review and two repair cycles reduced the findings from one high/two medium to none. Exact hosted `/execute` over real SSH/service managers and a tailnet remains external phase/release evidence. Phase 5 and PR #12 remain open; `dirtydash-px3.9` is now the active slice.

@@ -16,11 +16,11 @@ Adapter contract: `dirtyloops-harness/1`
 
 Current phase: 5 — Fleet management
 
-Current Beads issue: `dirtydash-px3.5`
+Current Beads issue: `dirtydash-px3.9` (Phase 5 executable update and rollback slice)
 
-Current PR: pending from `lavender/remote-hub-collector-fleet-5-fleet` into `lavender/remote-hub-collector-fleet-implementation`
+Current PR: #12 from `lavender/remote-hub-collector-fleet-5-fleet` into `lavender/remote-hub-collector-fleet-implementation`
 
-Current execution strategy: Luna-max implementation/review sessions supported by parent-mediated Sol-low pi-subagents scouts
+Current execution strategy: sequential durable Pi implementation sessions and fresh bounded thermo-nuclear review sessions, with structured completion callbacks and a two-cycle non-convergence guard
 
 Last completed phase: 4 — Hub deployment and enrollment (`dirtydash-px3.4`, PR #11)
 
@@ -54,4 +54,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Phase 5 claimed. Its attached worktree and symbolic branch are verified, and the orchestration brief is recorded before fleet-management implementation.
+Phase 5 slice `dirtydash-px3.8` closed after bounded review and two convergent repair cycles; commits through `9208aeb` are pushed to PR #12. `dirtydash-px3.9` is claimed as the next dependency-unlocking ready slice. The attached worktree is clean, its symbolic branch is verified, and the slice orchestration brief is recorded.
