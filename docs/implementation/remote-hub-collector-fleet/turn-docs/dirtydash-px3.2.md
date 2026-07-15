@@ -87,7 +87,12 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 
 ## Review
 
-Thermo-nuclear review findings were repaired in the preceding bounded pass. The coordinator still owns final independent review, CI interpretation, Beads updates, and merge. No Beads state was mutated by this repair owner.
+Approved after three independent `thermo-nuclear-code-quality-review` rounds and two bounded repair passes.
+
+- Round 1 found an arbitrary Tailscale-owner mapping bypass, insecure cookie transport, unrealistic transaction/concurrency/DST tests, monolithic module structure, weak metadata validation, migration races, raw internal errors, and unsafe public bootstrap. Repair commits `a558338` and `1f6ae86` closed those findings.
+- Round 2 and its Sol-low scout found that a static provenance header remained forgeable by a direct client. Repair commits `83fbc86` and `19e4ce2` bound trusted-proxy identity to transport-derived peer IP/CIDR before header evaluation.
+- Final fresh review approved the result with no changes required and verified preservation of public/loopback behavior and all prior fixes.
+- Residual operational constraints: trusted proxy CIDRs must be narrow, the proxy must sanitize identity/provenance headers, and malformed CIDRs fail closed.
 
 ### Review Round 2: Trusted-Proxy Transport Provenance
 
@@ -97,17 +102,18 @@ Positive trusted-CIDR login and existing-session tests preserve exact owner iden
 
 ## CI And Gates
 
-Owner: repair implementation session
+Owner: coordinator
 
-State: local gates passing; coordinator terminal review/CI remains pending
+State: `ci-unavailable-with-evidence`
 
 Evidence:
 
-- `cargo test -p dirtydash --lib hub::tests` — passed (25 tests)
-- `cargo fmt --check` — passed
-- `cargo clippy --all-targets -- -D warnings` — passed
-- `cargo test` — passed (46 unit/doc tests plus 5 CLI integration tests)
-- `git diff --check` — passed
+- GitHub reported an empty `statusCheckRollup` for PR #9; no repository CI checks were configured for the PR.
+- Coordinator reran `cargo fmt --check`: passed.
+- Coordinator reran `cargo clippy --all-targets -- -D warnings`: passed.
+- Coordinator reran `cargo test`: passed (46 unit tests, 5 CLI integration tests, and doc tests).
+- Coordinator reran `git diff --check origin/lavender/remote-hub-collector-fleet-implementation...HEAD`: passed.
+- Focused Hub tests passed during implementation and both repair passes.
 
 ## PR And Commits
 
@@ -115,14 +121,19 @@ Evidence:
   - `b071bac` — `Add hub protocol and auth foundation`
   - `3655174` — `Record phase 2 implementation evidence`
   - `a558338` — `Repair phase 2 hub security and transaction seams`
+  - `1f6ae86` — `Record phase 2 repair evidence`
   - `83fbc86` — `Harden trusted proxy peer provenance`
+  - `19e4ce2` — `Record trusted proxy review repair`
 - PR: #9 — `Phase 2: add hub protocol and auth foundation`
 - Branch: `lavender/remote-hub-collector-fleet-2-foundation`
 - Target: `lavender/remote-hub-collector-fleet-implementation`
+- Merged: 2026-07-15 at merge commit `5dd6b70`.
 
 ## Beads Updates And Follow-Ups
 
-No Beads mutation was performed by this repair owner. Coordinator retains issue status, follow-ups, final review, CI, and merge decisions.
+- `dirtydash-px3.2` closed after acceptance, independent review, repair evidence, coordinator gates, and PR merge.
+- Phase 3 (`dirtydash-px3.3`) is now ready.
+- No follow-up issue was required; dedicated Hub runtime/listener wiring remains explicitly in later accepted phases.
 
 ## Plan Amendments
 
@@ -130,8 +141,10 @@ None.
 
 ## Context To Keep
 
-Phase 1 must establish the canonical domain and ADRs first.
+- The Hub foundation is intentionally an isolated module/router adjacent to unchanged loopback `dirtydash serve`; later phases own dedicated runtime/deployment wiring.
+- Trusted-proxy identity requires exact owner mapping, transport-derived peer IP matching configured source CIDRs, and sanitized proxy headers.
+- Legacy read APIs and local path-bearing schema remain for the one-release compatibility window; the new `/api/v1` boundary enforces metadata-only persistence.
 
 ## Closeout
 
-Review round 2 repair is complete in commit `83fbc86`; the branch remains open for coordinator-owned final review/CI/Beads/merge. No Beads mutation or merge was performed.
+Phase 2 complete. The storage/protocol foundation is implemented, all independent review blockers were repaired, final review approved, coordinator quality gates passed, unavailable CI is documented, Beads is closed, and PR #9 is merged into `lavender/remote-hub-collector-fleet-implementation`.
