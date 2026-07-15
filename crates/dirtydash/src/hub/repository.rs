@@ -105,7 +105,7 @@ impl HubRepository {
                 "collector bearer token is invalid",
             )
         })?;
-        let (credential_id, secret) = token.split_once('.').ok_or_else(|| {
+        let (credential_id, secret) = token.rsplit_once('.').ok_or_else(|| {
             HubError::unauthorized(
                 "collector-auth-required",
                 "collector bearer token is invalid",
@@ -150,6 +150,208 @@ impl HubRepository {
         })
     }
 
+    pub(crate) fn activate_collector_credential_rotation(
+        &self,
+        auth: &AuthenticatedCollector,
+        request: CollectorCredentialRotationActivationRequest,
+    ) -> Result<CollectorCredentialRotationResponse, HubError> {
+        let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
+        if machine_id != auth.machine_id {
+            return Err(HubError::unauthorized(
+                "collector-auth-required",
+                "collector machine identity does not match the credential",
+            ));
+        }
+        let rotation_id = validate_identifier(&request.rotation_id, "rotation_id")?;
+        let replacement_secret =
+            validate_non_empty(&request.replacement_secret, "replacement credential secret")?;
+        if replacement_secret.len() > 512 {
+            return Err(HubError::unprocessable(
+                "invalid-credential-secret",
+                "replacement credential secret is too long",
+            ));
+        }
+        let secret_hash = sha256_hex(&replacement_secret);
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let label: String = tx
+            .query_row(
+                "SELECT credential_label FROM collector_credentials WHERE credential_id = ?1 AND machine_id = ?2 AND revoked_at IS NULL",
+                params![auth.credential_id, auth.machine_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        let existing = tx
+            .query_row(
+                r#"
+                SELECT machine_id, credential_id, status
+                FROM collector_credential_rotations
+                WHERE rotation_id = ?1
+                "#,
+                params![rotation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        if let Some((existing_machine, credential_id, status)) = existing {
+            if existing_machine != auth.machine_id {
+                return Err(HubError::conflict(
+                    "collector-rotation-conflict",
+                    "rotation_id is already bound to another Machine",
+                ));
+            }
+            let existing_hash: String = tx
+                .query_row(
+                    "SELECT secret_hash FROM collector_credentials WHERE credential_id = ?1",
+                    params![credential_id],
+                    |row| row.get(0),
+                )
+                .map_err(HubError::internal)?;
+            if existing_hash != secret_hash {
+                return Err(HubError::conflict(
+                    "collector-rotation-conflict",
+                    "rotation_id is already bound to a different replacement",
+                ));
+            }
+            tx.commit().map_err(HubError::internal)?;
+            return Ok(CollectorCredentialRotationResponse {
+                machine_id,
+                rotation_id,
+                status,
+            });
+        }
+
+        let credential_collision: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collector_credentials WHERE credential_id = ?1)",
+                params![rotation_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if credential_collision {
+            return Err(HubError::conflict(
+                "collector-rotation-conflict",
+                "rotation_id is already bound to a credential",
+            ));
+        }
+        let now = now_utc();
+        tx.execute(
+            r#"
+            INSERT INTO collector_credentials(
+                credential_id, machine_id, credential_label, secret_hash, created_at, rotated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            "#,
+            params![rotation_id, auth.machine_id, label, secret_hash, now],
+        )
+        .map_err(HubError::internal)?;
+        tx.execute(
+            r#"
+            INSERT INTO collector_credential_rotations(
+                rotation_id, machine_id, credential_id, previous_credential_id,
+                credential_label, status, created_at, activated_at
+            ) VALUES (?1, ?2, ?1, ?3, ?4, 'activated', ?5, ?5)
+            "#,
+            params![rotation_id, auth.machine_id, auth.credential_id, label, now],
+        )
+        .map_err(HubError::internal)?;
+        tx.commit().map_err(HubError::internal)?;
+        Ok(CollectorCredentialRotationResponse {
+            machine_id,
+            rotation_id,
+            status: "activated".to_string(),
+        })
+    }
+
+    pub(crate) fn prove_collector_credential_rotation(
+        &self,
+        auth: &AuthenticatedCollector,
+        request: CollectorCredentialRotationProofRequest,
+    ) -> Result<CollectorCredentialRotationResponse, HubError> {
+        let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
+        if machine_id != auth.machine_id {
+            return Err(HubError::unauthorized(
+                "collector-auth-required",
+                "collector machine identity does not match the credential",
+            ));
+        }
+        let rotation_id = validate_identifier(&request.rotation_id, "rotation_id")?;
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let rotation = tx
+            .query_row(
+                r#"
+                SELECT machine_id, credential_id, credential_label, status
+                FROM collector_credential_rotations
+                WHERE rotation_id = ?1
+                "#,
+                params![rotation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(HubError::internal)?
+            .ok_or_else(|| {
+                HubError::not_found(
+                    "collector-rotation-not-found",
+                    "collector credential rotation was not found",
+                )
+            })?;
+        if rotation.0 != auth.machine_id || rotation.1 != auth.credential_id {
+            return Err(HubError::unauthorized(
+                "collector-auth-required",
+                "replacement credential proof is invalid",
+            ));
+        }
+        if rotation.3 != "proved" {
+            let now = now_utc();
+            tx.execute(
+                r#"
+                UPDATE collector_credentials
+                SET revoked_at = ?3
+                WHERE machine_id = ?1
+                    AND credential_label = ?2
+                    AND credential_id <> ?4
+                    AND revoked_at IS NULL
+                "#,
+                params![rotation.0, rotation.2, now, rotation.1],
+            )
+            .map_err(HubError::internal)?;
+            tx.execute(
+                r#"
+                UPDATE collector_credential_rotations
+                SET status = 'proved', proved_at = ?2
+                WHERE rotation_id = ?1
+                "#,
+                params![rotation_id, now],
+            )
+            .map_err(HubError::internal)?;
+        }
+        tx.commit().map_err(HubError::internal)?;
+        Ok(CollectorCredentialRotationResponse {
+            machine_id,
+            rotation_id,
+            status: "proved".to_string(),
+        })
+    }
+
     fn prove_collector_credential(&self, auth: &AuthenticatedCollector) -> Result<(), HubError> {
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let mut conn = self.db.connection().map_err(HubError::internal)?;
@@ -174,6 +376,19 @@ impl HubRepository {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(HubError::internal)?;
+        // Explicit rotation rows are retired only by the authenticated proof
+        // endpoint. This keeps the old credential valid through activation,
+        // proof retries, and Collector crash recovery.
+        let explicit_rotation: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collector_credential_rotations WHERE credential_id = ?1)",
+                params![auth.credential_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if explicit_rotation {
+            return Ok(());
+        }
         // A newer active row means this token is an older overlap token. It
         // remains valid so a Collector can safely fall back while staging the
         // newest token.
@@ -393,7 +608,12 @@ impl HubRepository {
     ) -> Result<IssueCollectorCommandResponse, HubError> {
         let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
         let command_id = validate_identifier(request.command.command_id(), "command_id")?;
-        let command_json = serde_json::to_string(&request.command).map_err(HubError::internal)?;
+        if let OwnerCommand::RotateCredential { rotation_id, .. } = &request.command {
+            validate_identifier(rotation_id, "rotation_id")?;
+        }
+        let command = serde_json::to_value(&request.command).map_err(HubError::internal)?;
+        validate_command_has_no_secret(&command)?;
+        let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
         let now = now_utc();
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let conn = self.db.connection().map_err(HubError::internal)?;
@@ -482,6 +702,7 @@ impl HubRepository {
         request: CollectorCommandAckRequest,
     ) -> Result<(), HubError> {
         let command_id = validate_identifier(&request.command_id, "command_id")?;
+        validate_ack_result_has_no_secret(&request.result)?;
         let result_json = serde_json::to_string(&request.result).map_err(HubError::internal)?;
         let write_guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let conn = self.db.connection().map_err(HubError::internal)?;

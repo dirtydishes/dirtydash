@@ -91,7 +91,7 @@ impl CollectorTransport for CredentialFallbackTransport {
         request: &IngestBatchRequest,
     ) -> Result<IngestBatchResponse, TransportError> {
         self.seen_credentials.push(credential_token.to_string());
-        if credential_token == "pending-token" {
+        if credential_token.starts_with("ddcol_rotation-fallback.") {
             return Err(TransportError::new(
                 RetryClass::Unauthorized,
                 "pending credential not active yet",
@@ -175,6 +175,81 @@ impl CollectorTransport for FakeTransport {
         _result: &CommandOutcome,
     ) -> Result<(), TransportError> {
         self.acknowledgements += 1;
+        Ok(())
+    }
+}
+
+struct RotationTransport {
+    command: OwnerCommand,
+    activations: Vec<(String, String, String)>,
+    proofs: Vec<(String, String)>,
+    acknowledgements: Vec<CommandOutcome>,
+    fail_first_proof: bool,
+}
+
+impl CollectorTransport for RotationTransport {
+    fn send_batch(
+        &mut self,
+        _credential_token: &str,
+        request: &IngestBatchRequest,
+    ) -> Result<IngestBatchResponse, TransportError> {
+        Ok(IngestBatchResponse {
+            batch_id: request.batch_id.clone(),
+            inserted_events: request.events.len() as u64,
+            updated_events: 0,
+            skipped_events: 0,
+            idempotent_replay: false,
+            committed_at: "2026-07-15T00:00:00Z".to_string(),
+        })
+    }
+
+    fn poll_owner_command(
+        &mut self,
+        _credential_token: &str,
+        _machine_id: &str,
+        _wait: Duration,
+    ) -> Result<Option<OwnerCommand>, TransportError> {
+        Ok(Some(self.command.clone()))
+    }
+
+    fn acknowledge_owner_command(
+        &mut self,
+        _credential_token: &str,
+        _machine_id: &str,
+        _command_id: &str,
+        result: &CommandOutcome,
+    ) -> Result<(), TransportError> {
+        self.acknowledgements.push(result.clone());
+        Ok(())
+    }
+
+    fn activate_collector_credential_rotation(
+        &mut self,
+        credential_token: &str,
+        _machine_id: &str,
+        rotation_id: &str,
+        replacement_secret: &str,
+    ) -> Result<(), TransportError> {
+        self.activations.push((
+            credential_token.to_string(),
+            rotation_id.to_string(),
+            replacement_secret.to_string(),
+        ));
+        Ok(())
+    }
+
+    fn prove_collector_credential_rotation(
+        &mut self,
+        replacement_token: &str,
+        _machine_id: &str,
+        rotation_id: &str,
+    ) -> Result<(), TransportError> {
+        self.proofs
+            .push((replacement_token.to_string(), rotation_id.to_string()));
+        if self.fail_first_proof {
+            self.fail_first_proof = false;
+            return Err(TransportError::offline("rotation proof response lost"));
+        }
         Ok(())
     }
 }
@@ -433,6 +508,132 @@ fn unchanged_manifests_and_tombstones_are_coalesced() {
 }
 
 #[test]
+fn repeated_startup_manual_and_refresh_reconcile_without_outbox_growth_or_lost_updates() {
+    let (_dir, mut collector, roots, _usage_path, collector_path) = make_collector();
+    let store = Database::open(collector_path).unwrap();
+
+    let first = collector
+        .reconcile_startup(at("2026-07-15T00:00:00Z"))
+        .unwrap();
+    assert_eq!(first.events_queued, 6);
+    assert_eq!(store.collector_outbox_count().unwrap(), 1);
+
+    let repeated_startup = collector
+        .reconcile_startup(at("2026-07-15T00:00:01Z"))
+        .unwrap();
+    assert_eq!(repeated_startup.events_queued, 0);
+    assert_eq!(store.collector_outbox_count().unwrap(), 1);
+
+    let manual_before_delivery = collector
+        .reconcile_manual(at("2026-07-15T00:00:02Z"))
+        .unwrap();
+    assert_eq!(manual_before_delivery.events_queued, 0);
+    assert_eq!(store.collector_outbox_count().unwrap(), 1);
+
+    let mut transport = FakeTransport::default();
+    let delivered = collector
+        .deliver_pending(&mut transport, at("2026-07-15T00:00:03Z"))
+        .unwrap();
+    assert_eq!(delivered.acknowledged, 1);
+    assert_eq!(store.collector_outbox_count().unwrap(), 0);
+    assert!(store
+        .collector_event_manifests()
+        .unwrap()
+        .iter()
+        .all(|record| record.status == "delivered"));
+
+    let manual_after_delivery = collector
+        .reconcile_manual(at("2026-07-15T00:00:04Z"))
+        .unwrap();
+    assert_eq!(manual_after_delivery.events_queued, 0);
+    assert_eq!(store.collector_outbox_count().unwrap(), 0);
+
+    transport.command = Some(OwnerCommand::Refresh {
+        command_id: "refresh-idempotent".to_string(),
+    });
+    let refreshed = collector
+        .poll_owner_command(&mut transport, at("2026-07-15T00:00:05Z"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        refreshed,
+        CommandOutcome::Refreshed { batch_id: None }
+    ));
+    assert_eq!(store.collector_outbox_count().unwrap(), 0);
+    let replayed_refresh = collector
+        .poll_owner_command(&mut transport, at("2026-07-15T00:00:06Z"))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        replayed_refresh,
+        CommandOutcome::Refreshed { batch_id: None }
+    ));
+    assert_eq!(store.collector_outbox_count().unwrap(), 0);
+
+    let source = roots[0].1.join("session.jsonl");
+    let original = fs::read_to_string(&source).unwrap();
+    fs::write(
+        &source,
+        format!(
+            "{}\n{}",
+            original,
+            r#"{"sessionId":"new-update","cwd":"/private/project","timestamp":"2026-07-15T00:00:07Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":101,"output_tokens":21}}}"#
+        ),
+    )
+    .unwrap();
+    let update = collector
+        .reconcile_manual(at("2026-07-15T00:00:07Z"))
+        .unwrap();
+    assert_eq!(update.events_queued, 1);
+    assert_eq!(store.collector_outbox_count().unwrap(), 1);
+    let delivered_update = collector
+        .deliver_pending(&mut transport, at("2026-07-15T00:00:08Z"))
+        .unwrap();
+    assert_eq!(delivered_update.acknowledged, 1);
+    assert_eq!(transport.unique_events_arrived, 7);
+    assert_eq!(store.collector_outbox_count().unwrap(), 0);
+    assert!(store
+        .collector_event_manifests()
+        .unwrap()
+        .iter()
+        .all(|record| record.status == "delivered"));
+}
+
+#[test]
+fn missing_source_timestamps_do_not_make_refresh_events_change() {
+    let (_dir, mut collector, roots, _usage_path, collector_path) = make_collector();
+    let source = roots[0].1.join("missing-timestamp.jsonl");
+    fs::write(
+        &source,
+        r#"{"sessionId":"missing-timestamp","cwd":"/private/project","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":3,"output_tokens":2}}}"#,
+    )
+    .unwrap();
+    let first = collector
+        .reconcile_manual(at("2026-07-15T00:00:00Z"))
+        .unwrap();
+    assert!(first.events_queued >= 1);
+    let mut transport = FakeTransport::default();
+    assert_eq!(
+        collector
+            .deliver_pending(&mut transport, at("2026-07-15T00:00:01Z"))
+            .unwrap()
+            .acknowledged,
+        1
+    );
+    let second = collector
+        .reconcile_manual(at("2026-07-15T00:00:02Z"))
+        .unwrap();
+    assert_eq!(second.events_queued, 0);
+    assert_eq!(
+        Database::open(collector_path)
+            .unwrap()
+            .collector_outbox_count()
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn hermes_state_database_rows_are_parsed_as_metadata() {
     let dir = tempdir().unwrap();
     let hermes_root = dir.path().join("hermes");
@@ -607,6 +808,86 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
 }
 
 #[test]
+fn credential_rotation_generates_locally_proves_after_retry_and_commits_atomically() {
+    let (_dir, mut collector, _roots, usage_path, collector_path) = make_collector();
+    let command = OwnerCommand::RotateCredential {
+        command_id: "rotate-local-secret".to_string(),
+        rotation_id: "rotation-local-secret".to_string(),
+    };
+    let mut transport = RotationTransport {
+        command,
+        activations: Vec::new(),
+        proofs: Vec::new(),
+        acknowledgements: Vec::new(),
+        fail_first_proof: true,
+    };
+
+    assert!(collector
+        .poll_owner_command(&mut transport, at("2026-07-15T00:00:00Z"))
+        .is_err());
+    let store = Database::open(collector_path.clone()).unwrap();
+    let after_crash = store.collector_identity().unwrap().unwrap();
+    assert_eq!(
+        after_crash.credential_token.as_deref(),
+        Some("ddcol_fixture.secret")
+    );
+    assert!(after_crash
+        .pending_credential_token
+        .as_deref()
+        .is_some_and(|token| token.starts_with("ddcol_rotation-local-secret.")));
+    assert_eq!(
+        after_crash.pending_credential_id.as_deref(),
+        Some("rotation-local-secret")
+    );
+    assert!(transport.activations[0].0 == "ddcol_fixture.secret");
+    assert!(!transport.activations[0].2.is_empty());
+    assert!(transport.proofs[0]
+        .0
+        .starts_with("ddcol_rotation-local-secret."));
+
+    drop(collector);
+    let mut restarted = Collector::with_databases(
+        Database::open(usage_path).unwrap(),
+        Database::open(collector_path.clone()).unwrap(),
+        CollectorOptions {
+            machine_id: Some("machine-fixtures".to_string()),
+            credential_token: Some("ddcol_fixture.secret".to_string()),
+            ..CollectorOptions::default()
+        },
+    )
+    .unwrap();
+    let outcome = restarted
+        .poll_owner_command(&mut transport, at("2026-07-15T00:02:00Z"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, CommandOutcome::CredentialRotationStaged);
+    let committed = store.collector_identity().unwrap().unwrap();
+    assert!(committed
+        .credential_token
+        .as_deref()
+        .is_some_and(|token| token.starts_with("ddcol_rotation-local-secret.")));
+    assert!(committed.pending_credential_token.is_none());
+    assert!(committed.pending_credential_id.is_none());
+    assert_eq!(transport.activations.len(), 2);
+    assert_eq!(transport.proofs.len(), 2);
+    assert_eq!(transport.acknowledgements.len(), 1);
+    let acknowledgement = serde_json::to_string(&transport.acknowledgements[0]).unwrap();
+    assert!(!acknowledgement.contains("ddcol_fixture.secret"));
+    assert!(!acknowledgement.contains("rotation-local-secret."));
+
+    // A completed receipt is safe to acknowledge again after a response loss;
+    // it does not regenerate or stage another secret.
+    let replayed = restarted
+        .poll_owner_command(&mut transport, at("2026-07-15T00:03:00Z"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed, CommandOutcome::CredentialRotationStaged);
+    assert_eq!(transport.activations.len(), 2);
+    assert_eq!(transport.proofs.len(), 2);
+    assert_eq!(transport.acknowledgements.len(), 2);
+}
+
+#[test]
 fn pending_credential_auth_failure_falls_back_without_retiring_old_token() {
     let (_dir, mut collector, _roots, _usage_path, collector_path) = make_collector();
     collector
@@ -616,7 +897,7 @@ fn pending_credential_auth_failure_falls_back_without_retiring_old_token() {
         .handle_owner_command(
             OwnerCommand::RotateCredential {
                 command_id: "rotate-fallback".to_string(),
-                credential_token: "pending-token".to_string(),
+                rotation_id: "rotation-fallback".to_string(),
             },
             at("2026-07-15T00:00:00Z"),
         )
@@ -626,13 +907,9 @@ fn pending_credential_auth_failure_falls_back_without_retiring_old_token() {
         .deliver_pending(&mut transport, at("2026-07-15T00:00:01Z"))
         .unwrap();
     assert_eq!(report.acknowledged, 1);
-    assert_eq!(
-        transport.seen_credentials,
-        vec![
-            "pending-token".to_string(),
-            "ddcol_fixture.secret".to_string()
-        ]
-    );
+    assert_eq!(transport.seen_credentials.len(), 2);
+    assert!(transport.seen_credentials[0].starts_with("ddcol_rotation-fallback."));
+    assert_eq!(transport.seen_credentials[1], "ddcol_fixture.secret");
     let identity = Database::open(collector_path)
         .unwrap()
         .collector_identity()
@@ -642,9 +919,10 @@ fn pending_credential_auth_failure_falls_back_without_retiring_old_token() {
         identity.credential_token.as_deref(),
         Some("ddcol_fixture.secret")
     );
+    assert!(identity.pending_credential_token.is_some());
     assert_eq!(
-        identity.pending_credential_token.as_deref(),
-        Some("pending-token")
+        identity.pending_credential_id.as_deref(),
+        Some("rotation-fallback")
     );
 }
 
@@ -666,6 +944,10 @@ fn terminal_outbox_is_excluded_and_requires_manual_recovery() {
         .unwrap();
     assert_eq!(report.pending, 0);
     assert_eq!(report.terminal, 1);
+    let repeated = collector
+        .reconcile_manual(at("2026-07-15T00:00:02Z"))
+        .unwrap();
+    assert_eq!(repeated.batch_id, None);
     let store = Database::open(collector_path).unwrap();
     assert!(store
         .collector_outbox_ready("2026-07-15T00:00:02Z", 10)

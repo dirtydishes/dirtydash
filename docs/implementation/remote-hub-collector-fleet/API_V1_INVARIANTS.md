@@ -19,6 +19,7 @@ See also:
 - Every `/api/v1` request is authenticated as a specific enrolled Machine and Collector credential; administrator sessions never substitute for Collector credentials.
 - Usage Event identity is stable across retries: `machine_id + agent + collector_event_fingerprint`.
 - Collectors deliver at least once. The Hub must treat duplicates idempotently.
+- Owner credential rotation commands carry only a non-secret rotation ID. The Collector generates the replacement secret, activates its hash through an authenticated overlap endpoint, proves the replacement, and commits locally only after Hub retirement.
 - Batch acknowledgement happens only after the entire batch is durably committed.
 - Incompatible protocol versions fail explicitly; silent downgrade is not an accepted behavior.
 - Hub ingestion writes remain serialized behind the repository seam even when many Collectors are connected.
@@ -31,6 +32,7 @@ See also:
 - Forbidden payloads include raw prompts, raw responses, copied session files, absolute paths, SSH passwords, sudo passwords, and any other secret or content that would let the Hub reconstruct original session text.
 - Collector-local manifests may retain machine-local file paths when needed for parsing, but Hub persistence stores only redacted or non-reversible identifiers.
 - Deployment and enrollment secrets live only in process/request memory before they are discarded or transformed into hashed credentials.
+- Hub command and acknowledgement persistence stores no raw Collector token; credential tables contain hashes only.
 
 ## Trust-Mode Invariants
 

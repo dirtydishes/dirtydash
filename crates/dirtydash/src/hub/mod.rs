@@ -27,6 +27,7 @@ pub(crate) use errors::{
 };
 pub(crate) use ingestion::upsert_usage_event_tx;
 pub(crate) use protocol::{
+    canonical_event_identity, validate_ack_result_has_no_secret, validate_command_has_no_secret,
     validate_identifier, validate_ingest_batch, validate_non_empty, validate_tailscale_identity,
     validate_time_zone,
 };
@@ -407,14 +408,14 @@ pub struct CollectorUsageEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "kebab-case")]
 pub enum OwnerCommand {
     Refresh {
         command_id: String,
     },
     RotateCredential {
         command_id: String,
-        credential_token: String,
+        rotation_id: String,
     },
     Diagnostics {
         command_id: String,
@@ -446,6 +447,28 @@ pub struct CollectorCommandPollResponse {
 pub struct CollectorCommandAckRequest {
     pub command_id: String,
     pub result: serde_json::Value,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorCredentialRotationActivationRequest {
+    pub machine_id: String,
+    pub rotation_id: String,
+    pub replacement_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorCredentialRotationProofRequest {
+    pub machine_id: String,
+    pub rotation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCredentialRotationResponse {
+    pub machine_id: String,
+    pub rotation_id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

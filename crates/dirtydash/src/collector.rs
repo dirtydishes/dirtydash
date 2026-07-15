@@ -5,7 +5,7 @@
 //! Parser reads happen against the local usage database, while the transport
 //! seam never receives a local path or session body.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{CollectorConfig as FileCollectorConfig, Config, SourceRoot};
 use crate::db::{
-    CollectorIdentityRecord, CollectorManifestRecord, CollectorOutboxRecord, Database,
-    UsageEventWrite,
+    CollectorEventManifestRecord, CollectorIdentityRecord, CollectorManifestRecord,
+    CollectorOutboxRecord, Database,
 };
 use crate::hub::{
     CheckpointInput, CollectorUsageEvent, IngestBatchRequest, IngestBatchResponse, OwnerCommand,
@@ -181,6 +181,40 @@ pub trait CollectorTransport {
         let _ = (credential_token, machine_id, command_id, result);
         Ok(())
     }
+
+    /// Activate one locally generated replacement. Implementations must send
+    /// the secret only in this request and must not persist or echo it.
+    fn activate_collector_credential_rotation(
+        &mut self,
+        credential_token: &str,
+        machine_id: &str,
+        rotation_id: &str,
+        replacement_secret: &str,
+    ) -> std::result::Result<(), TransportError> {
+        let _ = (
+            credential_token,
+            machine_id,
+            rotation_id,
+            replacement_secret,
+        );
+        Err(TransportError::protocol(
+            "credential rotation activation is unsupported by this transport",
+        ))
+    }
+
+    /// Prove the replacement with the newly constructed bearer token. The Hub
+    /// retires older credentials only after this authenticated proof.
+    fn prove_collector_credential_rotation(
+        &mut self,
+        replacement_token: &str,
+        machine_id: &str,
+        rotation_id: &str,
+    ) -> std::result::Result<(), TransportError> {
+        let _ = (replacement_token, machine_id, rotation_id);
+        Err(TransportError::protocol(
+            "credential rotation proof is unsupported by this transport",
+        ))
+    }
 }
 
 /// Production outbound-only HTTP transport. TLS is provided by reqwest's
@@ -320,6 +354,58 @@ impl CollectorTransport for CollectorHttpTransport {
             return Err(Self::response_error(&response));
         }
         Ok(())
+    }
+
+    fn activate_collector_credential_rotation(
+        &mut self,
+        credential_token: &str,
+        machine_id: &str,
+        rotation_id: &str,
+        replacement_secret: &str,
+    ) -> std::result::Result<(), TransportError> {
+        let response = self
+            .client
+            .post(self.endpoint("/api/v1/collector/credentials/rotation/activate"))
+            .bearer_auth(credential_token)
+            .json(&crate::hub::CollectorCredentialRotationActivationRequest {
+                machine_id: machine_id.to_string(),
+                rotation_id: rotation_id.to_string(),
+                replacement_secret: replacement_secret.to_string(),
+            })
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        response
+            .json::<crate::hub::CollectorCredentialRotationResponse>()
+            .map(|_| ())
+            .map_err(|_| TransportError::protocol("Hub returned an invalid rotation activation"))
+    }
+
+    fn prove_collector_credential_rotation(
+        &mut self,
+        replacement_token: &str,
+        machine_id: &str,
+        rotation_id: &str,
+    ) -> std::result::Result<(), TransportError> {
+        let response = self
+            .client
+            .post(self.endpoint("/api/v1/collector/credentials/rotation/prove"))
+            .bearer_auth(replacement_token)
+            .json(&crate::hub::CollectorCredentialRotationProofRequest {
+                machine_id: machine_id.to_string(),
+                rotation_id: rotation_id.to_string(),
+            })
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        response
+            .json::<crate::hub::CollectorCredentialRotationResponse>()
+            .map(|_| ())
+            .map_err(|_| TransportError::protocol("Hub returned an invalid rotation proof"))
     }
 }
 
@@ -589,6 +675,7 @@ impl Collector {
                 project_salt,
                 credential_token: options.credential_token.clone(),
                 pending_credential_token: None,
+                pending_credential_id: None,
             };
             store.save_collector_identity(&identity)?;
             identity
@@ -789,7 +876,7 @@ impl Collector {
         let mut payload_manifests = Vec::new();
         let mut payload_events = Vec::new();
         let mut seen_event_ids = BTreeSet::new();
-        let pending_event_ids = self.pending_collector_event_ids()?;
+        let pending_event_fingerprints = self.pending_collector_event_fingerprints()?;
         let mut seen_source_keys = BTreeSet::new();
         let mut files_reprocessed = 0;
         let mut parse_errors = 0;
@@ -861,23 +948,25 @@ impl Collector {
             }
             files_reprocessed += 1;
             for event in &parsed_file.events {
-                let write = self.usage_db.upsert_usage_event(event)?;
-                let event_id = format!(
-                    "{}:{}",
-                    event.source.as_str(),
-                    stable_event_fingerprint(event)
-                );
-                // If the unchanged event is already represented by durable
-                // pending bytes, a resumed Refresh must not append another
-                // copy. Otherwise preserve the first-Collector send path even
-                // when the dashboard DB already contained the event.
-                if matches!(write, UsageEventWrite::Skipped)
-                    && pending_event_ids.contains(&event_id)
-                {
-                    continue;
-                }
-                if seen_event_ids.insert(event_id) {
-                    payload_events.push(self.redact_event(event, &source_key, now));
+                let _write = self.usage_db.upsert_usage_event(event)?;
+                let collector_event_fingerprint = canonical_collector_event_fingerprint(event);
+                let event_identity =
+                    canonical_event_identity(event.source.as_str(), &collector_event_fingerprint);
+                let redacted = self.redact_event(event, &source_key, now);
+                let canonical_fingerprint = canonical_event_fingerprint(&redacted)?;
+                let existing = self.store.collector_event_manifest(&event_identity)?;
+                let pending_fingerprint = pending_event_fingerprints.get(&event_identity);
+                let already_emitted = existing.as_ref().is_some_and(|record| {
+                    record.canonical_fingerprint == canonical_fingerprint
+                        && matches!(record.status.as_str(), "emitted" | "delivered")
+                });
+                let already_pending = pending_fingerprint == Some(&canonical_fingerprint);
+                // A forced Refresh still reparses the source, but a canonical
+                // event is emitted only when it is new or its redacted wire
+                // representation changed. The pending fallback closes the
+                // crash window before the durable event-manifest row exists.
+                if !already_emitted && !already_pending && seen_event_ids.insert(event_identity) {
+                    payload_events.push(redacted);
                 }
             }
         }
@@ -963,9 +1052,27 @@ impl Collector {
             let mut request = request_without_batch;
             request.batch_id = batch_id.clone();
             let events_queued = request.events.len();
+            let event_manifests = request
+                .events
+                .iter()
+                .map(|event| {
+                    Ok(CollectorEventManifestRecord {
+                        event_identity: canonical_event_identity(
+                            &event.agent,
+                            &event.collector_event_fingerprint,
+                        ),
+                        source_key: event.source_key.clone(),
+                        canonical_fingerprint: canonical_event_fingerprint(event)?,
+                        status: "emitted".to_string(),
+                        emitted_at: imported_at.clone(),
+                        delivered_at: None,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             let payload_json = serde_json::to_string(&request)?;
             self.store.commit_collector_reconciliation(
                 &manifests,
+                &event_manifests,
                 &batch_id,
                 &self.identity.machine_id,
                 &payload_json,
@@ -1023,21 +1130,21 @@ impl Collector {
         Ok((reconciliation, delivery))
     }
 
-    fn pending_collector_event_ids(&self) -> Result<BTreeSet<String>> {
-        let mut event_ids = BTreeSet::new();
-        for record in self.store.collector_outbox_records(false)? {
+    fn pending_collector_event_fingerprints(&self) -> Result<BTreeMap<String, String>> {
+        let mut event_fingerprints = BTreeMap::new();
+        for record in self.store.collector_outbox_records(true)? {
             let Ok(request) = serde_json::from_str::<IngestBatchRequest>(&record.payload_json)
             else {
                 continue;
             };
-            event_ids.extend(
-                request
-                    .events
-                    .into_iter()
-                    .map(|event| format!("{}:{}", event.agent, event.collector_event_fingerprint)),
-            );
+            for event in request.events {
+                let event_identity =
+                    canonical_event_identity(&event.agent, &event.collector_event_fingerprint);
+                let fingerprint = canonical_event_fingerprint(&event)?;
+                event_fingerprints.insert(event_identity, fingerprint);
+            }
         }
-        Ok(event_ids)
+        Ok(event_fingerprints)
     }
 
     fn credential_candidates(&self) -> Result<Vec<(String, bool)>> {
@@ -1136,16 +1243,33 @@ impl Collector {
             // No SQLite connection is held across this potentially long call.
             let sent = self.send_batch_with_fallback(transport, &request);
             match sent {
-                Ok((response, used_pending)) if response.batch_id == request.batch_id => {
-                    if self.store.acknowledge_collector_batch_if_matching(
-                        &request.batch_id,
-                        &response.batch_id,
-                    )? {
-                        // A successful request with the pending token is the
-                        // rotation proof; old remains available on fallback.
-                        if used_pending {
-                            let _ = self.store.commit_staged_collector_credential()?;
-                        }
+                Ok((response, _used_pending)) if response.batch_id == request.batch_id => {
+                    let event_manifests = request
+                        .events
+                        .iter()
+                        .map(|event| {
+                            Ok(CollectorEventManifestRecord {
+                                event_identity: canonical_event_identity(
+                                    &event.agent,
+                                    &event.collector_event_fingerprint,
+                                ),
+                                source_key: event.source_key.clone(),
+                                canonical_fingerprint: canonical_event_fingerprint(event)?,
+                                status: "emitted".to_string(),
+                                emitted_at: request.sync_run.finished_at.clone(),
+                                delivered_at: None,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if self
+                        .store
+                        .acknowledge_collector_batch_if_matching_with_events(
+                            &request.batch_id,
+                            &response.batch_id,
+                            &event_manifests,
+                            &now.to_rfc3339(),
+                        )?
+                    {
                         report.acknowledged += 1;
                     }
                 }
@@ -1227,14 +1351,14 @@ impl Collector {
         used_pending: bool,
         command_id: &str,
         outcome: &CommandOutcome,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         match transport.acknowledge_owner_command(
             credential,
             &self.identity.machine_id,
             command_id,
             outcome,
         ) {
-            Ok(()) => Ok(used_pending),
+            Ok(()) => Ok(()),
             Err(error) if error.class == RetryClass::Unauthorized && used_pending => {
                 let candidates = self.credential_candidates()?;
                 let (current, _) = candidates
@@ -1249,7 +1373,7 @@ impl Collector {
                         outcome,
                     )
                     .map_err(|error| anyhow::anyhow!(error))?;
-                Ok(false)
+                Ok(())
             }
             Err(error) => Err(anyhow::anyhow!(error)),
         }
@@ -1279,16 +1403,13 @@ impl Collector {
             } else {
                 let outcome: CommandOutcome = serde_json::from_str(&receipt.result_json)
                     .context("stored Collector command receipt is invalid")?;
-                let acknowledged_with_pending = self.acknowledge_command_with_fallback(
+                self.acknowledge_command_with_fallback(
                     transport,
                     &credential,
                     used_pending,
                     &command_id,
                     &outcome,
                 )?;
-                if acknowledged_with_pending {
-                    let _ = self.store.commit_staged_collector_credential()?;
-                }
                 return Ok(Some(outcome));
             }
         }
@@ -1304,20 +1425,30 @@ impl Collector {
                     .to_string(),
             }));
         }
-        let outcome = self.handle_owner_command(command, now)?;
+        let (outcome, acknowledgement_credential, acknowledgement_used_pending) = match command {
+            OwnerCommand::RotateCredential { rotation_id, .. } => {
+                let (outcome, replacement_token) =
+                    self.execute_credential_rotation(transport, &rotation_id)?;
+                // The local commit happens immediately after Hub proof, so the
+                // acknowledgement uses the replacement as the current token.
+                (outcome, replacement_token, false)
+            }
+            command => (
+                self.handle_owner_command(command, now)?,
+                credential,
+                used_pending,
+            ),
+        };
         let result_json = serde_json::to_string(&outcome)?;
         self.store
             .save_collector_command_result(&command_id, &result_json, &now.to_rfc3339())?;
-        let acknowledged_with_pending = self.acknowledge_command_with_fallback(
+        self.acknowledge_command_with_fallback(
             transport,
-            &credential,
-            used_pending,
+            &acknowledgement_credential,
+            acknowledgement_used_pending,
             &command_id,
             &outcome,
         )?;
-        if acknowledged_with_pending {
-            let _ = self.store.commit_staged_collector_credential()?;
-        }
         Ok(Some(outcome))
     }
 
@@ -1343,6 +1474,119 @@ impl Collector {
         Ok(())
     }
 
+    fn stage_local_credential_rotation(&self, rotation_id: &str) -> Result<String> {
+        if !is_safe_rotation_id(rotation_id) {
+            anyhow::bail!("credential rotation ID is invalid");
+        }
+        let identity = self
+            .store
+            .collector_identity()?
+            .context("Collector identity is missing")?;
+        if let Some(pending_id) = identity.pending_credential_id.as_deref() {
+            if pending_id != rotation_id {
+                anyhow::bail!("another credential rotation is already pending");
+            }
+            return identity
+                .pending_credential_token
+                .context("pending credential rotation is missing its local secret");
+        }
+        if identity.pending_credential_token.is_some() {
+            anyhow::bail!("legacy pending credential rotation has no rotation ID");
+        }
+        if identity
+            .credential_token
+            .as_deref()
+            .is_some_and(|token| token_credential_id(token) == Some(rotation_id))
+        {
+            return identity
+                .credential_token
+                .context("current credential disappeared during rotation");
+        }
+        let replacement_token = format!("ddcol_{rotation_id}.{}", random_hex(24));
+        self.store
+            .stage_collector_credential(rotation_id, &replacement_token)?;
+        Ok(replacement_token)
+    }
+
+    fn rotation_activation_candidates(&self) -> Result<Vec<String>> {
+        let identity = self
+            .store
+            .collector_identity()?
+            .context("Collector identity is missing")?;
+        let mut candidates = Vec::new();
+        if let Some(current) = identity.credential_token {
+            candidates.push(current);
+        }
+        if let Some(pending) = identity.pending_credential_token {
+            if !candidates.iter().any(|candidate| candidate == &pending) {
+                candidates.push(pending);
+            }
+        }
+        if candidates.is_empty() {
+            anyhow::bail!("Collector credential is not configured");
+        }
+        Ok(candidates)
+    }
+
+    fn execute_credential_rotation<T: CollectorTransport>(
+        &mut self,
+        transport: &mut T,
+        rotation_id: &str,
+    ) -> Result<(CommandOutcome, String)> {
+        let replacement_token = self.stage_local_credential_rotation(rotation_id)?;
+        let (_, replacement_secret) = replacement_token
+            .strip_prefix("ddcol_")
+            .and_then(|value| value.rsplit_once('.'))
+            .context("locally generated replacement credential is invalid")?;
+        let mut last_activation_error = None;
+        let mut activated = false;
+        for credential in self.rotation_activation_candidates()? {
+            match transport.activate_collector_credential_rotation(
+                &credential,
+                &self.identity.machine_id,
+                rotation_id,
+                replacement_secret,
+            ) {
+                Ok(()) => {
+                    activated = true;
+                    break;
+                }
+                Err(error) if error.class == RetryClass::Unauthorized => {
+                    last_activation_error = Some(error);
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
+        }
+        if !activated {
+            return Err(anyhow::anyhow!(last_activation_error.unwrap_or_else(
+                || {
+                    TransportError::new(
+                        RetryClass::Unauthorized,
+                        "all Collector credentials rejected during rotation activation",
+                    )
+                }
+            )));
+        }
+        transport
+            .prove_collector_credential_rotation(
+                &replacement_token,
+                &self.identity.machine_id,
+                rotation_id,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+        // Proof is the Hub cutover point. Commit locally immediately after it
+        // so a crash can leave either a durable pending secret or the complete
+        // new credential, never a partially written replacement.
+        let _ = self
+            .store
+            .commit_staged_collector_credential_if(rotation_id)?;
+        self.identity = self
+            .store
+            .collector_identity()?
+            .context("Collector identity disappeared after rotation")?;
+        Ok((CommandOutcome::CredentialRotationStaged, replacement_token))
+    }
+
     pub fn handle_owner_command(
         &mut self,
         command: OwnerCommand,
@@ -1355,16 +1599,8 @@ impl Collector {
                     batch_id: report.batch_id,
                 })
             }
-            OwnerCommand::RotateCredential {
-                credential_token, ..
-            } => {
-                if credential_token.trim().is_empty() {
-                    return Ok(CommandOutcome::Rejected {
-                        reason: "credential token is empty".to_string(),
-                    });
-                }
-                self.store
-                    .stage_collector_credential(credential_token.trim())?;
+            OwnerCommand::RotateCredential { rotation_id, .. } => {
+                self.stage_local_credential_rotation(&rotation_id)?;
                 Ok(CommandOutcome::CredentialRotationStaged)
             }
             OwnerCommand::Diagnostics { .. } => {
@@ -1449,17 +1685,19 @@ impl Collector {
         &self,
         event: &UsageEvent,
         source_key: &str,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> CollectorUsageEvent {
         let occurred_at = event
             .event_timestamp
             .as_deref()
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc).to_rfc3339())
-            .unwrap_or_else(|| now.to_rfc3339());
+            // A missing source timestamp must not turn every forced Refresh
+            // into a changed event merely because reconciliation ran later.
+            .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string());
         CollectorUsageEvent {
             agent: event.source.as_str().to_string(),
-            collector_event_fingerprint: format!("event-{}", stable_event_fingerprint(event)),
+            collector_event_fingerprint: canonical_collector_event_fingerprint(event),
             occurred_at,
             session_key: redacted_identifier(
                 &self.identity.project_salt,
@@ -1547,6 +1785,21 @@ impl Collector {
 
 pub fn redacted_project_id(project_salt: &str, project_path: &str) -> String {
     redacted_identifier(project_salt, "project", project_path)
+}
+
+/// Canonical wire identity used by reconciliation, outbox replay, and Hub
+/// deduplication. Keeping the delimiter and fingerprint prefix in one helper
+/// prevents local-parser and serialized-payload identities from diverging.
+pub fn canonical_event_identity(agent: &str, collector_event_fingerprint: &str) -> String {
+    crate::hub::canonical_event_identity(agent, collector_event_fingerprint)
+}
+
+fn canonical_collector_event_fingerprint(event: &UsageEvent) -> String {
+    format!("event-{}", stable_event_fingerprint(event))
+}
+
+fn canonical_event_fingerprint(event: &CollectorUsageEvent) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(event)?)))
 }
 
 pub fn redacted_identifier(project_salt: &str, namespace: &str, value: &str) -> String {
@@ -1660,6 +1913,21 @@ fn is_safe_update_version(value: &str) -> bool {
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
         })
+}
+
+fn is_safe_rotation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ':' | '@')
+        })
+}
+
+fn token_credential_id(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("ddcol_")?
+        .rsplit_once('.')
+        .map(|(id, _)| id)
 }
 
 fn safe_diagnostic(value: String) -> String {

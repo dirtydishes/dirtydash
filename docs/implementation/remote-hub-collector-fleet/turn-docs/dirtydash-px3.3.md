@@ -46,6 +46,7 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 
 - The phase PR targets the integration branch rather than `main`.
 - The user-selected `dirtyloops.scout` override is `openai-codex/gpt-5.6-sol` with low reasoning and the original read-only tool boundary.
+- Focused re-review returned the same mutable owner for two bounded repairs only: reconciliation event identity/outbox idempotency and secret-free command rotation.
 
 ## Discoveries And Decisions
 
@@ -56,6 +57,8 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 - `AppPaths` now derives a separate Collector SQLite path. Its manifest advance and immutable serialized `IngestBatchRequest` outbox append share one SQLite transaction. Outbox rows survive restart/offline states and are deleted only after an exact batch acknowledgement.
 - Watch notifications are coalesced hints; startup, periodic fifteen-minute, manual, and watcher-fallback paths all use complete reconciliation. Failure is persisted and visible as degraded status. No inbound Collector port or deployment/fleet UI was added.
 - Owner commands are typed and allowlisted for refresh, two-phase credential staging/commit, metadata-only diagnostics, and approved version/digest updates. Minimal authenticated Hub poll/ack and owner issue endpoints reuse the Phase 2 identity/ingestion contracts.
+- The re-review found that forced Refresh reparsed correctly but compared `source:fingerprint` locally with `agent:event-fingerprint` in pending payloads and had no durable delivered-event state. `collector_event_manifests` now stores canonical identity, canonical payload fingerprint, emitted state, and delivery state in the same transaction as manifest/outbox advancement. Startup, manual, and owner Refresh paths therefore reparse when required while enqueueing only new or changed canonical events; missing timestamps use a stable fallback and tombstones remain manifest-driven.
+- Credential rotation commands now carry only `rotation_id`. The Collector creates and durably stages its replacement token locally, activates only its SHA-256 hash through authenticated overlap endpoints, proves the replacement with the new bearer, then atomically commits the local credential. Hub rotation/command rows and acknowledgements reject or scrub raw credential-shaped values; old command rows are cleaned during migration, and old credentials remain valid until explicit proof.
 
 ## Implementation And Delegation Evidence
 
@@ -65,34 +68,38 @@ The mutable implementation session incorporated both accepted read-only Sol-low 
 
 - `crates/dirtydash/src/collector.rs`: outbound Collector, redaction, manifests/outbox, retry policy/classification, watcher scheduling/degradation, command receipts/handlers, credential rotation, instance lease, and transport seam.
 - `crates/dirtydash/src/importers.rs`: shared Collector parser registry, Hermes support/state DB fallback, format-evidence detection, parser versions, path-independent event fingerprints.
-- `crates/dirtydash/src/db.rs`: Collector-only migration, identity/rotation, manifest/outbox/receipt/lock/command storage, atomic reconciliation transaction.
+- `crates/dirtydash/src/db.rs`: Collector-only migration, event-manifest emitted/delivered state, identity/rotation, outbox/receipt/lock/command storage, and atomic reconciliation/delivery transactions.
 - `crates/dirtydash/src/app_paths.rs`, `config.rs`, `cli.rs`, `lib.rs`: separate Collector path/config and `collector reconcile`/`collector diagnostics` CLI.
-- `crates/dirtydash/src/hub/{mod.rs,repository.rs,router.rs}`: public protocol command types and minimal authenticated command issue/poll/ack endpoints.
-- `crates/dirtydash/tests/collector.rs`, `crates/dirtydash/tests/fixtures/{claude-code,codex,opencode,pi,hermes-agent}`: five-Agent real fixtures and focused malformed/token/confidence/redaction/replay/restart/parser-upgrade/watcher/command/backoff/single-instance/state-db tests.
-- `crates/dirtydash/src/hub/tests.rs`, `crates/dirtydash/tests/cli.rs`: command endpoint coverage and Hermes test-environment isolation.
+- `crates/dirtydash/src/hub/{mod.rs,repository.rs,router.rs,protocol.rs}`: non-secret rotation instruction, authenticated activation/proof endpoints, and command/ack secret rejection.
+- `crates/dirtydash/tests/collector.rs`, `crates/dirtydash/tests/fixtures/{claude-code,codex,opencode,pi,hermes-agent}`: five-Agent real fixtures plus repeated startup/manual/Refresh, durable event-state, missing-timestamp, rotation fallback/retry/crash, and secret-free acknowledgement tests.
+- `crates/dirtydash/src/hub/tests.rs`, `crates/dirtydash/tests/cli.rs`: command endpoint, overlap-proof, Hub-table secret scan, and Hermes test-environment isolation.
 
 ## Review
 
-Coordinator-owned independent review remains pending. No review or merge was performed in this session.
+Focused independent re-review identified two confirmed blockers and no broader scope expansion. This repair closes the canonical identity mismatch/durable delivery-state gap and removes raw credential material from command/ack persistence while preserving overlap fallback and crash replay. No merge was performed in this session.
 
 ## CI And Gates
 
-Owner: coordinator
+Owner: current Phase 3 mutable owner; coordinator retains integration/merge ownership
 
-State: local implementation gates passed; independent review/CI pending
+State: passed locally; final push/remote verification pending
 
 Evidence:
 
-- `cargo fmt --all -- --check` passed after formatting.
-- `cargo clippy --all-targets -- -D warnings` passed.
-- `cargo test --all-targets` passed: 47 unit tests, 6 CLI tests, and 6 Collector integration tests.
+- Focused red-capable regression initially failed because repeated manual Refresh queued six duplicate events before delivery; it passes after the event-manifest repair.
+- Focused Collector suite passes 14 tests, including repeated startup/manual/owner Refresh before and after delivery, missing timestamps, tombstones, terminal outbox bounding, local rotation generation, fallback, proof retry, restart reclaim, atomic commit, and acknowledgement redaction.
+- Focused Hub suite passes 31 tests, including overlap activation/proof, idempotent retries, command JSON/ack secret rejection, all-table raw-token scan, and legacy command migration cleanup.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+- `cargo test --workspace --all-targets --all-features` passed before the final migration-test addition; the final full gate is rerun at closeout.
 - `git diff --check` passed.
 
 ## PR And Commits
 
 - Implementation commits: `cfe13e4` (`feat: add durable outbound collector runtime`) and `b87597d` (removed-source tombstones/manifest completeness).
+- Repair commit(s): final hash recorded at closeout after the focused re-review repair gates pass.
 - Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`, state open.
-- Coordinator retains independent review, CI disposition, merge, and Beads/phase advancement ownership.
+- Coordinator retains integration/merge ownership; this session does not mutate Beads or merge the PR.
 
 
 ## Beads Updates And Follow-Ups

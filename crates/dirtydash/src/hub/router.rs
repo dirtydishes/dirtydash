@@ -56,6 +56,14 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             "/api/v1/collector/commands/ack",
             post(collector_ack_command),
         )
+        .route(
+            "/api/v1/collector/credentials/rotation/activate",
+            post(collector_activate_credential_rotation),
+        )
+        .route(
+            "/api/v1/collector/credentials/rotation/prove",
+            post(collector_prove_credential_rotation),
+        )
         .route("/api/v1/ingest/batches", post(collector_ingest_batch))
         .with_state(HubState { repo, config })
 }
@@ -218,6 +226,32 @@ async fn collector_ack_command(
     let auth = collector_auth(&state.repo, &headers)?;
     state.repo.acknowledge_collector_command(&auth, request)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn collector_activate_credential_rotation(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorCredentialRotationActivationRequest>,
+) -> Result<Json<CollectorCredentialRotationResponse>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    Ok(Json(
+        state
+            .repo
+            .activate_collector_credential_rotation(&auth, request)?,
+    ))
+}
+
+async fn collector_prove_credential_rotation(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorCredentialRotationProofRequest>,
+) -> Result<Json<CollectorCredentialRotationResponse>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    Ok(Json(
+        state
+            .repo
+            .prove_collector_credential_rotation(&auth, request)?,
+    ))
 }
 
 async fn collector_ingest_batch(

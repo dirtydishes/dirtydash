@@ -136,6 +136,8 @@ pub struct CollectorIdentityRecord {
     pub project_salt: String,
     pub credential_token: Option<String>,
     pub pending_credential_token: Option<String>,
+    #[serde(default)]
+    pub pending_credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +151,20 @@ pub struct CollectorManifestRecord {
     pub cursor: Option<String>,
     pub parse_error: Option<String>,
     pub last_reconciled_at: String,
+}
+
+/// Durable per-event reconciliation state. `emitted` means the canonical
+/// event is represented by a local outbox row; `delivered` means that row was
+/// acknowledged by the Hub. Keeping the canonical payload fingerprint here
+/// lets a forced parser re-read enqueue only a new or changed event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorEventManifestRecord {
+    pub event_identity: String,
+    pub source_key: String,
+    pub canonical_fingerprint: String,
+    pub status: String,
+    pub emitted_at: String,
+    pub delivered_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,7 +238,7 @@ impl Database {
     pub fn collector_identity(&self) -> Result<Option<CollectorIdentityRecord>> {
         let conn = self.connection()?;
         conn.query_row(
-            "SELECT machine_id, project_salt, credential_token, pending_credential_token FROM collector_identity WHERE identity_id = 1",
+            "SELECT machine_id, project_salt, credential_token, pending_credential_token, pending_credential_id FROM collector_identity WHERE identity_id = 1",
             [],
             |row| {
                 Ok(CollectorIdentityRecord {
@@ -230,6 +246,7 @@ impl Database {
                     project_salt: row.get(1)?,
                     credential_token: row.get(2)?,
                     pending_credential_token: row.get(3)?,
+                    pending_credential_id: row.get(4)?,
                 })
             },
         )
@@ -244,13 +261,14 @@ impl Database {
             r#"
             INSERT INTO collector_identity(
                 identity_id, machine_id, project_salt, credential_token,
-                pending_credential_token, created_at, updated_at
-            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?5)
+                pending_credential_token, pending_credential_id, created_at, updated_at
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?6)
             ON CONFLICT(identity_id) DO UPDATE SET
                 machine_id = excluded.machine_id,
                 project_salt = excluded.project_salt,
                 credential_token = excluded.credential_token,
                 pending_credential_token = excluded.pending_credential_token,
+                pending_credential_id = excluded.pending_credential_id,
                 updated_at = excluded.updated_at
             "#,
             params![
@@ -258,6 +276,7 @@ impl Database {
                 identity.project_salt,
                 identity.credential_token,
                 identity.pending_credential_token,
+                identity.pending_credential_id,
                 now
             ],
         )?;
@@ -267,40 +286,54 @@ impl Database {
     pub fn set_collector_credential(&self, token: Option<&str>) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
-            "UPDATE collector_identity SET credential_token = ?1, pending_credential_token = NULL, updated_at = ?2 WHERE identity_id = 1",
+            "UPDATE collector_identity SET credential_token = ?1, pending_credential_token = NULL, pending_credential_id = NULL, updated_at = ?2 WHERE identity_id = 1",
             params![token, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
 
-    /// Stage a new credential without destroying the currently usable one.
-    pub fn stage_collector_credential(&self, token: &str) -> Result<()> {
+    /// Stage a locally generated replacement without destroying the currently
+    /// usable credential. The rotation ID binds the local secret to one
+    /// replay-safe Hub instruction without persisting that secret remotely.
+    pub fn stage_collector_credential(&self, rotation_id: &str, token: &str) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
-            "UPDATE collector_identity SET pending_credential_token = ?1, updated_at = ?2 WHERE identity_id = 1",
-            params![token, Utc::now().to_rfc3339()],
+            "UPDATE collector_identity SET pending_credential_token = ?1, pending_credential_id = ?2, updated_at = ?3 WHERE identity_id = 1",
+            params![token, rotation_id, Utc::now().to_rfc3339()],
         )?;
         Ok(())
     }
 
-    /// Commit a staged credential only after a batch has been acknowledged with
-    /// it. The transition is one SQLite write transaction.
+    /// Commit a staged credential only after the Hub has accepted the explicit
+    /// rotation proof. The transition is one SQLite write transaction.
     pub fn commit_staged_collector_credential(&self) -> Result<bool> {
+        self.commit_staged_collector_credential_if("")
+    }
+
+    pub fn commit_staged_collector_credential_if(&self, rotation_id: &str) -> Result<bool> {
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let pending = tx
             .query_row(
-                "SELECT pending_credential_token FROM collector_identity WHERE identity_id = 1",
+                "SELECT pending_credential_token, pending_credential_id FROM collector_identity WHERE identity_id = 1",
                 [],
-                |row| row.get::<_, Option<String>>(0),
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
-        let Some(pending) = pending.flatten() else {
+        let Some((pending, pending_id)) = pending else {
             tx.commit()?;
             return Ok(false);
         };
+        let Some(pending) = pending else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        if !rotation_id.is_empty() && pending_id.as_deref() != Some(rotation_id) {
+            tx.commit()?;
+            return Ok(false);
+        }
         tx.execute(
-            "UPDATE collector_identity SET credential_token = ?1, pending_credential_token = NULL, updated_at = ?2 WHERE identity_id = 1",
+            "UPDATE collector_identity SET credential_token = ?1, pending_credential_token = NULL, pending_credential_id = NULL, updated_at = ?2 WHERE identity_id = 1",
             params![pending, Utc::now().to_rfc3339()],
         )?;
         tx.commit()?;
@@ -310,7 +343,7 @@ impl Database {
     pub fn clear_staged_collector_credential(&self) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(
-            "UPDATE collector_identity SET pending_credential_token = NULL, updated_at = ?1 WHERE identity_id = 1",
+            "UPDATE collector_identity SET pending_credential_token = NULL, pending_credential_id = NULL, updated_at = ?1 WHERE identity_id = 1",
             params![Utc::now().to_rfc3339()],
         )?;
         Ok(())
@@ -381,6 +414,41 @@ impl Database {
         Ok(())
     }
 
+    pub fn collector_event_manifest(
+        &self,
+        event_identity: &str,
+    ) -> Result<Option<CollectorEventManifestRecord>> {
+        let conn = self.connection()?;
+        conn.query_row(
+            r#"
+            SELECT event_identity, source_key, canonical_fingerprint, status,
+                emitted_at, delivered_at
+            FROM collector_event_manifests
+            WHERE event_identity = ?1
+            "#,
+            params![event_identity],
+            collector_event_manifest_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn collector_event_manifests(&self) -> Result<Vec<CollectorEventManifestRecord>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            r#"
+            SELECT event_identity, source_key, canonical_fingerprint, status,
+                emitted_at, delivered_at
+            FROM collector_event_manifests
+            ORDER BY event_identity
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], collector_event_manifest_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn enqueue_collector_batch(
         &self,
         batch_id: &str,
@@ -408,6 +476,7 @@ impl Database {
     pub fn commit_collector_reconciliation(
         &self,
         manifests: &[CollectorManifestRecord],
+        event_manifests: &[CollectorEventManifestRecord],
         batch_id: &str,
         machine_id: &str,
         payload_json: &str,
@@ -442,6 +511,28 @@ impl Database {
                     record.cursor,
                     record.parse_error,
                     record.last_reconciled_at,
+                ],
+            )?;
+        }
+        for record in event_manifests {
+            tx.execute(
+                r#"
+                INSERT INTO collector_event_manifests(
+                    event_identity, source_key, canonical_fingerprint, status,
+                    emitted_at, delivered_at
+                ) VALUES (?1, ?2, ?3, 'emitted', ?4, NULL)
+                ON CONFLICT(event_identity) DO UPDATE SET
+                    source_key = excluded.source_key,
+                    canonical_fingerprint = excluded.canonical_fingerprint,
+                    status = 'emitted',
+                    emitted_at = excluded.emitted_at,
+                    delivered_at = NULL
+                "#,
+                params![
+                    record.event_identity,
+                    record.source_key,
+                    record.canonical_fingerprint,
+                    record.emitted_at,
                 ],
             )?;
         }
@@ -527,7 +618,12 @@ impl Database {
     }
 
     pub fn acknowledge_collector_batch(&self, batch_id: &str) -> Result<bool> {
-        self.acknowledge_collector_batch_if_matching(batch_id, batch_id)
+        self.acknowledge_collector_batch_if_matching_with_events(
+            batch_id,
+            batch_id,
+            &[],
+            &Utc::now().to_rfc3339(),
+        )
     }
 
     pub fn acknowledge_collector_batch_if_matching(
@@ -535,14 +631,57 @@ impl Database {
         expected_batch_id: &str,
         acknowledged_batch_id: &str,
     ) -> Result<bool> {
+        self.acknowledge_collector_batch_if_matching_with_events(
+            expected_batch_id,
+            acknowledged_batch_id,
+            &[],
+            &Utc::now().to_rfc3339(),
+        )
+    }
+
+    pub fn acknowledge_collector_batch_if_matching_with_events(
+        &self,
+        expected_batch_id: &str,
+        acknowledged_batch_id: &str,
+        event_manifests: &[CollectorEventManifestRecord],
+        delivered_at: &str,
+    ) -> Result<bool> {
         if expected_batch_id != acknowledged_batch_id {
             return Ok(false);
         }
-        let conn = self.connection()?;
-        Ok(conn.execute(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
             "DELETE FROM collector_outbox WHERE batch_id = ?1",
             params![expected_batch_id],
-        )? > 0)
+        )? > 0;
+        if deleted {
+            for record in event_manifests {
+                tx.execute(
+                    r#"
+                    INSERT INTO collector_event_manifests(
+                        event_identity, source_key, canonical_fingerprint, status,
+                        emitted_at, delivered_at
+                    ) VALUES (?1, ?2, ?3, 'delivered', ?4, ?5)
+                    ON CONFLICT(event_identity) DO UPDATE SET
+                        source_key = excluded.source_key,
+                        canonical_fingerprint = excluded.canonical_fingerprint,
+                        status = 'delivered',
+                        delivered_at = excluded.delivered_at
+                    WHERE collector_event_manifests.canonical_fingerprint = excluded.canonical_fingerprint
+                    "#,
+                    params![
+                        record.event_identity,
+                        record.source_key,
+                        record.canonical_fingerprint,
+                        record.emitted_at,
+                        delivered_at,
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn fail_collector_batch(
@@ -987,6 +1126,7 @@ impl Database {
                 project_salt TEXT NOT NULL,
                 credential_token TEXT,
                 pending_credential_token TEXT,
+                pending_credential_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -1001,6 +1141,15 @@ impl Database {
                 cursor TEXT,
                 parse_error TEXT,
                 last_reconciled_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_event_manifests (
+                event_identity TEXT PRIMARY KEY,
+                source_key TEXT NOT NULL,
+                canonical_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'emitted',
+                emitted_at TEXT NOT NULL,
+                delivered_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS collector_outbox (
@@ -1066,6 +1215,15 @@ impl Database {
                 [],
             )?;
         }
+        if !columns
+            .iter()
+            .any(|column| column == "pending_credential_id")
+        {
+            conn.execute(
+                "ALTER TABLE collector_identity ADD COLUMN pending_credential_id TEXT",
+                [],
+            )?;
+        }
         let outbox_columns = table_columns(conn, "collector_outbox")?;
         if !outbox_columns.iter().any(|column| column == "status") {
             conn.execute(
@@ -1113,6 +1271,28 @@ impl Database {
                 [],
             )?;
         }
+        // Older Phase 3 builds could persist a replacement token inside an
+        // owner command or acknowledgement. Those rows cannot be replayed
+        // safely after the protocol change, so remove/redact them during the
+        // additive migration rather than carrying plaintext forward.
+        conn.execute(
+            r#"
+            DELETE FROM collector_commands
+            WHERE command_json LIKE '%credential_token%'
+                OR command_json LIKE '%ddcol_%'
+            "#,
+            [],
+        )?;
+        conn.execute(
+            r#"
+            UPDATE collector_command_results
+            SET result_json = '{"type":"rejected","reason":"legacy credential result redacted"}'
+            WHERE result_json LIKE '%credential_token%'
+                OR result_json LIKE '%ddcol_%'
+                OR result_json LIKE '%secret%'
+            "#,
+            [],
+        )?;
         Ok(())
     }
 
@@ -1141,6 +1321,23 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_collector_credentials_machine
                 ON collector_credentials(machine_id, revoked_at);
+
+            CREATE TABLE IF NOT EXISTS collector_credential_rotations (
+                rotation_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                credential_id TEXT NOT NULL UNIQUE,
+                previous_credential_id TEXT NOT NULL,
+                credential_label TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                activated_at TEXT NOT NULL,
+                proved_at TEXT,
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE,
+                FOREIGN KEY(credential_id) REFERENCES collector_credentials(credential_id) ON DELETE CASCADE,
+                FOREIGN KEY(previous_credential_id) REFERENCES collector_credentials(credential_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_collector_credential_rotations_machine
+                ON collector_credential_rotations(machine_id, status);
 
             CREATE TABLE IF NOT EXISTS ingest_batches (
                 batch_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2123,6 +2320,19 @@ fn collector_manifest_from_row(
         cursor: row.get(6)?,
         parse_error: row.get(7)?,
         last_reconciled_at: row.get(8)?,
+    })
+}
+
+fn collector_event_manifest_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CollectorEventManifestRecord> {
+    Ok(CollectorEventManifestRecord {
+        event_identity: row.get(0)?,
+        source_key: row.get(1)?,
+        canonical_fingerprint: row.get(2)?,
+        status: row.get(3)?,
+        emitted_at: row.get(4)?,
+        delivered_at: row.get(5)?,
     })
 }
 

@@ -805,6 +805,263 @@ async fn collector_credential_rotation_and_revocation_work() {
 }
 
 #[tokio::test]
+async fn collector_rotation_uses_non_secret_instruction_and_secret_free_hub_persistence() {
+    let repo = test_repo();
+    let app = test_app(repo.clone(), ListenerTrustMode::Public);
+    let (cookie, csrf) = bootstrap_session(&app).await;
+    let initial = rotate_credential(&app, &cookie, &csrf).await;
+    let replacement_secret = "ROTATION_SECRET_SENTINEL";
+    let rotation_id = "rotation-secret-free";
+
+    let activate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/credentials/rotation/activate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", initial.token))
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "rotation_id": rotation_id,
+                        "replacement_secret": replacement_secret
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(activate.status(), StatusCode::OK);
+    let activate_body = json_response(activate).await;
+    assert!(!activate_body.to_string().contains(replacement_secret));
+    assert_eq!(activate_body["status"], "activated");
+
+    // Activation retries are idempotent and do not create another credential.
+    let activate_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/credentials/rotation/activate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", initial.token))
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "rotation_id": rotation_id,
+                        "replacement_secret": replacement_secret
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(activate_retry.status(), StatusCode::OK);
+
+    let replacement_token = format!("ddcol_{rotation_id}.{replacement_secret}");
+    let mut overlap_request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    overlap_request.batch_id = "rotation-overlap".to_string();
+    overlap_request.sync_run.sync_run_id = "rotation-overlap-sync".to_string();
+    assert_eq!(
+        ingest(&app, &initial.token, &overlap_request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let mut replacement_overlap_request = overlap_request.clone();
+    replacement_overlap_request.batch_id = "rotation-replacement-overlap".to_string();
+    replacement_overlap_request.sync_run.sync_run_id =
+        "rotation-replacement-overlap-sync".to_string();
+    assert_eq!(
+        ingest(&app, &replacement_token, &replacement_overlap_request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let proof = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/credentials/rotation/prove")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {replacement_token}"))
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "rotation_id": rotation_id
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(proof.status(), StatusCode::OK);
+    let proof_body = json_response(proof).await;
+    assert!(!proof_body.to_string().contains(replacement_secret));
+    assert_eq!(proof_body["status"], "proved");
+
+    let proof_retry = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/credentials/rotation/prove")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {replacement_token}"))
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "rotation_id": rotation_id
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(proof_retry.status(), StatusCode::OK);
+
+    let mut old_request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    old_request.batch_id = "rotation-old".to_string();
+    old_request.sync_run.sync_run_id = "rotation-old-sync".to_string();
+    assert_eq!(
+        ingest(&app, &initial.token, &old_request).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut replacement_request = old_request.clone();
+    replacement_request.batch_id = "rotation-new".to_string();
+    replacement_request.sync_run.sync_run_id = "rotation-new-sync".to_string();
+    assert_eq!(
+        ingest(&app, &replacement_token, &replacement_request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let issue = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/collector-commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header(OWNER_CSRF_HEADER, &csrf)
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "command": {
+                            "type": "rotate-credential",
+                            "command_id": "rotation-command",
+                            "rotation_id": "rotation-command-id"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issue.status(), StatusCode::OK);
+
+    assert!(serde_json::from_value::<OwnerCommand>(json!({
+        "type": "rotate-credential",
+        "command_id": "legacy-secret-command",
+        "credential_token": replacement_secret
+    }))
+    .is_err());
+
+    let conn = repo.db.connection().unwrap();
+    let command_json: String = conn
+        .query_row(
+            "SELECT command_json FROM collector_commands WHERE command_id = 'rotation-command'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!command_json.contains("token"));
+    assert!(!command_json.contains(replacement_secret));
+    assert!(!command_json.contains(&initial.token));
+
+    let secret_ack = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/commands/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {replacement_token}"))
+                .body(Body::from(
+                    json!({
+                        "command_id": "rotation-command",
+                        "result": {"credential_token": replacement_secret}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(secret_ack.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let valid_ack = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/commands/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {replacement_token}"))
+                .body(Body::from(
+                    json!({
+                        "command_id": "rotation-command",
+                        "result": {"status": "rotation-staged"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(valid_ack.status(), StatusCode::NO_CONTENT);
+    let stored_ack: String = conn
+        .query_row(
+            "SELECT result_json FROM collector_commands WHERE command_id = 'rotation-command'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!stored_ack.contains(replacement_secret));
+    assert!(!stored_ack.contains(&replacement_token));
+
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for table in tables {
+        let query = format!("SELECT * FROM \"{table}\"");
+        let mut statement = conn.prepare(&query).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for index in 0..row.as_ref().column_count() {
+                if let Ok(value) = row.get::<_, String>(index) {
+                    assert!(!value.contains(replacement_secret), "secret in {table}");
+                    assert!(!value.contains(&replacement_token), "token in {table}");
+                    assert!(!value.contains(&initial.token), "initial token in {table}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn incompatible_protocol_versions_fail_explicitly() {
     let repo = test_repo();
     let app = test_app(repo, ListenerTrustMode::Public);
@@ -1356,6 +1613,44 @@ fn migration_upgrades_existing_v1_schema_additively() {
         )
         .unwrap();
     assert_eq!(owner_sessions_exists, "owner_sessions");
+}
+
+#[test]
+fn migration_removes_legacy_plaintext_collector_command_credentials() {
+    let dir = tempdir().unwrap();
+    let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
+    db.migrate().unwrap();
+    let conn = db.connection().unwrap();
+    conn.execute(
+        "INSERT INTO collector_commands(command_id, machine_id, command_json, created_at) VALUES ('legacy-secret', 'machine-a', ?1, '2026-07-15T00:00:00Z')",
+        params![r#"{"type":"rotate-credential","command_id":"legacy-secret","credential_token":"LEGACY_SECRET_SENTINEL"}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO collector_command_results(command_id, result_json, handled_at) VALUES ('legacy-result', ?1, '2026-07-15T00:00:00Z')",
+        params![r#"{"credential_token":"LEGACY_SECRET_SENTINEL"}"#],
+    )
+    .unwrap();
+    drop(conn);
+
+    db.migrate().unwrap();
+    let conn = db.connection().unwrap();
+    let command_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM collector_commands WHERE command_json LIKE '%LEGACY_SECRET_SENTINEL%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(command_count, 0);
+    let result_json: String = conn
+        .query_row(
+            "SELECT result_json FROM collector_command_results WHERE command_id = 'legacy-result'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!result_json.contains("LEGACY_SECRET_SENTINEL"));
 }
 
 #[test]
