@@ -90,7 +90,9 @@ Evidence:
 
 ## PR And Commits
 
-Implementation commit/PR and integration push remain coordinator-owned closeout actions.
+- Implementation commit: `cfe13e4` (`feat: add durable outbound collector runtime`).
+- Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`, state open.
+- Coordinator retains independent review, CI disposition, merge, and Beads/phase advancement ownership.
 
 
 ## Beads Updates And Follow-Ups
