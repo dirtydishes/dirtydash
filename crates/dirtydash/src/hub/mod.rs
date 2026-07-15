@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::db::Database;
+pub use crate::pricing::PricingMode;
 
 mod auth;
 mod errors;
@@ -25,6 +27,7 @@ pub(crate) use errors::{
 };
 pub(crate) use ingestion::upsert_usage_event_tx;
 pub(crate) use protocol::{
+    canonical_event_identity, validate_ack_result_has_no_secret, validate_command_has_no_secret,
     validate_identifier, validate_ingest_batch, validate_non_empty, validate_tailscale_identity,
     validate_time_zone,
 };
@@ -33,7 +36,9 @@ const OWNER_SESSION_COOKIE: &str = "dirtydash_owner_session";
 const OWNER_CSRF_HEADER: &str = "x-csrf-token";
 const BOOTSTRAP_SETUP_TOKEN_HEADER: &str = "x-dirtydash-setup-token";
 const TAILSCALE_USER_LOGIN: &str = "tailscale-user-login";
-const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+pub const API_V1_PROTOCOL_VERSION: u32 = 1;
+// Internal compatibility alias for the Phase 2 test/repository code.
+const SUPPORTED_PROTOCOL_VERSION: u32 = API_V1_PROTOCOL_VERSION;
 const OWNER_SESSION_TTL_SECONDS: i64 = 60 * 60 * 12;
 const DEFAULT_CREDENTIAL_LABEL: &str = "default";
 
@@ -281,6 +286,7 @@ struct HubState {
 pub struct HubRepository {
     db: Database,
     write_guard: Arc<Mutex<()>>,
+    command_notify: Arc<Notify>,
     #[cfg(test)]
     final_insert_failure: Arc<Mutex<bool>>,
 }
@@ -392,8 +398,96 @@ pub struct CollectorUsageEvent {
     pub parser_name: String,
     pub parser_version: String,
     pub pricing_version: String,
+    /// Provenance of the cost value. This is part of the wire contract so a
+    /// reported provider cost and a locally computed Codex priority estimate
+    /// survive Collector -> Hub round trips.
+    #[serde(default)]
+    pub pricing_mode: PricingMode,
     #[serde(default = "default_metadata_only_true")]
     pub metadata_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "kebab-case")]
+pub enum OwnerCommand {
+    Refresh {
+        command_id: String,
+    },
+    RotateCredential {
+        command_id: String,
+        rotation_id: String,
+    },
+    Diagnostics {
+        command_id: String,
+    },
+    ApprovedUpdate {
+        command_id: String,
+        version: String,
+        sha256: String,
+    },
+}
+
+impl OwnerCommand {
+    pub fn command_id(&self) -> &str {
+        match self {
+            Self::Refresh { command_id }
+            | Self::RotateCredential { command_id, .. }
+            | Self::Diagnostics { command_id }
+            | Self::ApprovedUpdate { command_id, .. } => command_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandPollResponse {
+    pub command: Option<OwnerCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandAckRequest {
+    pub command_id: String,
+    pub result: serde_json::Value,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorCredentialRotationActivationRequest {
+    pub machine_id: String,
+    pub rotation_id: String,
+    pub replacement_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorCredentialRotationProofRequest {
+    pub machine_id: String,
+    pub rotation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCredentialRotationResponse {
+    pub machine_id: String,
+    pub rotation_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IssueCollectorCommandRequest {
+    pub machine_id: String,
+    pub command: OwnerCommand,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct IssueCollectorCommandResponse {
+    pub command_id: String,
+    pub machine_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandPollQuery {
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -419,7 +513,7 @@ pub struct RotateCollectorCredentialResponse {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IngestBatchResponse {
     pub batch_id: String,
     pub inserted_events: u64,
@@ -539,6 +633,7 @@ pub(crate) struct ValidatedCollectorUsageEvent {
     parser_name: String,
     parser_version: String,
     pricing_version: String,
+    pricing_mode: PricingMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

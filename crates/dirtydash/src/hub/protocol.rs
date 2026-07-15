@@ -2,6 +2,11 @@ use super::*;
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
 use std::path::Path;
+
+pub(crate) fn canonical_event_identity(agent: &str, collector_event_fingerprint: &str) -> String {
+    format!("{agent}:{collector_event_fingerprint}")
+}
+
 pub(crate) fn validate_ingest_batch(
     request: IngestBatchRequest,
     authenticated_machine_id: &str,
@@ -95,7 +100,10 @@ pub(crate) fn validate_ingest_batch(
             &event.collector_event_fingerprint,
             "collector_event_fingerprint",
         )?;
-        if !event_identities.insert(format!("{agent}:{collector_event_fingerprint}")) {
+        if !event_identities.insert(canonical_event_identity(
+            &agent,
+            &collector_event_fingerprint,
+        )) {
             return Err(HubError::unprocessable(
                 "duplicate-event-identity",
                 "events must be unique by agent and collector_event_fingerprint within a batch",
@@ -131,6 +139,7 @@ pub(crate) fn validate_ingest_batch(
             parser_name: validate_identifier(&event.parser_name, "parser_name")?,
             parser_version: validate_identifier(&event.parser_version, "parser_version")?,
             pricing_version: validate_identifier(&event.pricing_version, "pricing_version")?,
+            pricing_mode: event.pricing_mode,
         });
     }
 
@@ -185,6 +194,52 @@ pub(crate) fn validate_non_empty(value: &str, field: &str) -> Result<String, Hub
         ));
     }
     Ok(trimmed.to_string())
+}
+
+pub(crate) fn validate_command_has_no_secret(value: &serde_json::Value) -> Result<(), HubError> {
+    if command_value_contains_secret(value, false) {
+        return Err(HubError::unprocessable(
+            "collector-command-secret-forbidden",
+            "collector commands must contain only non-secret rotation instructions",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ack_result_has_no_secret(value: &serde_json::Value) -> Result<(), HubError> {
+    if command_value_contains_secret(value, true) {
+        return Err(HubError::unprocessable(
+            "collector-command-secret-forbidden",
+            "collector command acknowledgements must not contain credentials",
+        ));
+    }
+    Ok(())
+}
+
+fn command_value_contains_secret(value: &serde_json::Value, inspect_values: bool) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+            let normalized = key.to_ascii_lowercase();
+            normalized.contains("token")
+                || normalized.contains("secret")
+                || normalized == "password"
+                || command_value_contains_secret(value, inspect_values)
+        }),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| command_value_contains_secret(value, inspect_values)),
+        serde_json::Value::String(value) => {
+            let normalized = value.to_ascii_lowercase();
+            normalized.starts_with("ddcol_")
+                || (inspect_values
+                    && (normalized.contains("secret")
+                        || normalized.contains("token")
+                        || normalized.contains("sentinel")))
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
 }
 
 pub(crate) fn validate_display_safe_key(value: &str, field: &str) -> Result<String, HubError> {

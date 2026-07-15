@@ -1,0 +1,2 @@
+{"type":"session","id":"pi-fixture-1","cwd":"\\\\server\\share\\private-project","timestamp":"2026-07-14T10:03:00Z"}
+{"type":"message","id":"pi-turn-1","provider":"openai-codex","model":"gpt-5.4","message":{"role":"assistant","usage":{"input":1782,"output":169,"cacheRead":1536,"cacheWrite":0,"reasoning":32,"cost":{"input":0.004455,"output":0.002535,"cacheRead":0.000384,"cacheWrite":0,"total":0.00699}},"content":"SENTINEL_PI_RESPONSE_SHOULD_NOT_TRAVEL"}}

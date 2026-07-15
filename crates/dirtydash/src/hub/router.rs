@@ -1,7 +1,7 @@
 use super::*;
 
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -46,6 +46,23 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
         .route(
             "/api/v1/admin/collector-credentials/revoke",
             post(admin_revoke_collector_credential),
+        )
+        .route(
+            "/api/v1/admin/collector-commands",
+            post(admin_issue_collector_command),
+        )
+        .route("/api/v1/collector/commands", get(collector_poll_command))
+        .route(
+            "/api/v1/collector/commands/ack",
+            post(collector_ack_command),
+        )
+        .route(
+            "/api/v1/collector/credentials/rotation/activate",
+            post(collector_activate_credential_rotation),
+        )
+        .route(
+            "/api/v1/collector/credentials/rotation/prove",
+            post(collector_prove_credential_rotation),
         )
         .route("/api/v1/ingest/batches", post(collector_ingest_batch))
         .with_state(HubState { repo, config })
@@ -166,6 +183,75 @@ async fn admin_revoke_collector_credential(
     let _session = require_owner_session(&state, &headers, true)?;
     state.repo.revoke_collector_credential(request)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_issue_collector_command(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<IssueCollectorCommandRequest>,
+) -> Result<Json<IssueCollectorCommandResponse>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.issue_collector_command(request)?))
+}
+
+async fn collector_poll_command(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Query(query): Query<CollectorCommandPollQuery>,
+) -> Result<Json<CollectorCommandPollResponse>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    if let Some(command) = state.repo.poll_collector_command(&auth)? {
+        return Ok(Json(CollectorCommandPollResponse {
+            command: Some(command),
+        }));
+    }
+    let wait_seconds = query.wait_seconds.unwrap_or(20).min(20);
+    if wait_seconds > 0 {
+        let notification = state.repo.command_notification();
+        tokio::select! {
+            _ = notification.notified() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)) => {},
+        }
+    }
+    Ok(Json(CollectorCommandPollResponse {
+        command: state.repo.poll_collector_command(&auth)?,
+    }))
+}
+
+async fn collector_ack_command(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorCommandAckRequest>,
+) -> Result<StatusCode, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    state.repo.acknowledge_collector_command(&auth, request)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn collector_activate_credential_rotation(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorCredentialRotationActivationRequest>,
+) -> Result<Json<CollectorCredentialRotationResponse>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    Ok(Json(
+        state
+            .repo
+            .activate_collector_credential_rotation(&auth, request)?,
+    ))
+}
+
+async fn collector_prove_credential_rotation(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorCredentialRotationProofRequest>,
+) -> Result<Json<CollectorCredentialRotationResponse>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    Ok(Json(
+        state
+            .repo
+            .prove_collector_credential_rotation(&auth, request)?,
+    ))
 }
 
 async fn collector_ingest_batch(

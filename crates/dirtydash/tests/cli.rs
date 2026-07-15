@@ -13,7 +13,8 @@ fn dirtydash_cmd() -> assert_cmd::Command {
         .env("CLAUDE_CONFIG_DIR", "/tmp/dirtydash-test-no-claude")
         .env("CODEX_HOME", "/tmp/dirtydash-test-no-codex")
         .env("OPENCODE_DATA_DIR", "/tmp/dirtydash-test-no-opencode")
-        .env("PI_AGENT_DIR", "/tmp/dirtydash-test-no-pi");
+        .env("PI_AGENT_DIR", "/tmp/dirtydash-test-no-pi")
+        .env("HERMES_HOME", "/tmp/dirtydash-test-no-hermes");
     command
 }
 
@@ -28,7 +29,8 @@ fn apply_clean_source_env(command: &mut std::process::Command) {
         .env("CLAUDE_CONFIG_DIR", "/tmp/dirtydash-test-no-claude")
         .env("CODEX_HOME", "/tmp/dirtydash-test-no-codex")
         .env("OPENCODE_DATA_DIR", "/tmp/dirtydash-test-no-opencode")
-        .env("PI_AGENT_DIR", "/tmp/dirtydash-test-no-pi");
+        .env("PI_AGENT_DIR", "/tmp/dirtydash-test-no-pi")
+        .env("HERMES_HOME", "/tmp/dirtydash-test-no-hermes");
 }
 
 #[test]
@@ -105,6 +107,66 @@ fn scan_import_doctor_and_pricing_commands_work_from_binary() {
         .assert()
         .success()
         .stdout(contains("claude-sonnet-4-6"));
+}
+
+#[test]
+fn collector_reconcile_and_diagnostics_use_separate_state_database() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("claude/projects/project-a");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("session.jsonl"),
+        r#"{"sessionId":"collector-cli-1","cwd":"/private/project","timestamp":"2026-06-06T12:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":250}}}"#,
+    )
+    .unwrap();
+    let db = dir.path().join("dirtydash.sqlite3");
+    let config = dir.path().join("config.toml");
+    let source_root = format!(
+        "claude-code={}",
+        dir.path().join("claude/projects").display()
+    );
+
+    dirtydash_cmd()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--source-root",
+            &source_root,
+            "collector",
+            "reconcile",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("\"events_queued\": 1"));
+
+    dirtydash_cmd()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "collector",
+            "diagnostics",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("\"pending_outbox\": 1"));
+
+    let collector_db = dir.path().join("dirtydash-collector.sqlite3");
+    assert!(collector_db.exists());
+    let tables = rusqlite::Connection::open(collector_db)
+        .unwrap()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'usage_events'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(tables.is_empty());
 }
 
 #[test]

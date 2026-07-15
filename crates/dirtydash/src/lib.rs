@@ -1,5 +1,6 @@
 pub mod app_paths;
 pub mod cli;
+pub mod collector;
 pub mod config;
 pub mod db;
 pub mod hub;

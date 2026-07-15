@@ -16,7 +16,7 @@ pub(crate) fn upsert_usage_event_tx(
             r#"
             SELECT provider, model, turn_id, reasoning_effort, prompt_tokens, completion_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
-                estimated_cost_usd, confidence, pricing_version, event_timestamp,
+                estimated_cost_usd, confidence, pricing_version, pricing_mode, event_timestamp,
                 project_path, session_id, raw_path, parser_name, parser_version
             FROM usage_events
             WHERE machine_id = ?1
@@ -39,12 +39,13 @@ pub(crate) fn upsert_usage_event_tx(
                     row.get::<_, f64>(10)?,
                     row.get::<_, f64>(11)?,
                     row.get::<_, String>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, Option<String>>(14)?,
                     row.get::<_, String>(15)?,
                     row.get::<_, String>(16)?,
                     row.get::<_, String>(17)?,
                     row.get::<_, String>(18)?,
+                    row.get::<_, String>(19)?,
                 ))
             },
         )
@@ -64,12 +65,13 @@ pub(crate) fn upsert_usage_event_tx(
             && (existing.10 - event.estimated_cost_usd).abs() < 0.0000001
             && (existing.11 - event.confidence).abs() < 0.0000001
             && existing.12 == event.pricing_version
-            && existing.13.as_deref() == Some(event.occurred_at.as_str())
-            && existing.14 == event.project_key
-            && existing.15 == event.session_key
-            && existing.16 == event.source_key
-            && existing.17 == event.parser_name
-            && existing.18 == event.parser_version;
+            && existing.13 == event.pricing_mode.as_str()
+            && existing.14.as_deref() == Some(event.occurred_at.as_str())
+            && existing.15 == event.project_key
+            && existing.16 == event.session_key
+            && existing.17 == event.source_key
+            && existing.18 == event.parser_name
+            && existing.19 == event.parser_version;
         if matches {
             return Ok(UsageEventWrite::Skipped);
         }
@@ -96,15 +98,15 @@ pub(crate) fn upsert_usage_event_tx(
                 parser_version = ?21,
                 imported_at = ?22,
                 pricing_version = ?23,
-                pricing_mode = 'unpriced',
+                pricing_mode = ?24,
                 metadata_only = 1,
-                raw_event_hash = ?24,
+                raw_event_hash = ?25,
                 machine = ?1,
                 source = ?2,
                 ingest_batch_id = ?3
             WHERE machine_id = ?1
                 AND agent = ?2
-                AND collector_event_fingerprint = ?25
+                AND collector_event_fingerprint = ?26
             "#,
             params![
                 machine_id,
@@ -130,6 +132,7 @@ pub(crate) fn upsert_usage_event_tx(
                 event.parser_version,
                 imported_at,
                 event.pricing_version,
+                event.pricing_mode.as_str(),
                 raw_event_hash,
                 event.collector_event_fingerprint,
             ],
@@ -152,8 +155,8 @@ pub(crate) fn upsert_usage_event_tx(
             ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15,
             ?16, ?17, ?18, NULL, ?19, ?20,
-            ?21, ?22, ?23, 'unpriced', 1,
-            ?1, ?2, ?24, ?25
+            ?21, ?22, ?23, ?24, 1,
+            ?1, ?2, ?25, ?26
         )
         "#,
         params![
@@ -180,6 +183,7 @@ pub(crate) fn upsert_usage_event_tx(
             raw_event_hash,
             imported_at,
             event.pricing_version,
+            event.pricing_mode.as_str(),
             event.collector_event_fingerprint,
             batch_id,
         ],

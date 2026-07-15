@@ -1,0 +1,3 @@
+{"type":"session","session_id":"hermes-fixture-1","cwd":"/srv/private-hermes-project","timestamp":"2026-07-14T10:04:00Z"}
+{"type":"metering","session_id":"hermes-fixture-1","project_path":"D:\\private\\hermes-project","provider":"openai","model":"gpt-5.4","usage":{"input_tokens":2100,"output_tokens":300,"cache_read_tokens":450,"cache_write_tokens":12,"reasoning_tokens":44},"cost":0.0084,"content":"SENTINEL_HERMES_MESSAGE_SHOULD_NOT_TRAVEL"}
+malformed-hermes-record

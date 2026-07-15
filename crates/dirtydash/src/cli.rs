@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::app_paths::AppPaths;
+use crate::collector;
 use crate::config::Config;
 use crate::db::Database;
 use crate::importers::{self, ImportOptions};
@@ -32,7 +33,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Detect local Claude Code, Codex, OpenCode, and pi-agent sources.
+    /// Detect local Claude Code, Codex, OpenCode, Pi, and Hermes sources.
     Scan(ScanArgs),
     /// Import detected or configured local sources into SQLite.
     Import(ImportArgs),
@@ -40,6 +41,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Validate config, database, source paths, parser health, and pricing assumptions.
     Doctor(DoctorArgs),
+    /// Run the outbound-only local Collector reconciliation/runtime.
+    Collector(CollectorCommand),
     /// Configure pull-based SSH remotes.
     Remote(RemoteCommand),
     /// Inspect bundled pricing and manage manual overrides.
@@ -77,6 +80,51 @@ pub struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorCommand {
+    #[command(subcommand)]
+    pub command: CollectorSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CollectorSubcommand {
+    /// Run the outbound-only Collector daemon (startup, watcher, delivery, and command poller).
+    Run(CollectorRunArgs),
+    /// Reconcile local harness sources and queue one durable outbound batch.
+    Reconcile(CollectorReconcileArgs),
+    /// Print metadata-only Collector diagnostics.
+    Diagnostics(CollectorDiagnosticsArgs),
+    /// Explicitly recover one terminal/dead-lettered outbox batch.
+    Recover(CollectorRecoverArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorRunArgs {
+    /// Perform startup reconciliation and one delivery pass, then exit.
+    #[arg(long)]
+    pub once: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorReconcileArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorDiagnosticsArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorRecoverArgs {
+    #[arg(long)]
+    pub batch_id: String,
     #[arg(long)]
     pub json: bool,
 }
@@ -218,6 +266,7 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
         Some(Command::Import(args)) => import(&paths, &config, args),
         Some(Command::Serve(args)) => serve(&paths, args),
         Some(Command::Doctor(args)) => doctor(&paths, &config, args),
+        Some(Command::Collector(args)) => collector_command(&paths, &config, args),
         Some(Command::Remote(args)) => remote::run(&paths, &mut config, args),
         Some(Command::Pricing(args)) => pricing_command(&paths, args),
         Some(Command::Loop(args)) => loop_command(args),
@@ -300,6 +349,83 @@ fn doctor(paths: &AppPaths, config: &Config, args: DoctorArgs) -> Result<()> {
             println!("warnings:");
             for warning in report.warnings {
                 println!("- {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) -> Result<()> {
+    let usage_db = Database::open(&paths.db_path)?;
+    let collector_db = Database::open(&paths.collector_db_path)?;
+    let mut runtime = collector::Collector::from_config(usage_db, collector_db, config)?;
+    match args.command {
+        CollectorSubcommand::Run(run_args) => {
+            if run_args.once {
+                let report = runtime.reconcile_startup(chrono::Utc::now())?;
+                let hub_url = config
+                    .collector
+                    .hub_url
+                    .as_deref()
+                    .context("collector.hub_url is required for `collector run --once`")?;
+                let mut transport = collector::CollectorHttpTransport::new(hub_url)?;
+                let delivery = runtime.deliver_pending(&mut transport, chrono::Utc::now())?;
+                println!(
+                    "collector run once: batch={} acknowledged={} pending={} terminal={}",
+                    report.batch_id.as_deref().unwrap_or("none"),
+                    delivery.acknowledged,
+                    delivery.pending,
+                    delivery.terminal
+                );
+            } else {
+                collector::run_daemon(paths, config)?;
+            }
+        }
+        CollectorSubcommand::Reconcile(reconcile_args) => {
+            let report = runtime.reconcile_manual(chrono::Utc::now())?;
+            if reconcile_args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "collector reconciled {} files, queued {} events, batch {}",
+                    report.files_seen,
+                    report.events_queued,
+                    report.batch_id.as_deref().unwrap_or("none")
+                );
+            }
+        }
+        CollectorSubcommand::Diagnostics(diagnostics_args) => {
+            let report = runtime.diagnostics()?;
+            if diagnostics_args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "collector machine={} pending={} watcher_degraded={}",
+                    report.machine_id, report.pending_outbox, report.watcher.degraded
+                );
+                if report.terminal_outbox > 0 {
+                    println!(
+                        "collector terminal outbox batches={}",
+                        report.terminal_outbox
+                    );
+                }
+            }
+        }
+        CollectorSubcommand::Recover(recover_args) => {
+            let recovered =
+                runtime.recover_outbox_batch(&recover_args.batch_id, chrono::Utc::now())?;
+            if recover_args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"batch_id": recover_args.batch_id, "recovered": recovered})
+                );
+            } else if recovered {
+                println!("collector recovered outbox batch {}", recover_args.batch_id);
+            } else {
+                println!(
+                    "collector outbox batch {} was not terminal",
+                    recover_args.batch_id
+                );
             }
         }
     }

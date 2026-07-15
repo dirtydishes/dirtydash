@@ -1,0 +1,1 @@
+{"sessionID":"opencode-fixture-1","projectPath":"/workspaces/private-project","providerID":"anthropic","modelID":"claude-haiku-4-5","time":"2026-07-14T10:02:00Z","usage":{"inputTokens":700,"outputTokens":90,"cacheReadTokens":120,"cacheWriteTokens":25},"prompt":"SENTINEL_RAW_PROMPT_SHOULD_NOT_TRAVEL"}
