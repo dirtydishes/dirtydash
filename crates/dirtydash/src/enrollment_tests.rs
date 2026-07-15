@@ -396,6 +396,42 @@ fn failed_install_redacts_hostile_stderr_and_retry_cleanup_is_explicit() {
 }
 
 #[test]
+fn rollback_failure_is_persisted_as_manual_recovery_blocker() {
+    let (mut workflow, draft, plan, _dir) = workflow();
+    workflow.start(draft).unwrap();
+    let secrets = EnrollmentSecrets::password("PASSWORD_SENTINEL");
+    workflow
+        .trust_and_auth(
+            "machine-1",
+            &AuthMethod::Password,
+            &secrets,
+            Some("sha256:known"),
+        )
+        .unwrap();
+    workflow
+        .probe_and_plan("machine-1", &AuthMethod::Password, &secrets)
+        .unwrap();
+    let reviewed_plan = workflow
+        .review_with_artifact("machine-1", &plan, &fixture_artifact(), None)
+        .unwrap();
+    workflow.backend_mut().execute_error = Some("manual recovery required".to_string());
+    assert!(workflow
+        .execute(
+            "machine-1",
+            &reviewed_plan,
+            &fixture_artifact(),
+            None,
+            &ListenerPlan::default(),
+            &secrets,
+        )
+        .is_err());
+    assert_eq!(
+        workflow.store.load("machine-1").unwrap().blocker,
+        EnrollmentBlocker::ManualRecoveryRequired
+    );
+}
+
+#[test]
 fn sudo_failure_stays_on_auth_step_and_redacts_password() {
     let (mut workflow, draft, _plan, _dir) = workflow();
     workflow.start(draft).unwrap();

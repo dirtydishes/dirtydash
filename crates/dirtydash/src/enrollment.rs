@@ -26,13 +26,13 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 use crate::deployment::{
     DeploymentPlan, DeploymentReceipt, DeploymentRequest, DeploymentRunner, RemoteFacts,
-    SshRemoteExecutor, TargetPlatform, VerifiedArtifact,
+    SshLiveSecrets, SshRemoteExecutor, TargetPlatform, VerifiedArtifact,
 };
 use crate::listener::ListenerPlan;
 use crate::ssh::{canonical_known_hosts_line, host_key_fingerprint, CanonicalSshTarget};
@@ -82,6 +82,7 @@ pub enum EnrollmentBlocker {
     SudoFailed,
     PlanInvalidated,
     CleanupRequired,
+    ManualRecoveryRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -978,6 +979,9 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         secrets: &EnrollmentSecrets,
     ) -> Result<EnrollmentReceipt> {
         let mut draft = self.store.load(id)?;
+        if draft.blocker == EnrollmentBlocker::ManualRecoveryRequired {
+            bail!("manual recovery is required before enrollment can be retried");
+        }
         if !matches!(
             draft.state,
             EnrollmentState::ImmutablePlanReview | EnrollmentState::ExecuteVerifyReceipt
@@ -1044,12 +1048,23 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
                 self.store.save(&draft)?;
                 Ok(receipt)
             }
-            Err(error) => self.fail_execute(
-                &mut draft,
-                EnrollmentBlocker::CleanupRequired,
-                &redact_error(&error.to_string(), secrets),
-                secrets,
-            ),
+            Err(error) => {
+                let blocker = if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("manual recovery")
+                {
+                    EnrollmentBlocker::ManualRecoveryRequired
+                } else {
+                    EnrollmentBlocker::CleanupRequired
+                };
+                self.fail_execute(
+                    &mut draft,
+                    blocker,
+                    &redact_error(&error.to_string(), secrets),
+                    secrets,
+                )
+            }
         }
     }
 
@@ -1062,7 +1077,9 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
     ) -> Result<EnrollmentReceipt> {
         let cleanup_result = self.backend.cleanup(draft, secrets);
         draft.blocker = if cleanup_result.is_ok() {
-            blocker
+            blocker.clone()
+        } else if blocker == EnrollmentBlocker::ManualRecoveryRequired {
+            EnrollmentBlocker::ManualRecoveryRequired
         } else {
             EnrollmentBlocker::CleanupRequired
         };
@@ -1072,11 +1089,17 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         draft.updated_at = Utc::now().to_rfc3339();
         self.store.save(draft)?;
         cleanup_result.context("enrollment execution failed and cleanup failed")?;
+        if blocker == EnrollmentBlocker::ManualRecoveryRequired {
+            bail!("enrollment execution failed; manual recovery is required")
+        }
         bail!("enrollment execution failed; retry remains available at the execute step")
     }
 
     pub fn retry_cleanup(&mut self, id: &str, secrets: &EnrollmentSecrets) -> Result<()> {
         let mut draft = self.store.load(id)?;
+        if draft.blocker == EnrollmentBlocker::ManualRecoveryRequired {
+            bail!("manual recovery is required; automatic cleanup is disabled");
+        }
         self.backend.cleanup(&draft, secrets).map_err(|error| {
             self.record_failure(
                 &mut draft,
@@ -1209,10 +1232,11 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// A production SSH adapter for the trust/probe half of the workflow.  The
-/// install method is intentionally still typed and uses the same fixed
-/// invocation rules; live password/PTY behavior is delegated to the user's
-/// terminal, never to `sshpass`, an environment variable, or a temp file.
+/// A production SSH adapter for the trust, probe, and install workflow. Every
+/// operation remains typed and uses one canonical target; password, key-
+/// passphrase, and sudo bytes travel only through the deployment module's
+/// prompt-aware live PTY, never through `sshpass`, argv, environment, temp
+/// files, or persisted state.
 #[derive(Debug, Clone)]
 pub struct SshEnrollmentBackend {
     target: CanonicalSshTarget,
@@ -1244,69 +1268,55 @@ impl SshEnrollmentBackend {
         })
     }
 
-    fn ssh_args(
+    fn live_secrets(&self, secrets: &EnrollmentSecrets) -> Result<SshLiveSecrets> {
+        SshLiveSecrets::new(
+            secrets
+                .password
+                .as_ref()
+                .map(|value| value.expose().as_bytes()),
+            secrets
+                .key_passphrase
+                .as_ref()
+                .map(|value| value.expose().as_bytes()),
+            secrets
+                .sudo_password
+                .as_ref()
+                .map(|value| value.expose().as_bytes()),
+        )
+    }
+
+    fn executor(
         &self,
-        _connection: &ConnectionSpec,
         auth_method: &AuthMethod,
-        interactive: bool,
-    ) -> Result<Vec<String>> {
-        Ok(self.target.ssh_args(
-            &self.known_hosts_path,
-            match auth_method {
-                AuthMethod::KeyPath { path } => Some(path.as_path()),
-                AuthMethod::Password => None,
-            },
-            !interactive,
-        ))
+        secrets: &EnrollmentSecrets,
+    ) -> Result<SshRemoteExecutor> {
+        let mut executor = SshRemoteExecutor::from_canonical_target(
+            self.target.clone(),
+            self.known_hosts_path.clone(),
+        )?;
+        if let AuthMethod::KeyPath { path } = auth_method {
+            executor = executor.with_key_path(path.clone())?;
+        }
+        Ok(executor.with_live_secrets(self.live_secrets(secrets)?))
     }
 
     fn run_operation(
-        &self,
-        connection: &ConnectionSpec,
+        &mut self,
+        _connection: &ConnectionSpec,
         auth_method: &AuthMethod,
         operation: SshOperation,
         secrets: &EnrollmentSecrets,
         sudo: bool,
     ) -> Result<String> {
-        let interactive = matches!(auth_method, AuthMethod::Password)
-            || secrets.key_passphrase.is_some()
-            || (sudo && secrets.sudo_password.is_none());
-        let mut args = self.ssh_args(connection, auth_method, interactive)?;
-        if sudo {
-            args.push("sudo -S -p '' sh -c 'printf ok'".to_string());
+        let mut executor = self.executor(auth_method, secrets)?;
+        let command = if sudo {
+            // This token is deliberately fixed so only the sudo prompt, not
+            // arbitrary remote output, can release the sudo secret.
+            "sudo -S -p 'DIRTYDASH_SUDO_PROMPT' sh -c 'printf ok'"
         } else {
-            args.push(operation.command().to_string());
-        }
-        let mut process = Command::new("ssh");
-        process.args(&args);
-        if interactive {
-            process.stdin(Stdio::inherit());
-        } else {
-            process.stdin(Stdio::piped());
-        }
-        process.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = process
-            .spawn()
-            .context("starting SSH enrollment operation")?;
-        if !interactive {
-            if let Some(mut stdin) = child.stdin.take() {
-                if let Some(password) = &secrets.sudo_password {
-                    stdin.write_all(password.expose().as_bytes())?;
-                    stdin.write_all(b"\n")?;
-                }
-            }
-        }
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let operation = if sudo {
-                "SSH sudo operation failed"
-            } else {
-                "SSH enrollment operation failed"
-            };
-            bail!("{operation}: {}", redact_error(&stderr, secrets));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+            operation.command()
+        };
+        Ok(executor.live_command(command, sudo, None)?.stdout)
     }
 }
 
@@ -1398,25 +1408,17 @@ impl EnrollmentBackend for SshEnrollmentBackend {
             artifact,
             database_seed,
             listener,
-            secrets: _secrets,
+            secrets,
         } = request;
         let auth = auth_from_persisted(&draft.auth_method)?;
-        let AuthMethod::KeyPath { path: key_path } = auth else {
-            // OpenSSH password authentication needs a live PTY from the
-            // operator.  It is supported for trust/auth above, but an
-            // unattended artifact stream cannot safely multiplex a password
-            // prompt and binary stdin.  Refuse rather than silently falling
-            // back to sshpass, an environment variable, or a temp file.
-            bail!("password-authenticated install requires an interactive PTY; retry with a reviewed key-path method");
-        };
         if plan.plan_hash != plan_hash {
             bail!("enrollment plan hash changed before execution");
         }
-        let executor = SshRemoteExecutor::from_canonical_target(
-            self.target.clone(),
-            self.known_hosts_path.clone(),
-        )?
-        .with_key_path(key_path)?;
+        // Password enrollment uses the same prompt-aware live stdin seam as
+        // trust/probe.  The deployment runner therefore never creates a
+        // second unauthenticated SSH connection or asks for a password in an
+        // argv/env/temp-file fallback.
+        let executor = self.executor(&auth, secrets)?;
         let request = DeploymentRequest {
             target: self.target.destination(),
             release: plan.release.clone(),

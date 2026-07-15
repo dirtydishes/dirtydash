@@ -578,6 +578,10 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
     if args.plan
         && (args.manifest.is_none() || args.artifact_dir.is_none() || args.public_key.is_none())
     {
+        // Even a shape preview must not make an untrusted publisher look like
+        // an eligible deployment.  The anchor is read from durable config;
+        // flags alone are never sufficient.
+        configured_publisher_anchor(config, &args)?;
         let plan = crate::deployment::DeploymentPlan::skeleton(
             args.ssh_target,
             env!("CARGO_PKG_VERSION"),
@@ -596,6 +600,7 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
     // Planning is a concrete read-only probe.  Artifact evidence is required
     // so the persisted plan cannot be approved for an unknown release.
     if args.plan {
+        verify_publisher_inputs(&args, config)?;
         let known_hosts = managed_known_hosts(paths)?;
         let canonical = CanonicalSshTarget::resolve(&args.ssh_target)?;
         confirm_managed_first_use(
@@ -633,6 +638,7 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
         anyhow::bail!("pass --plan for a concrete probe or --apply with an approved plan hash");
     }
 
+    verify_publisher_inputs(&args, config)?;
     let known_hosts = managed_known_hosts(paths)?;
     let canonical = CanonicalSshTarget::resolve(&args.ssh_target)?;
     confirm_managed_first_use(
@@ -670,6 +676,77 @@ struct DeploymentInputs {
     seed: Option<Vec<u8>>,
 }
 
+fn configured_publisher_anchor<'a>(
+    config: &'a Config,
+    args: &DeployHubArgs,
+) -> Result<(&'a str, &'a str)> {
+    let key_id = config
+        .hub
+        .allowed_publisher_key_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "deployment requires a durable configured publisher key ID; CLI flags cannot establish trust",
+        )?;
+    let fingerprint = config
+        .hub
+        .allowed_publisher_fingerprint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "deployment requires a durable configured publisher fingerprint; CLI flags cannot establish trust",
+        )?;
+    if let Some(value) = args.publisher_key_id.as_deref() {
+        if value != key_id {
+            anyhow::bail!(
+                "--publisher-key-id does not match the configured publisher trust anchor"
+            );
+        }
+    }
+    if let Some(value) = args.publisher_fingerprint.as_deref() {
+        if !value.eq_ignore_ascii_case(fingerprint) {
+            anyhow::bail!(
+                "--publisher-fingerprint does not match the configured publisher trust anchor"
+            );
+        }
+    }
+    Ok((key_id, fingerprint))
+}
+
+fn verify_publisher_inputs(args: &DeployHubArgs, config: &Config) -> Result<()> {
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("--manifest is required for deployment planning/apply")?;
+    let artifact_dir = args
+        .artifact_dir
+        .as_deref()
+        .context("--artifact-dir is required for deployment planning/apply")?;
+    let public_key_path = args
+        .public_key
+        .as_deref()
+        .context("--public-key is required for deployment planning/apply")?;
+    let (key_id, fingerprint) = configured_publisher_anchor(config, args)?;
+    let signed: SignedArtifactManifest = serde_json::from_slice(
+        &fs::read(manifest_path)
+            .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
+    )
+    .context("parsing signed artifact manifest")?;
+    let public_key = read_public_key(public_key_path)?;
+    let publisher = PublisherKey::new(key_id, fingerprint, &public_key)?;
+    let verified_manifest = signed.verify_with_publisher(&publisher)?;
+    for descriptor in &verified_manifest.manifest().artifacts {
+        let bytes = fs::read(artifact_dir.join(&descriptor.file)).with_context(|| {
+            format!(
+                "reading signed artifact {}",
+                artifact_dir.join(&descriptor.file).display()
+            )
+        })?;
+        verified_manifest.verify_artifact(descriptor.platform, bytes)?;
+    }
+    Ok(())
+}
+
 fn deployment_inputs(
     args: &DeployHubArgs,
     config: &Config,
@@ -688,36 +765,8 @@ fn deployment_inputs(
         .public_key
         .as_deref()
         .context("--public-key is required for deployment planning/apply")?;
-    let key_id = args
-        .publisher_key_id
-        .as_deref()
-        .or(config.hub.allowed_publisher_key_id.as_deref())
-        .context("--publisher-key-id or configured publisher allowlist is required")?;
-    let fingerprint = args
-        .publisher_fingerprint
-        .as_deref()
-        .or(config.hub.allowed_publisher_fingerprint.as_deref())
-        .context("--publisher-fingerprint or configured publisher allowlist is required")?;
-    if let Some(configured) = config.hub.allowed_publisher_key_id.as_deref() {
-        if args
-            .publisher_key_id
-            .as_deref()
-            .is_some_and(|value| value != configured)
-        {
-            anyhow::bail!("--publisher-key-id does not match the configured publisher allowlist");
-        }
-    }
-    if let Some(configured) = config.hub.allowed_publisher_fingerprint.as_deref() {
-        if args
-            .publisher_fingerprint
-            .as_deref()
-            .is_some_and(|value| !value.eq_ignore_ascii_case(configured))
-        {
-            anyhow::bail!(
-                "--publisher-fingerprint does not match the configured publisher allowlist"
-            );
-        }
-    }
+
+    let (key_id, fingerprint) = configured_publisher_anchor(config, args)?;
     let signed: SignedArtifactManifest = serde_json::from_slice(
         &fs::read(manifest_path)
             .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
@@ -743,8 +792,12 @@ fn deployment_inputs(
     let seed = args
         .db_seed
         .as_deref()
-        .map(|path| {
-            fs::read(path).with_context(|| format!("reading SQLite seed {}", path.display()))
+        .map(|path| -> Result<Vec<u8>> {
+            let bytes = fs::read(path)
+                .with_context(|| format!("reading SQLite seed {}", path.display()))?;
+            crate::deployment::validate_sqlite_header(&bytes)
+                .with_context(|| format!("validating SQLite seed {}", path.display()))?;
+            Ok(bytes)
         })
         .transpose()?;
     if applying && args.approved_plan_hash.is_none() {

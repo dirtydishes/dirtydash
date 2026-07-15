@@ -17,14 +17,20 @@
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+#[cfg(unix)]
+use portable_pty::MasterPty;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 use crate::listener::{ListenerAccessMode, ListenerPlan, TailscaleServeState};
 use crate::service::{ServicePlatform, ServiceSpec};
@@ -54,7 +60,9 @@ pub mod plan {
 }
 
 pub mod executor {
-    pub use super::{RemoteAction, RemoteExecutor, RemoteResult, RemoteStatus, SshRemoteExecutor};
+    pub use super::{
+        RemoteAction, RemoteExecutor, RemoteResult, RemoteStatus, SshLiveSecrets, SshRemoteExecutor,
+    };
 }
 
 pub mod runner {
@@ -561,6 +569,18 @@ fn validate_remote_home(value: &str) -> Result<()> {
     Ok(())
 }
 
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+const SQLITE_HEADER_HEX: &str = "53514c69746520666f726d6174203300";
+
+/// Validate the SQLite file header without invoking a platform SQLite CLI.
+/// This is intentionally byte-level: shell variables never receive a NUL.
+pub fn validate_sqlite_header(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < SQLITE_HEADER.len() || &bytes[..SQLITE_HEADER.len()] != SQLITE_HEADER {
+        bail!("SQLite backup does not have the expected 16-byte header");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentPaths {
     pub home: String,
@@ -694,6 +714,8 @@ pub struct RollbackData {
     pub database_wal_backup: Option<String>,
     pub database_shm_backup: Option<String>,
     pub previous_config: Option<String>,
+    /// Snapshot location is the source of truth after the remote mutation;
+    /// this enum is only a plan-time fallback for legacy adapters.
     pub previous_services: Vec<String>,
     pub previous_listener_state: TailscaleServeState,
     pub rollback_snapshot_dir: Option<String>,
@@ -1599,8 +1621,9 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
             Err(error) => {
                 let mut cleanup_error = None;
                 let mut rollback_succeeded = !mutated;
+                let mut rollback_failed = false;
                 if mutated {
-                    if let Err(rollback) = self.executor.run(RemoteAction::Rollback {
+                    if let Err(_rollback) = self.executor.run(RemoteAction::Rollback {
                         current: paths.current.clone(),
                         previous: plan.rollback.previous_release.clone(),
                         database_path: request.database_seed.as_ref().map(|_| paths.hub_db.clone()),
@@ -1620,7 +1643,7 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                         listener: Some(previous_listener_state(&plan)),
                         snapshot_dir: plan.rollback.rollback_snapshot_dir.clone(),
                     }) {
-                        let _ = rollback;
+                        rollback_failed = true;
                         cleanup_error = Some("rollback operation failed".to_string());
                     } else {
                         rollback_succeeded = true;
@@ -1629,26 +1652,51 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                 if let Err(cleanup) = self.executor.run(RemoteAction::Cleanup {
                     release: paths.release_dir,
                     remove_release: true,
-                    database_backup: None,
-                    database_wal_backup: None,
-                    database_shm_backup: None,
+                    database_backup: request
+                        .database_seed
+                        .as_ref()
+                        .filter(|_| rollback_succeeded)
+                        .map(|_| paths.hub_db_backup.clone()),
+                    database_wal_backup: request
+                        .database_seed
+                        .as_ref()
+                        .filter(|_| rollback_succeeded)
+                        .map(|_| format!("{}-wal.previous", paths.hub_db_backup)),
+                    database_shm_backup: request
+                        .database_seed
+                        .as_ref()
+                        .filter(|_| rollback_succeeded)
+                        .map(|_| format!("{}-shm.previous", paths.hub_db_backup)),
                     temporary_seed: request
                         .database_seed
                         .as_ref()
                         .map(|_| format!("{}/dirtydash.sqlite3.seed", paths.data_dir)),
-                    rollback_snapshot: rollback_succeeded
+                    rollback_snapshot: (!rollback_failed)
                         .then(|| plan.rollback.rollback_snapshot_dir.clone())
                         .flatten(),
                 }) {
                     let _ = cleanup;
                     cleanup_error = Some("cleanup operation failed".to_string());
                 }
-                let message = match cleanup_error {
-                    Some(cleanup) => {
-                        format!("deployment failed; rollback/cleanup also failed: {cleanup}")
-                    }
-                    None => {
-                        "deployment failed; remote state was rolled back and cleaned".to_string()
+                if rollback_failed {
+                    let _ = self.save_checkpoint(&DeploymentCheckpoint {
+                        target: plan.target.clone(),
+                        release: plan.release.clone(),
+                        plan_hash: plan.plan_hash.clone(),
+                        status: "manual-recovery-required".to_string(),
+                        tailscale_state: plan.listener.tailscale_state,
+                        receipt: None,
+                    });
+                }
+                let message = if rollback_failed {
+                    "manual recovery required: deployment rollback failed; the retained rollback snapshot must be restored by an operator".to_string()
+                } else {
+                    match cleanup_error {
+                        Some(cleanup) => {
+                            format!("deployment failed; rollback/cleanup also failed: {cleanup}")
+                        }
+                        None => "deployment failed; remote state was rolled back and cleaned"
+                            .to_string(),
                     }
                 };
                 // Do not copy remote stderr or arbitrary executor errors into
@@ -1753,6 +1801,317 @@ fn redact_error(value: &str, secrets: &[&str]) -> String {
     redacted
 }
 
+const MAX_LIVE_SECRET_BYTES: usize = 4096;
+const MAX_LIVE_OUTPUT_BYTES: usize = 16 * 1024;
+const OPTIONAL_KEY_PROMPT_GRACE: Duration = Duration::from_millis(750);
+const MAX_LIVE_OPERATION_DURATION: Duration = Duration::from_secs(60);
+
+/// Short-lived credentials for one live SSH connection.  This type is not
+/// serializable or printable.  Its only consumer is the prompt-aware stdin
+/// writer below; it never becomes an argument, environment value, checkpoint,
+/// or transcript.
+#[derive(Clone)]
+pub struct SshLiveSecrets {
+    password: Option<Zeroizing<Vec<u8>>>,
+    key_passphrase: Option<Zeroizing<Vec<u8>>>,
+    sudo_password: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl SshLiveSecrets {
+    pub fn new(
+        password: Option<&[u8]>,
+        key_passphrase: Option<&[u8]>,
+        sudo_password: Option<&[u8]>,
+    ) -> Result<Self> {
+        for (label, value) in [
+            ("SSH password", password),
+            ("SSH key passphrase", key_passphrase),
+            ("sudo password", sudo_password),
+        ] {
+            if value.is_some_and(|value| value.len() > MAX_LIVE_SECRET_BYTES) {
+                bail!("{label} exceeds the bounded live-input size");
+            }
+        }
+        Ok(Self {
+            password: password.map(|value| Zeroizing::new(value.to_vec())),
+            key_passphrase: key_passphrase.map(|value| Zeroizing::new(value.to_vec())),
+            sudo_password: sudo_password.map(|value| Zeroizing::new(value.to_vec())),
+        })
+    }
+
+    fn redaction_values(&self) -> Vec<&str> {
+        [
+            self.password.as_deref(),
+            self.key_passphrase.as_deref(),
+            self.sudo_password.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| std::str::from_utf8(value).ok())
+        .filter(|value| !value.is_empty())
+        .collect()
+    }
+}
+
+impl fmt::Debug for SshLiveSecrets {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshLiveSecrets([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LivePromptKind {
+    SshPassword,
+    KeyPassphrase,
+    SudoPassword,
+}
+
+struct LivePrompt<'a> {
+    kind: LivePromptKind,
+    secret: Option<&'a [u8]>,
+    sent: bool,
+    required: bool,
+}
+
+impl LivePrompt<'_> {
+    fn matches(&self, output: &str) -> bool {
+        let lower = output.to_ascii_lowercase();
+        match self.kind {
+            LivePromptKind::SshPassword => lower.contains("password:") && !lower.contains("sudo"),
+            LivePromptKind::KeyPassphrase => {
+                lower.contains("passphrase") && lower.contains("for key")
+            }
+            LivePromptKind::SudoPassword => lower.contains("dirtydash_sudo_prompt"),
+        }
+    }
+}
+
+struct LiveChunk {
+    bytes: Zeroizing<Vec<u8>>,
+}
+
+fn spawn_live_reader<R: Read + Send + 'static>(mut reader: R, sender: mpsc::Sender<LiveChunk>) {
+    thread::spawn(move || {
+        let mut bytes = [0_u8; 1024];
+        loop {
+            match reader.read(&mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let _ = sender.send(LiveChunk {
+                        bytes: Zeroizing::new(bytes[..read].to_vec()),
+                    });
+                }
+            }
+        }
+    });
+}
+
+fn append_live_output(output: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    let remaining = MAX_LIVE_OUTPUT_BYTES.saturating_sub(output.len());
+    output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+}
+
+fn write_live_secret(stdin: &mut impl Write, secret: &[u8]) -> Result<()> {
+    if secret.len() > MAX_LIVE_SECRET_BYTES {
+        bail!("live input exceeds the bounded secret size");
+    }
+    stdin.write_all(secret)?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn redacted_live_output(output: &[u8], secrets: &SshLiveSecrets) -> String {
+    let raw = Zeroizing::new(String::from_utf8_lossy(output).into_owned());
+    let values = secrets.redaction_values();
+    redact_error(&raw, &values)
+}
+
+#[cfg(unix)]
+fn set_pty_raw(master: &dyn MasterPty) -> Result<()> {
+    let fd = master
+        .as_raw_fd()
+        .context("controlled SSH PTY has no file descriptor")?;
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr initializes the termios structure before it is read.
+    if unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) } != 0 {
+        bail!("reading controlled SSH PTY attributes failed");
+    }
+    // SAFETY: tcgetattr succeeded above.
+    let mut termios = unsafe { termios.assume_init() };
+    termios.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG | libc::IEXTEN);
+    termios.c_iflag &= !(libc::ICRNL | libc::INLCR | libc::IGNCR);
+    termios.c_oflag &= !libc::OPOST;
+    // SAFETY: termios was populated by tcgetattr and fd remains owned by the
+    // PTY pair for the duration of this function.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } != 0 {
+        bail!("configuring controlled SSH PTY failed");
+    }
+    Ok(())
+}
+
+/// The production path uses a controlled PTY so OpenSSH can perform its
+/// normal password/passphrase exchange even when the caller is not itself a
+/// terminal.  Only the classified prompt writer below touches the PTY.
+fn run_live_process(
+    program: &Path,
+    args: &[String],
+    secrets: &SshLiveSecrets,
+    require_password_prompt: bool,
+    require_sudo_prompt: bool,
+    payload: Option<&[u8]>,
+) -> Result<RemoteResult> {
+    let mut prompts = vec![LivePrompt {
+        kind: LivePromptKind::SshPassword,
+        secret: secrets.password.as_ref().map(|value| value.as_slice()),
+        sent: false,
+        required: require_password_prompt,
+    }];
+    if secrets.key_passphrase.is_some() {
+        prompts.push(LivePrompt {
+            kind: LivePromptKind::KeyPassphrase,
+            secret: secrets
+                .key_passphrase
+                .as_ref()
+                .map(|value| value.as_slice()),
+            sent: false,
+            required: false,
+        });
+    }
+    if require_sudo_prompt {
+        prompts.push(LivePrompt {
+            kind: LivePromptKind::SudoPassword,
+            secret: secrets.sudo_password.as_ref().map(|value| value.as_slice()),
+            sent: false,
+            required: true,
+        });
+    }
+    for prompt in &prompts {
+        if prompt.required && prompt.secret.is_none() {
+            bail!("required live SSH prompt has no in-memory secret");
+        }
+    }
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("opening controlled SSH PTY")?;
+    let mut builder = CommandBuilder::new(program);
+    builder.args(args);
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .context("starting live SSH PTY connection")?;
+    drop(pair.slave);
+    #[cfg(unix)]
+    set_pty_raw(pair.master.as_ref())?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("opening live SSH PTY reader")?;
+    let writer = pair
+        .master
+        .take_writer()
+        .context("opening live SSH PTY writer")?;
+    let (sender, receiver) = mpsc::channel();
+    spawn_live_reader(reader, sender);
+    let mut writer: Option<Box<dyn Write + Send>> = Some(writer);
+    let mut output = Zeroizing::new(Vec::new());
+    let mut prompt_bytes = Zeroizing::new(Vec::new());
+    let started = SystemTime::now();
+    let mut payload_sent = payload.is_none();
+    if payload.is_none()
+        && prompts
+            .iter()
+            .all(|prompt| !prompt.required && prompt.secret.is_none())
+    {
+        writer.take();
+    }
+
+    loop {
+        if started.elapsed().unwrap_or_default() > MAX_LIVE_OPERATION_DURATION {
+            writer.take();
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("live SSH prompt/operation exceeded its bounded duration");
+        }
+        if let Some(_status) = child.try_wait().context("polling live SSH PTY")? {
+            while let Ok(chunk) = receiver.try_recv() {
+                append_live_output(&mut output, &chunk.bytes);
+                append_live_output(&mut prompt_bytes, &chunk.bytes);
+            }
+            break;
+        }
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(chunk) => {
+                append_live_output(&mut output, &chunk.bytes);
+                append_live_output(&mut prompt_bytes, &chunk.bytes);
+                let prompt_text =
+                    Zeroizing::new(String::from_utf8_lossy(&prompt_bytes).into_owned());
+                for prompt in &mut prompts {
+                    if !prompt.sent && prompt.matches(&prompt_text) {
+                        let secret = prompt
+                            .secret
+                            .context("live SSH prompt appeared without a supplied secret")?;
+                        let live_writer = writer
+                            .as_mut()
+                            .context("live SSH PTY closed before authentication")?;
+                        write_live_secret(live_writer, secret)?;
+                        prompt.sent = true;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                writer.take();
+                break;
+            }
+        }
+        let required_sent = prompts
+            .iter()
+            .filter(|prompt| prompt.required)
+            .all(|prompt| prompt.sent);
+        let optional_key_waiting = prompts
+            .iter()
+            .any(|prompt| matches!(prompt.kind, LivePromptKind::KeyPassphrase) && !prompt.sent);
+        let grace_elapsed = started.elapsed().unwrap_or_default() >= OPTIONAL_KEY_PROMPT_GRACE;
+        if required_sent && (!optional_key_waiting || grace_elapsed) {
+            if !payload_sent {
+                if let Some(bytes) = payload {
+                    let live_writer = writer
+                        .as_mut()
+                        .context("live SSH PTY closed before payload")?;
+                    live_writer.write_all(bytes)?;
+                    live_writer.flush()?;
+                }
+                payload_sent = true;
+            }
+            if payload.is_none() && prompts.iter().all(|prompt| prompt.sent || !prompt.required) {
+                writer.take();
+            }
+        }
+    }
+    writer.take();
+    let status = child.wait().context("waiting for live SSH PTY")?;
+    let stdout = redacted_live_output(&output, secrets);
+    if !status.success() {
+        bail!(
+            "live SSH operation failed: {}",
+            redact_error(&stdout, &secrets.redaction_values())
+        );
+    }
+    Ok(RemoteResult {
+        status: RemoteStatus::Success,
+        stdout,
+        stderr: String::new(),
+    })
+}
+
 /// Production SSH adapter.  Its command line is fixed and carries no
 /// password, passphrase, sudo secret, or signing key.  Artifact and seed bytes
 /// are written to the remote command's stdin and never placed in an argument,
@@ -1762,6 +2121,8 @@ pub struct SshRemoteExecutor {
     target: CanonicalSshTarget,
     known_hosts: PathBuf,
     key_path: Option<PathBuf>,
+    ssh_program: PathBuf,
+    live_secrets: Option<SshLiveSecrets>,
 }
 
 impl SshRemoteExecutor {
@@ -1797,7 +2158,17 @@ impl SshRemoteExecutor {
             target,
             known_hosts,
             key_path: None,
+            ssh_program: PathBuf::from("ssh"),
+            live_secrets: None,
         })
+    }
+
+    /// Attach bounded, zeroized credentials for a live password/key/sudo
+    /// connection.  They are consumed only by classified prompt handling and
+    /// never become process arguments or environment values.
+    pub fn with_live_secrets(mut self, secrets: SshLiveSecrets) -> Self {
+        self.live_secrets = Some(secrets);
+        self
     }
 
     pub fn with_key_path(mut self, key_path: impl Into<PathBuf>) -> Result<Self> {
@@ -1815,16 +2186,50 @@ impl SshRemoteExecutor {
     }
 
     fn base_args(&self) -> Vec<String> {
-        self.target
-            .ssh_args(&self.known_hosts, self.key_path.as_deref(), true)
+        let mut args = self.target.ssh_args(
+            &self.known_hosts,
+            self.key_path.as_deref(),
+            self.live_secrets.is_none(),
+        );
+        if self.live_secrets.is_some() && self.key_path.is_none() {
+            args.extend([
+                "-o".to_string(),
+                "PreferredAuthentications=password".to_string(),
+                "-o".to_string(),
+                "PubkeyAuthentication=no".to_string(),
+            ]);
+        }
+        args
     }
 
     fn invocation(&self, command: &str) -> Result<std::process::Output> {
-        let mut process = Command::new("ssh");
+        let mut process = Command::new(&self.ssh_program);
         process.args(self.base_args()).arg(command);
         process
             .output()
             .context("running fixed-allowlist SSH operation")
+    }
+
+    pub(crate) fn live_command(
+        &mut self,
+        command: &str,
+        sudo: bool,
+        payload: Option<&[u8]>,
+    ) -> Result<RemoteResult> {
+        let secrets = self
+            .live_secrets
+            .as_ref()
+            .context("live SSH credentials were not configured")?;
+        let mut args = self.base_args();
+        args.push(command.to_string());
+        run_live_process(
+            &self.ssh_program,
+            &args,
+            secrets,
+            self.key_path.is_none(),
+            sudo,
+            payload,
+        )
     }
 }
 
@@ -1834,9 +2239,12 @@ impl RemoteExecutor for SshRemoteExecutor {
     }
 
     fn detect(&mut self) -> Result<RemoteFacts> {
-        let output = self.invocation(
-            "set -eu; printf 'os=%s\\n' \"$(uname -s)\"; printf 'arch=%s\\n' \"$(uname -m)\"; printf 'user=%s\\n' \"$(id -un)\"; printf 'uid=%s\\n' \"$(id -u)\"; printf 'home=%s\\n' \"$HOME\"; if [ -L \"$HOME/.local/share/dirtydash/current\" ]; then printf 'current=%s\\n' \"$(readlink \"$HOME/.local/share/dirtydash/current\")\"; fi",
-        )?;
+        let command = "set -eu; printf 'os=%s\\n' \"$(uname -s)\"; printf 'arch=%s\\n' \"$(uname -m)\"; printf 'user=%s\\n' \"$(id -un)\"; printf 'uid=%s\\n' \"$(id -u)\"; printf 'home=%s\\n' \"$HOME\"; if [ -L \"$HOME/.local/share/dirtydash/current\" ]; then printf 'current=%s\\n' \"$(readlink \"$HOME/.local/share/dirtydash/current\")\"; fi";
+        if self.live_secrets.is_some() {
+            let result = self.live_command(command, false, None)?;
+            return RemoteFacts::parse_probe(&result.stdout);
+        }
+        let output = self.invocation(command)?;
         if !output.status.success() {
             bail!(
                 "remote platform probe failed with status {}",
@@ -1856,6 +2264,9 @@ impl RemoteExecutor for SshRemoteExecutor {
                 shm_backup_path: _,
             } => {
                 let command = action_command(&action)?;
+                if self.live_secrets.is_some() {
+                    return self.live_command(&command, false, None);
+                }
                 let output = self.invocation(&command)?;
                 if !output.status.success() {
                     bail!(
@@ -1896,6 +2307,9 @@ impl RemoteExecutor for SshRemoteExecutor {
             _ => {}
         }
         let command = action_command(&action)?;
+        if self.live_secrets.is_some() {
+            return self.live_command(&command, false, None);
+        }
         let output = self.invocation(&command)?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -1929,15 +2343,27 @@ impl RemoteExecutor for SshRemoteExecutor {
             bail!("remote upload mode is not allowlisted");
         }
         let temp = format!("{destination}.tmp-{}", std::process::id());
+        let input_command = if self.live_secrets.is_some() {
+            format!(
+                "dd bs=1 count={} 2>/dev/null > {}",
+                bytes.len(),
+                shell_quote(&temp)
+            )
+        } else {
+            format!("cat > {}", shell_quote(&temp))
+        };
         let command = format!(
-            "set -eu; umask 077; cat > {}; chmod {:o} {}; mv -f {} {}",
-            shell_quote(&temp),
+            "set -eu; umask 077; {input_command}; chmod {:o} {}; mv -f {} {}",
             mode,
             shell_quote(&temp),
             shell_quote(&temp),
             shell_quote(destination),
+            input_command = input_command,
         );
-        let mut process = Command::new("ssh");
+        if self.live_secrets.is_some() {
+            return self.live_command(&command, false, Some(bytes));
+        }
+        let mut process = Command::new(&self.ssh_program);
         process
             .args(self.base_args())
             .arg(command)
@@ -1962,6 +2388,211 @@ impl RemoteExecutor for SshRemoteExecutor {
     }
 }
 
+fn sqlite_header_command(path: &str) -> String {
+    let path = shell_quote(path);
+    format!(
+        "if command -v python3 >/dev/null 2>&1; then python3 - {path} <<'PY'\nimport sys\nwith open(sys.argv[1], 'rb') as handle:\n    if handle.read(16) != bytes.fromhex('{SQLITE_HEADER_HEX}'):\n        raise SystemExit(1)\nPY\nelif command -v od >/dev/null 2>&1; then actual=$(dd if={path} bs=1 count=16 2>/dev/null | od -An -v -t x1 | tr -d '[:space:]'); test \"$actual\" = {SQLITE_HEADER_HEX}; else echo 'no portable SQLite header validator' >&2; exit 1; fi",
+    )
+}
+
+fn snapshot_command(
+    paths: &DeploymentPaths,
+    platform: ServicePlatform,
+    listener: &ListenerPlan,
+) -> Result<String> {
+    let snapshot = format!("{}/deployment-rollback", paths.state_dir);
+    let service_files = [
+        format!("{}/dirtydash-hub.service", paths.service_dir),
+        format!("{}/dirtydash-collector.service", paths.service_dir),
+        format!("{}/dev.dirtydash.hub.plist", paths.service_dir),
+        format!("{}/dev.dirtydash.collector.plist", paths.service_dir),
+    ]
+    .into_iter()
+    .map(|path| shell_quote(&path))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let service_state = match platform {
+        ServicePlatform::Systemd => {
+            "for service in dirtydash-hub.service dirtydash-collector.service; do if systemctl --user is-enabled \"$service\" > \"$snapshot/$service.enabled\" 2>/dev/null; then :; else printf 'disabled\\n' > \"$snapshot/$service.enabled\"; fi; if systemctl --user is-active \"$service\" > \"$snapshot/$service.active\" 2>/dev/null; then :; else printf 'inactive\\n' > \"$snapshot/$service.active\"; fi; done".to_string()
+        }
+        ServicePlatform::Launchd => {
+            "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do if launchctl print \"$domain/$service\" > \"$snapshot/$service.loaded\" 2>/dev/null; then :; else printf 'unloaded\\n' > \"$snapshot/$service.loaded\"; fi; done".to_string()
+        }
+    };
+    Ok(format!(
+        "set -eu; umask 077; snapshot={snapshot}; mkdir -p \"$snapshot\"; if [ -L {current} ]; then readlink {current} > \"$snapshot/previous-current\"; else : > \"$snapshot/.missing-current\"; fi; if [ -f {config} ]; then cp -p {config} \"$snapshot/config.toml\"; else : > \"$snapshot/.missing-config\"; fi; for service in {service_files}; do if [ -f \"$service\" ]; then cp -p \"$service\" \"$snapshot/$(basename \"$service\")\"; else : > \"$snapshot/.missing-$(basename \"$service\")\"; fi; done; {service_state}; : > \"$snapshot/hub-port\"; for service in {service_files}; do if [ -f \"$service\" ]; then port=$(sed -nE 's/.*--port[ =]([0-9]+).*/\\1/p' \"$service\" | head -n 1); if [ -z \"$port\" ]; then port=$(grep -A1 '<string>--port</string>' \"$service\" 2>/dev/null | sed -n '2p' | sed -nE 's/.*<string>([0-9]+)</string>.*/\\1/p'); fi; if [ -n \"$port\" ]; then printf '%s\\n' \"$port\" > \"$snapshot/hub-port\"; break; fi; fi; done; printf '%s\\n' {requested_port} > \"$snapshot/requested-port\"; if command -v tailscale >/dev/null 2>&1 && tailscale serve status --json > \"$snapshot/tailscale-serve.json\" 2>/dev/null && [ -s \"$snapshot/tailscale-serve.json\" ]; then tailscale serve status > \"$snapshot/tailscale-serve.txt\" 2>/dev/null || true; port=$(sed -nE 's/.*127\\.0\\.0\\.1:([0-9]+).*/\\1/p' \"$snapshot/tailscale-serve.txt\" | head -n 1); backend=$(sed -nE 's/.*proxy (https?:\\/\\/[^ ]+).*/\\1/p' \"$snapshot/tailscale-serve.txt\" | head -n 1); if [ -n \"$port\" ] || [ -n \"$backend\" ]; then printf 'enabled\\n' > \"$snapshot/listener-state\"; if [ -n \"$port\" ]; then printf '%s\\n' \"$port\" > \"$snapshot/listener-port\"; fi; if [ -n \"$backend\" ]; then printf '%s\\n' \"$backend\" > \"$snapshot/listener-backend\"; fi; else printf 'not-configured\\n' > \"$snapshot/listener-state\"; fi; elif command -v tailscale >/dev/null 2>&1; then printf 'not-configured\\n' > \"$snapshot/listener-state\"; else printf 'unavailable\\n' > \"$snapshot/listener-state\"; fi",
+        snapshot = shell_quote(&snapshot),
+        current = shell_quote(&paths.current),
+        config = shell_quote(&paths.config_file),
+        service_files = service_files,
+        service_state = service_state,
+        requested_port = listener.local_port,
+    ))
+}
+
+fn snapshot_restore_command(snapshot: &str) -> String {
+    let snapshot = shell_quote(snapshot);
+    format!(
+        "if [ -f {snapshot}/config.toml ]; then mv -f {snapshot}/config.toml \"$HOME/.config/dirtydash/config.toml\"; elif [ -f {snapshot}/.missing-config ]; then rm -f \"$HOME/.config/dirtydash/config.toml\"; fi; for service in dirtydash-hub.service dirtydash-collector.service; do if [ -f {snapshot}/$service ]; then mv -f {snapshot}/$service \"$HOME/.config/dirtydash/systemd/user/$service\"; elif [ -f {snapshot}/.missing-$service ]; then rm -f \"$HOME/.config/dirtydash/systemd/user/$service\"; fi; done; for service in dev.dirtydash.hub.plist dev.dirtydash.collector.plist; do if [ -f {snapshot}/$service ]; then mv -f {snapshot}/$service \"$HOME/Library/LaunchAgents/$service\"; elif [ -f {snapshot}/.missing-$service ]; then rm -f \"$HOME/Library/LaunchAgents/$service\"; fi; done; ",
+    )
+}
+
+fn listener_snapshot_restore_command(snapshot: &str) -> String {
+    let snapshot = shell_quote(snapshot);
+    format!(
+        "test -f {snapshot}/listener-state; if command -v tailscale >/dev/null 2>&1; then state=$(cat {snapshot}/listener-state); case \"$state\" in enabled) tailscale serve reset; if [ -s {snapshot}/listener-backend ]; then backend=$(cat {snapshot}/listener-backend); tailscale serve --https=443 \"$backend\"; else test -s {snapshot}/listener-port; port=$(cat {snapshot}/listener-port); case \"$port\" in ''|*[!0-9]*) exit 71;; esac; tailscale serve --https=443 http://127.0.0.1:\"$port\"; fi;; not-configured) tailscale serve reset;; unavailable) echo 'prior Tailscale listener state was not observable' >&2; exit 72;; *) echo 'prior Tailscale listener state is invalid' >&2; exit 73;; esac; else state=$(cat {snapshot}/listener-state); test \"$state\" = not-configured; fi; ",
+    )
+}
+
+fn rollback_activation_command(
+    current: &str,
+    previous: Option<&str>,
+    platform: ServicePlatform,
+    snapshot: Option<&str>,
+) -> String {
+    let current_path = current.to_string();
+    let current = shell_quote(current);
+    let temp = format!("{current_path}.rollback-{}", std::process::id());
+    let move_command = activation_move_command(&temp, &current_path, platform);
+    let fallback = previous
+        .map(|previous| format!("previous={}; ", shell_quote(previous),))
+        .unwrap_or_default();
+    let snapshot_previous = snapshot
+        .map(|snapshot| {
+            let snapshot = shell_quote(snapshot);
+            format!(
+                "if [ -s {snapshot}/previous-current ]; then previous=$(cat {snapshot}/previous-current); elif [ -f {snapshot}/.missing-current ]; then previous=; else {fallback}fi; ",
+                fallback = fallback,
+            )
+        })
+        .unwrap_or_else(|| {
+            if previous.is_some() {
+                fallback.to_string()
+            } else {
+                "previous=; ".to_string()
+            }
+        });
+    format!(
+        "{snapshot_previous}if [ -n \"$previous\" ]; then ln -s \"$previous\" {temp}; {move_command}; else rm -f {current}; fi; ",
+        snapshot_previous = snapshot_previous,
+        temp = shell_quote(&temp),
+        move_command = move_command,
+        current = current,
+    )
+}
+
+fn rollback_service_restart_command(platform: ServicePlatform, snapshot: Option<&str>) -> String {
+    let Some(snapshot) = snapshot else {
+        return service_restart_command(platform).to_string();
+    };
+    let snapshot = shell_quote(snapshot);
+    match platform {
+        ServicePlatform::Systemd => format!(
+            "systemctl --user daemon-reload; if grep -qx enabled {snapshot}/dirtydash-hub.service.enabled 2>/dev/null; then systemctl --user enable dirtydash-hub.service; else systemctl --user disable dirtydash-hub.service 2>/dev/null || true; fi; if grep -qx enabled {snapshot}/dirtydash-collector.service.enabled 2>/dev/null; then systemctl --user enable dirtydash-collector.service; else systemctl --user disable dirtydash-collector.service 2>/dev/null || true; fi; systemctl --user restart dirtydash-hub.service; systemctl --user restart dirtydash-collector.service; systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service",
+        ),
+        ServicePlatform::Launchd => service_restart_command(platform).to_string(),
+    }
+}
+
+fn rollback_health_command(
+    current: &str,
+    database_path: Option<&str>,
+    snapshot: Option<&str>,
+    fallback_port: u16,
+) -> String {
+    let current = shell_quote(current);
+    let database = database_path
+        .map(shell_quote)
+        .unwrap_or_else(|| "\"$HOME/.local/state/dirtydash/data/dirtydash.sqlite3\"".to_string());
+    let port = snapshot
+        .map(|snapshot| {
+            let snapshot = shell_quote(snapshot);
+            format!(
+                "if [ -s {snapshot}/listener-port ]; then port=$(cat {snapshot}/listener-port); elif [ -s {snapshot}/hub-port ]; then port=$(cat {snapshot}/hub-port); else port={fallback_port}; fi; ",
+            )
+        })
+        .unwrap_or_else(|| format!("port={fallback_port}; "));
+    format!(
+        "{port}case \"$port\" in ''|*[!0-9]*) exit 74;; esac; command -v curl >/dev/null; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:\"$port\"/healthz >/dev/null; test -x {current}/dirtydash; {current}/dirtydash --config \"$HOME/.config/dirtydash/config.toml\" --db {database} collector diagnostics --json >/dev/null; ",
+        port = port,
+        current = current,
+        database = database,
+    )
+}
+
+struct RollbackCommandInput<'a> {
+    current: &'a str,
+    previous: Option<&'a str>,
+    database_path: Option<&'a str>,
+    database_backup: Option<&'a str>,
+    database_wal_backup: Option<&'a str>,
+    database_shm_backup: Option<&'a str>,
+    platform: ServicePlatform,
+    listener: Option<&'a ListenerPlan>,
+    snapshot: Option<&'a str>,
+}
+
+fn rollback_command(input: RollbackCommandInput<'_>) -> Result<String> {
+    let RollbackCommandInput {
+        current,
+        previous,
+        database_path,
+        database_backup,
+        database_wal_backup,
+        database_shm_backup,
+        platform,
+        listener,
+        snapshot,
+    } = input;
+    let database_restore = match (database_path, database_backup) {
+        (Some(database), Some(backup)) => {
+            let wal = database_wal_backup
+                .map(shell_quote)
+                .unwrap_or_else(|| shell_quote(&format!("{backup}-wal")));
+            let shm = database_shm_backup
+                .map(shell_quote)
+                .unwrap_or_else(|| shell_quote(&format!("{backup}-shm")));
+            format!(
+                "{validate}; rm -f {database}-wal {database}-shm; mv -f {backup} {database}; if [ -e {wal} ]; then mv -f {wal} {database}-wal; fi; if [ -e {shm} ]; then mv -f {shm} {database}-shm; fi; ",
+                validate = sqlite_header_command(backup),
+                database = shell_quote(database),
+                backup = shell_quote(backup),
+                wal = wal,
+                shm = shm,
+            )
+        }
+        (Some(_), None) => {
+            bail!("rollback refuses to delete a database without a validated backup")
+        }
+        _ => String::new(),
+    };
+    let snapshot_restore = snapshot.map(snapshot_restore_command).unwrap_or_default();
+    let listener_restore = snapshot
+        .map(listener_snapshot_restore_command)
+        .or_else(|| listener.map(listener_restore_command))
+        .unwrap_or_default();
+    let activation = rollback_activation_command(current, previous, platform, snapshot);
+    let restart = rollback_service_restart_command(platform, snapshot);
+    let health = rollback_health_command(
+        current,
+        database_path,
+        snapshot,
+        listener
+            .map(|listener| listener.local_port)
+            .unwrap_or(DEFAULT_HUB_PORT),
+    );
+    Ok(format!(
+        "set -eu; {quiesce}; {database_restore}{activation}{snapshot_restore}{listener_restore}{restart}; {health}",
+        quiesce = service_quiesce_command(platform),
+        database_restore = database_restore,
+        activation = activation,
+        snapshot_restore = snapshot_restore,
+        listener_restore = listener_restore,
+        restart = restart,
+        health = health,
+    ))
+}
+
 fn action_command(action: &RemoteAction) -> Result<String> {
     match action {
         RemoteAction::PreparePaths { paths } => Ok(format!(
@@ -1974,20 +2605,11 @@ fn action_command(action: &RemoteAction) -> Result<String> {
             shell_quote(&paths.service_dir),
             shell_quote(&paths.home),
         )),
-        RemoteAction::SnapshotRollbackState { paths, platform: _, listener: _ } => Ok(format!(
-            "set -eu; umask 077; snapshot={}; mkdir -p {}; if [ -f {} ]; then cp -p {} {}/config.toml; else : > {}/.missing-config; fi; for service in {}/dirtydash-hub.service {}/dirtydash-collector.service {}/dev.dirtydash.hub.plist {}/dev.dirtydash.collector.plist; do if [ -f \"$service\" ]; then cp -p \"$service\" \"$snapshot/$(basename \"$service\")\"; else : > \"$snapshot/.missing-$(basename \"$service\")\"; fi; done",
-
-            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
-            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
-            shell_quote(&paths.config_file),
-            shell_quote(&paths.config_file),
-            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
-            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
-            shell_quote(&paths.service_dir),
-            shell_quote(&paths.service_dir),
-            shell_quote(&paths.service_dir),
-            shell_quote(&paths.service_dir),
-        )),
+        RemoteAction::SnapshotRollbackState {
+            paths,
+            platform,
+            listener,
+        } => snapshot_command(paths, *platform, listener),
         RemoteAction::QuiesceServices { platform } => Ok(match platform {
             ServicePlatform::Systemd => "set -eu; systemctl --user stop dirtydash-hub.service; systemctl --user stop dirtydash-collector.service".to_string(),
             ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); launchctl kill TERM \"$domain/dev.dirtydash.hub\" 2>/dev/null || true; launchctl kill TERM \"$domain/dev.dirtydash.collector\" 2>/dev/null || true".to_string(),
@@ -2015,15 +2637,24 @@ fn action_command(action: &RemoteAction) -> Result<String> {
         } => {
             // The old database is never removed without a validated backup.
             // SQLite's sidecars are copied as part of the same quiesced
-            // transaction so a WAL-backed database cannot be restored into an
-            // inconsistent main file.
+            // transaction so a WAL-backed database can be restored without
+            // putting the 16-byte magic in a shell variable.  The Python/od
+            // helper is deliberately independent of sqlite3 availability.
+            let seed = shell_quote(seed_path);
+            let db = shell_quote(database_path);
+            let backup = shell_quote(backup_path);
+            let wal = shell_quote(wal_backup_path);
+            let shm = shell_quote(shm_backup_path);
             Ok(format!(
-                "set -eu; test -s {seed}; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 {seed} 'PRAGMA integrity_check' | grep -qx ok; else test \"$(dd if={seed} bs=1 count=16 2>/dev/null)\" = \"SQLite format 3\\000\"; fi; if [ -e {db} ]; then cp -p {db} {backup}; test -s {backup}; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 {backup} 'PRAGMA integrity_check' | grep -qx ok; fi; if [ -e {db}-wal ]; then cp -p {db}-wal {wal}; else rm -f {wal}; fi; if [ -e {db}-shm ]; then cp -p {db}-shm {shm}; else rm -f {shm}; fi; else test ! -e {backup}; test ! -e {wal}; test ! -e {shm}; fi; rm -f {db}-wal {db}-shm; mv -f {seed} {db}",
-                seed = shell_quote(seed_path),
-                db = shell_quote(database_path),
-                backup = shell_quote(backup_path),
-                wal = shell_quote(wal_backup_path),
-                shm = shell_quote(shm_backup_path),
+                "set -eu; test -s {seed}; {seed_header}; if [ -e {db} ]; then {db_header}; cp -p {db} {backup}; test -s {backup}; {backup_header}; if [ -e {db}-wal ]; then cp -p {db}-wal {wal}; else rm -f {wal}; fi; if [ -e {db}-shm ]; then cp -p {db}-shm {shm}; else rm -f {shm}; fi; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 {backup} 'PRAGMA integrity_check' | grep -qx ok; fi; else test ! -e {backup}; test ! -e {wal}; test ! -e {shm}; fi; rm -f {db}-wal {db}-shm; mv -f {seed} {db}",
+                seed = seed,
+                seed_header = sqlite_header_command(seed_path),
+                db = db,
+                db_header = sqlite_header_command(database_path),
+                backup = backup,
+                backup_header = sqlite_header_command(backup_path),
+                wal = wal,
+                shm = shm,
             ))
         }
         RemoteAction::InstallRuntimeConfig { config_path, .. } => {
@@ -2061,57 +2692,17 @@ fn action_command(action: &RemoteAction) -> Result<String> {
             platform,
             listener,
             snapshot_dir,
-        } => {
-            let database_restore = match (database_path, database_backup) {
-                (Some(database), Some(backup)) => {
-                    let wal_restore = database_wal_backup
-                        .as_ref()
-                        .zip(database_shm_backup.as_ref())
-                        .map(|(wal, shm)| format!("if [ -e {wal} ]; then mv -f {wal} {database}-wal; fi; if [ -e {shm} ]; then mv -f {shm} {database}-shm; fi; ", wal = shell_quote(wal), shm = shell_quote(shm), database = shell_quote(database)))
-                        .unwrap_or_default();
-                    format!(
-                        "test -f {backup}; mv -f {backup} {database}; {wal_restore}",
-                        database = shell_quote(database),
-                        backup = shell_quote(backup),
-                        wal_restore = wal_restore,
-                    )
-                }
-                (Some(_), None) => bail!("rollback refuses to delete a database without a validated backup"),
-                _ => String::new(),
-            };
-            let listener_restore = listener
-                .as_ref()
-                .map(listener_restore_command)
-                .unwrap_or_default();
-            let snapshot_restore = snapshot_dir
-                .as_ref()
-                .map(|snapshot| format!("if [ -f {snapshot}/config.toml ]; then mv -f {snapshot}/config.toml \"$HOME/.config/dirtydash/config.toml\"; elif [ -f {snapshot}/.missing-config ]; then rm -f \"$HOME/.config/dirtydash/config.toml\"; fi; for service in dirtydash-hub.service dirtydash-collector.service; do if [ -f {snapshot}/$service ]; then mv -f {snapshot}/$service \"$HOME/.config/dirtydash/systemd/user/$service\"; elif [ -f {snapshot}/.missing-$service ]; then rm -f \"$HOME/.config/dirtydash/systemd/user/$service\"; fi; done; for service in dev.dirtydash.hub.plist dev.dirtydash.collector.plist; do if [ -f {snapshot}/$service ]; then mv -f {snapshot}/$service \"$HOME/Library/LaunchAgents/$service\"; elif [ -f {snapshot}/.missing-$service ]; then rm -f \"$HOME/Library/LaunchAgents/$service\"; fi; done; ", snapshot = shell_quote(snapshot)))
-                .unwrap_or_default();
-            let Some(previous) = previous else {
-                let quiesce = service_quiesce_command(*platform);
-                return Ok(format!(
-                    "set -eu; {database_restore}{quiesce}; rm -f {current}; {snapshot_restore}{listener_restore}{restart}",
-                    database_restore = database_restore,
-                    quiesce = quiesce,
-                    current = shell_quote(current),
-                    snapshot_restore = snapshot_restore,
-                    listener_restore = listener_restore,
-                    restart = service_restart_command(*platform),
-                ));
-            };
-            let temp = format!("{current}.rollback-{}", std::process::id());
-            Ok(format!(
-                "set -eu; {database_restore}{quiesce}; ln -s {} {}; {}; {snapshot_restore}{listener_restore}{restart}",
-                shell_quote(previous),
-                shell_quote(&temp),
-                activation_move_command(&temp, current, *platform),
-                database_restore = database_restore,
-                quiesce = service_quiesce_command(*platform),
-                snapshot_restore = snapshot_restore,
-                listener_restore = listener_restore,
-                restart = service_restart_command(*platform),
-            ))
-        }
+        } => rollback_command(RollbackCommandInput {
+            current,
+            previous: previous.as_deref(),
+            database_path: database_path.as_deref(),
+            database_backup: database_backup.as_deref(),
+            database_wal_backup: database_wal_backup.as_deref(),
+            database_shm_backup: database_shm_backup.as_deref(),
+            platform: *platform,
+            listener: listener.as_ref(),
+            snapshot: snapshot_dir.as_deref(),
+        }),
         RemoteAction::Cleanup {
             release,
             remove_release,
