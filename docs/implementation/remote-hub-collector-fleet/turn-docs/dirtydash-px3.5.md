@@ -42,6 +42,41 @@ Owners can safely understand and operate Machine lifecycle, health, credentials,
 
 The implementation session is sole mutable owner. The coordinator owns Beads, integration, CI, and callbacks. The Machines UI must preserve Dirtydash's calm, dense, terminal-native product register rather than introducing generic SaaS cards.
 
+### Tracer-bullet resume brief — 2026-07-15
+
+```json
+{
+  "phase_issue_id": "dirtydash-px3.5",
+  "active_slice": "dirtydash-px3.8",
+  "risk": "high",
+  "strategy": "sessions",
+  "implementation_owner": "one durable Pi session bound to /home/delta/dev/dirtydash-phase5 on lavender/remote-hub-collector-fleet-5-fleet",
+  "review_independence": "a fresh read-only thermo-nuclear review session after implementation ownership returns",
+  "delegation_plan": [
+    "complete only the active ready slice",
+    "run focused and regression gates in the implementation session",
+    "perform one bounded independent review and at most two convergent repair cycles before closeout",
+    "return Beads, PR, merge, and phase advancement authority to the coordinator"
+  ],
+  "model_and_effort_rationale": "Enrollment crosses SSH deployment, transient credentials, authentication, ingest, command polling, and cleanup, so a strong model with high reasoning is proportionate.",
+  "required_evidence": [
+    "non-loopback canonical Hub URL",
+    "unique Machine-bound credential",
+    "production-path first ingest and command poll",
+    "no secret in arguments, environment, logs, diagnostics, or persistence",
+    "failed-attempt credential revocation and plaintext retry-state clearing"
+  ],
+  "user_constraints": [
+    "continue autonomously across slices and phases",
+    "structured completion callbacks without routine polling",
+    "one active implementation PR and one mutable checkout owner",
+    "two-cycle non-convergence guard"
+  ]
+}
+```
+
+The coordinator validated the Pi binding and certified adapter contract before resume, claimed `dirtydash-px3.8`, and transferred the clean phase checkout to the implementation session.
+
 ## Adaptations
 
 - The phase PR targets the integration branch rather than `main`.
@@ -61,6 +96,8 @@ The implementation session is sole mutable owner. The coordinator owns Beads, in
 
 The bound implementation checkout contains the Hub fleet repository/router, additive schema migration, Collector repair command, hosted enrollment endpoints, signed rollout persistence/coordinator, and Machines workspace. This repair pass adds typed bounded command/receipt schemas, deterministic update and rollback commands, transactional lifecycle revisions, rollback desired-version/runtime state, canonical hosted Hub URL rendering, request-scoped credential reservation and atomic restrictive secret transfer, server-owned restart reconciliation, timeout recovery, cleanup retry, private snapshot permissions, and fail-closed private Tailscale identity handling. The dashboard uses native Tab order, tablist arrow/Home/End navigation, explicit icon-plus-text states, focus-visible styling, reduced-motion support, container-responsive controls, a body-portal destructive dialog with complete background inertness, mutation/load error separation, secret-free retry closures, and server-owned receipt rendering. Contract and rendered axe/focus tests cover the repaired surface.
 
+Slice `dirtydash-px3.8` tightens hosted enrollment through first Hub ingest: hosted execute now rejects loopback/unspecified canonical Hub origins, revokes the reserved pending Collector credential on post-reservation failure paths, and leaves retry bound to the same enrollment credential row with a newly hashed secret. A production HTTP Collector test provisions an enrollment credential, runs the real Collector with `CollectorHttpTransport` against an Axum Hub listener, ingests usage, polls a diagnostics command, and confirms Hub persistence contains the resulting event/ack without raw credential material.
+
 ## Changed Behavior And Files
 
 - Backend: `crates/dirtydash/src/hub/fleet.rs`, `hub/router.rs`, `hub/repository.rs`, `hub/auth.rs`, `hub/mod.rs`, `hub/protocol.rs`, `db.rs`, `config.rs`, `enrollment.rs`, and `collector.rs`.
@@ -68,6 +105,7 @@ The bound implementation checkout contains the Hub fleet repository/router, addi
 - Dashboard tooling: `dashboard/package.json`, `dashboard/package-lock.json`, and `dashboard/vite.config.ts` add strict TypeScript types plus rendered Vitest/jsdom/axe coverage.
 - Generated dashboard artifacts: `dashboard/dist` is regenerated from the repaired portal/inert and secret-state UI; stale hashed assets are removed.
 - Documentation: this turn document, the phase docs, and `/api/v1` invariant notes record canonical URLs, secret transfer, receipt/rollback, lifecycle, and snapshot-permission contracts.
+- Slice `dirtydash-px3.8`: `crates/dirtydash/src/hub/router.rs`, `hub/repository.rs`, `hub/mod.rs`, and `hub/tests.rs` cover non-loopback hosted canonical URL enforcement, pending credential revocation/retry semantics, and first-ingest/command-poll production HTTP evidence.
 
 ## Review
 
@@ -90,6 +128,19 @@ Evidence:
 - `npm --prefix dashboard exec tsc -- --noEmit` passed with dashboard-local React typings.
 - Production bundle inspection confirmed the generated JavaScript contains the portal/inert modal behavior.
 - `git diff --check` passed.
+
+Additional `dirtydash-px3.8` evidence:
+
+- `cargo test -p dirtydash hosted_enrollment_canonical_url_and_pending_credentials_are_safe_to_retry -- --nocapture` passed.
+- `cargo test -p dirtydash enrolled_collector_http_path_ingests_usage_and_polls_commands -- --nocapture` passed.
+- `cargo test -p dirtydash hub::tests:: -- --nocapture` passed: 41 Hub tests.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo test --all-targets --all-features` passed: 119 library tests, 9 CLI tests, and 15 Collector integration tests.
+- `npm --prefix dashboard run test:contract` passed.
+- `npm --prefix dashboard run test` passed: 2 rendered tests.
+- `cd dashboard && npx tsc --noEmit` passed.
+- `cd dashboard && npm run build` passed.
 
 ## PR And Commits
 

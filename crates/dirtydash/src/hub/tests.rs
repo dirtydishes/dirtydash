@@ -1,8 +1,10 @@
 use super::*;
 use crate::collector::{
-    Collector, CollectorOptions, CollectorTransport, RetryClass, TransportError,
+    Collector, CollectorHttpTransport, CollectorOptions, CollectorTransport, CommandOutcome,
+    RetryClass, TransportError,
 };
 use crate::config::SourceRoot;
+use anyhow::Context;
 use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::header;
@@ -803,6 +805,197 @@ async fn collector_credential_rotation_and_revocation_work() {
 
     let revoked = ingest(&app, &second.token, &initial).await;
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn hosted_enrollment_canonical_url_and_pending_credentials_are_safe_to_retry() {
+    assert!(super::router::validate_hosted_collector_hub_url("https://hub.example.test/").is_ok());
+    for invalid in [
+        "http://hub.example.test/",
+        "https://localhost/",
+        "https://127.0.0.1/",
+        "https://[::1]/",
+        "https://0.0.0.0/",
+        "https://hub.example.test/path",
+    ] {
+        assert!(
+            super::router::validate_hosted_collector_hub_url(invalid).is_err(),
+            "{invalid} should not be advertised to hosted Collectors"
+        );
+    }
+
+    let repo = test_repo();
+    let first = repo
+        .prepare_enrollment_credential("enroll-first", "machine-enrolled-a", "Machine Enrolled A")
+        .unwrap()
+        .unwrap();
+    let second = repo
+        .prepare_enrollment_credential("enroll-second", "machine-enrolled-b", "Machine Enrolled B")
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.credential_id, second.credential_id);
+    assert_ne!(first.token.as_str(), second.token.as_str());
+
+    let mut wrong_machine = ingest_request(API_V1_PROTOCOL_VERSION);
+    wrong_machine.machine_id = "machine-enrolled-b".to_string();
+    let auth = repo.authenticate_collector_bearer(&first.token).unwrap();
+    assert_eq!(auth.machine_id, "machine-enrolled-a");
+    assert_eq!(
+        repo.ingest_batch(&auth, wrong_machine).unwrap_err().code,
+        "collector-machine-mismatch"
+    );
+
+    let token = first.token.to_string();
+    let secret = token.rsplit_once('.').unwrap().1.to_string();
+    let credential_id = first.credential_id.clone();
+    repo.revoke_pending_enrollment_credential("enroll-first", "machine-enrolled-a", &credential_id)
+        .unwrap();
+    assert!(repo.authenticate_collector_bearer(&token).is_err());
+
+    let conn = repo.db.connection().unwrap();
+    let (status, revoked_at): (String, Option<String>) = conn
+        .query_row(
+            "SELECT e.status, c.revoked_at FROM enrollment_credentials e JOIN collector_credentials c USING (credential_id) WHERE e.enrollment_id = 'enroll-first'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "revoked");
+    assert!(revoked_at.is_some());
+    for needle in [&token, &secret] {
+        for (table, column) in [
+            ("machines", "display_name"),
+            ("collector_credentials", "secret_hash"),
+            ("enrollment_credentials", "status"),
+        ] {
+            let query = format!("SELECT COUNT(*) FROM {table} WHERE {column} LIKE ?1");
+            let count: i64 = conn
+                .query_row(&query, [format!("%{needle}%")], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "secret material persisted in {table}.{column}");
+        }
+    }
+
+    drop(conn);
+    let retry = repo
+        .prepare_enrollment_credential("enroll-first", "machine-enrolled-a", "Machine Enrolled A")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.credential_id, credential_id);
+    assert_ne!(retry.token.as_str(), token);
+    assert!(repo.authenticate_collector_bearer(&retry.token).is_ok());
+}
+
+#[tokio::test]
+async fn enrolled_collector_http_path_ingests_usage_and_polls_commands() {
+    let repo = test_repo();
+    let issued = repo
+        .prepare_enrollment_credential(
+            "enroll-http",
+            "machine-http-installed",
+            "HTTP Installed Collector",
+        )
+        .unwrap()
+        .unwrap();
+    repo.complete_enrollment_credential(
+        "enroll-http",
+        "machine-http-installed",
+        &issued.credential_id,
+    )
+    .unwrap();
+    let token = issued.token.to_string();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_repo = repo.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            build_router_with_config_and_connect_info(
+                server_repo,
+                HubRouterConfig::for_listener(ListenerTrustMode::LoopbackHttp),
+            ),
+        )
+        .await
+    });
+
+    repo.issue_collector_command(IssueCollectorCommandRequest {
+        machine_id: "machine-http-installed".to_string(),
+        command: OwnerCommand::Diagnostics {
+            command_id: "first-http-command".to_string(),
+        },
+        expected_state_revision: None,
+    })
+    .unwrap();
+
+    let dir = tempdir().unwrap();
+    let source_root = dir.path().join("claude/projects/project-http");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        source_root.join("session.jsonl"),
+        r#"{"sessionId":"http-installed-session","cwd":"/private/project","timestamp":"2026-07-15T00:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":42,"output_tokens":9}}}"#,
+    )
+    .unwrap();
+    let usage_path = dir.path().join("usage.sqlite3");
+    let collector_path = dir.path().join("collector.sqlite3");
+    let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, CommandOutcome)> {
+        let options = CollectorOptions {
+            source_roots: vec![SourceRoot {
+                kind: "claude-code".to_string(),
+                path: dir.path().join("claude/projects"),
+            }],
+            machine_id: Some("machine-http-installed".to_string()),
+            credential_token: Some(token),
+            ..CollectorOptions::default()
+        };
+        let mut collector = Collector::with_databases(
+            Database::open(&usage_path)?,
+            Database::open(&collector_path)?,
+            options,
+        )?;
+        collector.reconcile_startup(
+            chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")?
+                .with_timezone(&chrono::Utc),
+        )?;
+        let mut transport = CollectorHttpTransport::new(&format!("http://{address}"))?;
+        let delivery = collector.deliver_pending(
+            &mut transport,
+            chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:01Z")?
+                .with_timezone(&chrono::Utc),
+        )?;
+        let outcome = collector
+            .poll_owner_command(
+                &mut transport,
+                chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:02Z")?
+                    .with_timezone(&chrono::Utc),
+            )?
+            .context("Collector did not receive the first Hub command")?;
+        Ok((delivery.acknowledged, outcome))
+    });
+    let (acknowledged, outcome) = handle.await.unwrap().unwrap();
+    assert_eq!(acknowledged, 1);
+    assert!(matches!(outcome, CommandOutcome::Diagnostics { .. }));
+
+    let conn = repo.db.connection().unwrap();
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_events WHERE machine_id = 'machine-http-installed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(events, 1);
+    let result_json: String = conn
+        .query_row(
+            "SELECT result_json FROM collector_commands WHERE command_id = 'first-http-command'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(result_json.contains("diagnostics"));
+
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use zeroize::Zeroize;
 
 use crate::deployment::SignedArtifactManifest;
@@ -709,6 +709,44 @@ fn enrollment_step_error(error: anyhow::Error) -> HubError {
     HubError::unprocessable("enrollment-step-failed", error.to_string())
 }
 
+fn is_loopback_or_unspecified_host(host: &str) -> bool {
+    let host = host.trim_matches(|character| matches!(character, '[' | ']'));
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+pub(crate) fn validate_hosted_collector_hub_url(value: &str) -> Result<String, HubError> {
+    let parsed = reqwest::Url::parse(value).map_err(|_| {
+        HubError::unprocessable(
+            "invalid-canonical-hub-url",
+            "hosted enrollment requires a canonical Hub origin URL",
+        )
+    })?;
+    let Some(host) = parsed.host_str() else {
+        return Err(HubError::unprocessable(
+            "invalid-canonical-hub-url",
+            "hosted enrollment requires a canonical Hub origin URL",
+        ));
+    };
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+        || is_loopback_or_unspecified_host(host)
+    {
+        return Err(HubError::unprocessable(
+            "invalid-canonical-hub-url",
+            "hosted enrollment requires a non-loopback HTTPS Hub origin URL",
+        ));
+    }
+    Ok(parsed.to_string())
+}
+
 fn verified_enrollment_artifact(
     state: &HubState,
     draft: &EnrollmentDraft,
@@ -920,6 +958,7 @@ async fn admin_enrollment_execute(
             "hosted enrollment requires an explicitly configured reachable Hub URL",
         )
     })?;
+    let hub_url = validate_hosted_collector_hub_url(&hub_url)?;
     let machine_id = draft.machine_id.clone().ok_or_else(|| {
         HubError::conflict(
             "enrollment-machine-required",
@@ -962,36 +1001,84 @@ async fn admin_enrollment_execute(
             "the credential was provisioned but the enrollment receipt is missing; inspect the remote before retrying",
         ));
     };
+    let credential_id = credential.credential_id.clone();
     let mut bound_draft = draft;
-    bound_draft.collector_credential_id = Some(credential.credential_id.clone());
+    bound_draft.collector_credential_id = Some(credential_id.clone());
     bound_draft.collector_credential_state = Some("pending".to_string());
-    enrollment_store(&state)
-        .save(&bound_draft)
-        .map_err(|error| HubError::internal(error.to_string()))?;
-    let listener = plan.listener().clone();
-    let mut workflow = enrollment_workflow(&state, &bound_draft)?;
-    let secrets = request.secrets.materialize();
-    workflow
-        .execute_with_collector(
+    if let Err(error) = enrollment_store(&state).save(&bound_draft) {
+        drop(credential);
+        state.repo.revoke_pending_enrollment_credential(
             &enrollment_id,
-            &plan,
-            &artifact,
-            seed.as_deref(),
-            &listener,
-            &secrets,
-            Some(credential.token.as_bytes()),
-            Some(&machine_id),
-            Some(&hub_url),
-        )
-        .map_err(enrollment_step_error)?;
+            &machine_id,
+            &credential_id,
+        )?;
+        return Err(HubError::internal(error.to_string()));
+    }
+    let listener = plan.listener().clone();
+    let mut workflow = match enrollment_workflow(&state, &bound_draft) {
+        Ok(workflow) => workflow,
+        Err(error) => {
+            drop(credential);
+            let revoke_result = state.repo.revoke_pending_enrollment_credential(
+                &enrollment_id,
+                &machine_id,
+                &credential_id,
+            );
+            let mut failed = enrollment_store(&state)
+                .load(&enrollment_id)
+                .map_err(|load_error| HubError::internal(load_error.to_string()))?;
+            failed.collector_credential_state = Some(if revoke_result.is_ok() {
+                "revoked".to_string()
+            } else {
+                "revocation-failed".to_string()
+            });
+            enrollment_store(&state)
+                .save(&failed)
+                .map_err(|save_error| HubError::internal(save_error.to_string()))?;
+            revoke_result?;
+            return Err(error);
+        }
+    };
+    let secrets = request.secrets.materialize();
+    let execute_result = workflow.execute_with_collector(
+        &enrollment_id,
+        &plan,
+        &artifact,
+        seed.as_deref(),
+        &listener,
+        &secrets,
+        Some(credential.token.as_bytes()),
+        Some(&machine_id),
+        Some(&hub_url),
+    );
+    drop(credential);
+    if let Err(error) = execute_result {
+        let step_error = enrollment_step_error(error);
+        let revoke_result = state.repo.revoke_pending_enrollment_credential(
+            &enrollment_id,
+            &machine_id,
+            &credential_id,
+        );
+        let mut failed = enrollment_store(&state)
+            .load(&enrollment_id)
+            .map_err(|error| HubError::internal(error.to_string()))?;
+        failed.collector_credential_state = Some(if revoke_result.is_ok() {
+            "revoked".to_string()
+        } else {
+            "revocation-failed".to_string()
+        });
+        enrollment_store(&state)
+            .save(&failed)
+            .map_err(|error| HubError::internal(error.to_string()))?;
+        revoke_result?;
+        return Err(step_error);
+    }
     let mut completed = enrollment_store(&state)
         .load(&enrollment_id)
         .map_err(|error| HubError::internal(error.to_string()))?;
-    state.repo.complete_enrollment_credential(
-        &enrollment_id,
-        &machine_id,
-        &credential.credential_id,
-    )?;
+    state
+        .repo
+        .complete_enrollment_credential(&enrollment_id, &machine_id, &credential_id)?;
     completed.collector_credential_state = Some("provisioned".to_string());
     enrollment_store(&state)
         .save(&completed)

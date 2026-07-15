@@ -365,6 +365,11 @@ impl HubRouterConfig {
         self
     }
 
+    pub fn with_canonical_hub_url(mut self, canonical_hub_url: impl Into<String>) -> Self {
+        self.canonical_hub_url = Some(canonical_hub_url.into());
+        self
+    }
+
     pub fn with_fleet_update_runtime(
         mut self,
         artifact_dir: impl Into<PathBuf>,

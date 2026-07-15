@@ -64,6 +64,11 @@ impl HubRepository {
             )
             .map_err(HubError::internal)?;
             tx.execute(
+                "UPDATE enrollment_credentials SET status = 'pending', provisioned_at = NULL WHERE enrollment_id = ?1 AND credential_id = ?2",
+                params![enrollment_id, credential_id],
+            )
+            .map_err(HubError::internal)?;
+            tx.execute(
                 "UPDATE machines SET display_name = ?2, state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL AND revoked_at IS NULL",
                 params![machine_id, display_name],
             )
@@ -124,6 +129,61 @@ impl HubRepository {
             credential_id: credential_id.clone(),
             token: zeroize::Zeroizing::new(format!("ddcol_{credential_id}.{secret}")),
         }))
+    }
+
+    pub(crate) fn revoke_pending_enrollment_credential(
+        &self,
+        enrollment_id: &str,
+        machine_id: &str,
+        credential_id: &str,
+    ) -> Result<(), HubError> {
+        let enrollment_id = validate_identifier(enrollment_id, "enrollment_id")?;
+        let machine_id = validate_identifier(machine_id, "machine_id")?;
+        let credential_id = validate_identifier(credential_id, "credential_id")?;
+        let now = now_utc();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT machine_id, status FROM enrollment_credentials WHERE enrollment_id = ?1 AND credential_id = ?2",
+                params![enrollment_id, credential_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((bound_machine_id, status)) = row else {
+            return Err(HubError::not_found(
+                "enrollment-credential-not-found",
+                "enrollment credential binding was not found",
+            ));
+        };
+        if bound_machine_id != machine_id {
+            return Err(HubError::unauthorized(
+                "enrollment-credential-mismatch",
+                "enrollment credential is bound to another Machine",
+            ));
+        }
+        if status != "provisioned" {
+            tx.execute(
+                "UPDATE collector_credentials SET revoked_at = COALESCE(revoked_at, ?2) WHERE credential_id = ?1 AND machine_id = ?3",
+                params![credential_id, now, machine_id],
+            )
+            .map_err(HubError::internal)?;
+            tx.execute(
+                "UPDATE enrollment_credentials SET status = 'revoked' WHERE enrollment_id = ?1 AND credential_id = ?2 AND status <> 'provisioned'",
+                params![enrollment_id, credential_id],
+            )
+            .map_err(HubError::internal)?;
+            tx.execute(
+                "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL AND revoked_at IS NULL",
+                params![machine_id],
+            )
+            .map_err(HubError::internal)?;
+        }
+        tx.commit().map_err(HubError::internal)
     }
 
     pub(crate) fn complete_enrollment_credential(
