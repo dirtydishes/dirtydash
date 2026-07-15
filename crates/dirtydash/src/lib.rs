@@ -2,6 +2,7 @@ pub mod app_paths;
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod hub;
 pub mod importers;
 pub mod loop_upgrade;
 pub mod pricing;

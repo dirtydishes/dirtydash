@@ -1225,12 +1225,8 @@ const REASONING_KEYS: &[&str] = &[
 ];
 const MODEL_KEYS: &[&str] = &["model", "model_id", "modelID", "modelId", "active_model"];
 const PROVIDER_KEYS: &[&str] = &["provider", "provider_id", "providerID", "providerId"];
-const REASONING_EFFORT_KEYS: &[&str] = &[
-    "reasoning_effort",
-    "reasoningEffort",
-    "reasoning",
-    "effort",
-];
+const REASONING_EFFORT_KEYS: &[&str] =
+    &["reasoning_effort", "reasoningEffort", "reasoning", "effort"];
 const SESSION_KEYS: &[&str] = &[
     "session_id",
     "sessionId",
@@ -1626,7 +1622,9 @@ mod tests {
 
         let conn = db.connection().unwrap();
         let modes = conn
-            .prepare("SELECT model, pricing_mode, reasoning_effort FROM usage_events ORDER BY model")
+            .prepare(
+                "SELECT model, pricing_mode, reasoning_effort FROM usage_events ORDER BY model",
+            )
             .unwrap()
             .query_map([], |row| {
                 Ok((

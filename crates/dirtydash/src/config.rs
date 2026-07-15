@@ -12,6 +12,49 @@ pub struct Config {
     pub source_roots: Vec<SourceRoot>,
     #[serde(default)]
     pub remotes: Vec<RemoteConfig>,
+    /// Optional Hub runtime settings. Local loopback mode remains the default.
+    #[serde(default)]
+    pub hub: HubConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HubConfig {
+    #[serde(default)]
+    pub tailscale_owner_mappings: Vec<TailscaleOwnerMappingConfig>,
+    #[serde(default)]
+    pub trusted_proxy: Option<TrustedProxyConfig>,
+    #[serde(default)]
+    pub cookie_transport: CookieTransportConfig,
+    /// One-time setup secret for bootstrap when the local setup route is not available.
+    #[serde(default)]
+    pub bootstrap_setup_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailscaleOwnerMappingConfig {
+    #[serde(alias = "owner")]
+    pub owner_username: String,
+    #[serde(alias = "tailscale_user", alias = "tailscale_login")]
+    pub tailscale_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedProxyConfig {
+    pub identity_header: String,
+    pub provenance_header: String,
+    pub provenance_value: String,
+    /// Direct peer IPs or CIDRs allowed to supply the trusted proxy headers.
+    /// An empty policy fails closed.
+    #[serde(default)]
+    pub source_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CookieTransportConfig {
+    #[default]
+    Secure,
+    LoopbackHttp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
