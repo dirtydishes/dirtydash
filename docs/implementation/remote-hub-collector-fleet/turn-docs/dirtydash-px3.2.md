@@ -55,6 +55,7 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 - The narrow repository seam for new Hub behavior is `HubRepository` in `crates/dirtydash/src/hub/repository.rs` plus the auth/session implementation in `crates/dirtydash/src/hub/auth.rs`. It owns owner auth/session lifecycle, collector credential lifecycle, authenticated `/api/v1` ingestion, transaction boundaries, and owner time-zone aggregation while reusing the existing SQLite file and legacy read-path compatibility.
 - Thermo-nuclear review findings were accepted as bounded Phase 2 repairs: `first_owner` Tailscale login was an authorization bypass; direct/proxy header provenance and fresh public bootstrap were under-specified; cookie flags were implicit; the original failure/concurrency tests did not exercise the dangerous seams; display-safe fields admitted arbitrary content; additive migrations were not serialized; and API errors exposed raw internal text.
 - The repair design persists exact owner-to-Tailscale identities in `owner_tailscale_identities`, supports explicit configured mappings through `HubRouterConfig`/`Config::hub`, separates `PrivateTailscale`, `TrustedProxy`, `Public`, and explicit `LoopbackHttp` boundaries, and makes public bootstrap disabled unless a loopback or setup-token boundary is explicitly selected.
+- Review round 2 independently confirmed that a trusted proxy's expected provenance header was forgeable by a direct client. The repair therefore requires configured source IP/CIDR policy plus transport-provided `ConnectInfo<SocketAddr>` before reading either proxy identity or provenance headers.
 - Legacy read APIs remain intact for this release. The existing loopback server and CLI serve path still target the unauthenticated local dashboard contract while the new Hub foundation stays adjacent to it.
 
 ## Implementation And Delegation Evidence
@@ -62,6 +63,8 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 - Split the former roughly 2,439-line Hub file into cohesive modules: `hub/protocol.rs` (DTO validation and timestamp normalization), `hub/auth.rs` (owner/session/credential auth), `hub/repository.rs` plus `hub/ingestion.rs` (repository and transactional writes), `hub/router.rs` (narrow HTTP/config boundary), `hub/errors.rs`, and `hub/tests.rs`.
 - Replaced implicit Tailscale owner selection with persisted/configured exact identity mappings, explicit trusted-proxy provenance markers, mismatch rejection, forged-direct negatives, loopback/setup-token-only fresh bootstrap, and fail-closed generic API errors.
 - Added explicit cookie transport configuration. Secure cookies are the default and are forced for Tailscale, HTTPS/public, and trusted-proxy modes; only `ListenerTrustMode::LoopbackHttp` can select insecure loopback cookies. Login/bootstrap and logout behavior are covered.
+- Added trusted-proxy `source_cidrs` configuration with exact-IP and CIDR matching. Tailscale login and current-session handlers receive `ConnectInfo<SocketAddr>` and reject missing or unapproved peers before evaluating identity/provenance headers.
+- Added the exported `build_router_with_config_and_connect_info` production seam and made the existing dashboard serving path use `into_make_service_with_connect_info::<SocketAddr>()`.
 - Added a final-insert SQLite failure injection test that checks rollback of sync runs, manifests, checkpoints, usage events, and ingest batches; raced the same batch through independently constructed repositories; persisted non-UTC RFC3339 normalization; and added DST transition/local-midnight aggregation cases.
 - Tightened display-safe identifiers/checkpoints to bounded ASCII, no whitespace/control text, and no absolute paths. Additive SQLite migrations now run under `BEGIN IMMEDIATE` and commit as one unit.
 - Extended the shared SQLite schema in `db.rs` with additive guarded migrations for fleet foundation tables, compatibility columns, and owner identity mappings.
@@ -73,15 +76,24 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 - Added persisted/configured Hub auth and transport settings:
   - `crates/dirtydash/src/config.rs`
   - `crates/dirtydash/src/db.rs`
+- Hardened trusted-proxy routing and transport serving in:
+  - `crates/dirtydash/src/hub/mod.rs`
+  - `crates/dirtydash/src/hub/router.rs`
+  - `crates/dirtydash/src/hub/tests.rs`
+  - `crates/dirtydash/src/server.rs`
 - Preserved the crate module surface in `crates/dirtydash/src/lib.rs`; no dependency change was needed for the repair.
 - Kept rustfmt clean-up required by `cargo fmt --check` in `crates/dirtydash/src/importers.rs`.
 - Updated this phase execution record with repair evidence.
 
 ## Review
 
-Thermo-nuclear review findings were repaired in this bounded pass. The coordinator still owns final independent review, CI interpretation, Beads updates, and merge. No Beads state was mutated by this repair owner.
+Thermo-nuclear review findings were repaired in the preceding bounded pass. The coordinator still owns final independent review, CI interpretation, Beads updates, and merge. No Beads state was mutated by this repair owner.
 
-Repair evidence includes approved persisted/configured Tailscale mappings, mismatch and forged-direct negatives, trusted-proxy provenance negatives, secure/insecure cookie transport tests, explicit setup-only bootstrap tests, final-insert rollback coverage, independent-repository same-batch races, prompt-like display/checkpoint rejection, migration serialization, generic internal API errors, non-UTC persistence, and DST/local-midnight rebucketing.
+### Review Round 2: Trusted-Proxy Transport Provenance
+
+The independent review blocker was valid: comparing a client-supplied provenance header to a configured value did not establish that the request came through the proxy. `TrustedProxyConfig` now requires an explicit `source_cidrs` policy; the router derives the peer only from Axum transport `ConnectInfo<SocketAddr>`, fails closed when it is absent or outside that policy, and only then evaluates provenance and exact identity headers. The login and existing-session paths both enforce this boundary.
+
+Positive trusted-CIDR login and existing-session tests preserve exact owner identity mapping. Negative tests cover an untrusted direct peer supplying both the expected identity and provenance values, plus absent connect info. Public and loopback trust modes remain header-agnostic.
 
 ## CI And Gates
 
@@ -91,10 +103,11 @@ State: local gates passing; coordinator terminal review/CI remains pending
 
 Evidence:
 
-- `cargo test -p dirtydash --lib hub::tests`
-- `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
+- `cargo test -p dirtydash --lib hub::tests` — passed (25 tests)
+- `cargo fmt --check` — passed
+- `cargo clippy --all-targets -- -D warnings` — passed
+- `cargo test` — passed (46 unit/doc tests plus 5 CLI integration tests)
+- `git diff --check` — passed
 
 ## PR And Commits
 
@@ -102,6 +115,7 @@ Evidence:
   - `b071bac` — `Add hub protocol and auth foundation`
   - `3655174` — `Record phase 2 implementation evidence`
   - `a558338` — `Repair phase 2 hub security and transaction seams`
+  - `83fbc86` — `Harden trusted proxy peer provenance`
 - PR: #9 — `Phase 2: add hub protocol and auth foundation`
 - Branch: `lavender/remote-hub-collector-fleet-2-foundation`
 - Target: `lavender/remote-hub-collector-fleet-implementation`
@@ -120,4 +134,4 @@ Phase 1 must establish the canonical domain and ADRs first.
 
 ## Closeout
 
-Repair implementation and local gates are complete. Commit `a558338` contains the repairs; the branch remains open for coordinator-owned final review/CI/Beads/merge.
+Review round 2 repair is complete in commit `83fbc86`; the branch remains open for coordinator-owned final review/CI/Beads/merge. No Beads mutation or merge was performed.
