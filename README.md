@@ -14,7 +14,7 @@ Usage costs are estimates. dirtydash keeps provenance and confidence visible bec
 
 - [x] Rust CLI binary named `dirtydash`
 - [x] Local config and SQLite database paths, with `--config` and `--db` overrides for testing or custom installs
-- [x] Source scanning for Claude Code, Codex, OpenCode, and pi-agent
+- [x] Source scanning for Claude Code, Codex, OpenCode, Pi, and Hermes Agent
 - [x] Metadata-only import by default
 - [x] SQLite storage for usage events, source file records, pricing records, remotes, and migrations
 - [x] Idempotent import keyed by raw event hash
@@ -48,7 +48,7 @@ Earlier roadmap work toward agentless SSH-pull usage import is now superseded by
 
 ### V2: Broader Harness Support
 
-- [ ] Importers for Gemini CLI, Pi, Hermes, Goose, Amp, Qwen, Kimi, Copilot CLI, and other coding harnesses
+- [ ] Importers for Gemini CLI, Goose, Amp, Qwen, Kimi, Copilot CLI, and other coding harnesses
 - [ ] Support for GUI coding agents where their local usage traces are available
 - [ ] Live session tailing
 - [ ] Parser diagnostics and richer Import/Files views

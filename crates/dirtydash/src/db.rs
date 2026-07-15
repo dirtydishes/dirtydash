@@ -120,6 +120,50 @@ pub struct RemoteRow {
     pub last_file_count: u64,
 }
 
+/// Durable identity material owned by the local Collector. The project salt is
+/// never sent to the Hub; it only makes the local-to-Hub redacted identifiers
+/// stable across reconciliation and process restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorIdentityRecord {
+    pub machine_id: String,
+    pub project_salt: String,
+    pub credential_token: Option<String>,
+    pub pending_credential_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorManifestRecord {
+    pub source_key: String,
+    pub agent: String,
+    pub local_path: String,
+    pub file_fingerprint: String,
+    pub parser_version: String,
+    pub item_count: u64,
+    pub cursor: Option<String>,
+    pub parse_error: Option<String>,
+    pub last_reconciled_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorOutboxRecord {
+    pub batch_id: String,
+    pub machine_id: String,
+    pub payload_json: String,
+    pub attempts: u32,
+    pub next_attempt_at: String,
+    pub created_at: String,
+    pub last_attempt_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandResultRecord {
+    pub command_id: String,
+    pub status: String,
+    pub result_json: String,
+    pub handled_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageEventWrite {
     Inserted,
@@ -143,6 +187,7 @@ struct UsageEventPricingState {
     confidence: f64,
     pricing_version: String,
     pricing_mode: String,
+    parser_version: String,
 }
 
 impl Database {
@@ -159,6 +204,423 @@ impl Database {
         &self.path
     }
 
+    pub fn collector_identity(&self) -> Result<Option<CollectorIdentityRecord>> {
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT machine_id, project_salt, credential_token, pending_credential_token FROM collector_identity WHERE identity_id = 1",
+            [],
+            |row| {
+                Ok(CollectorIdentityRecord {
+                    machine_id: row.get(0)?,
+                    project_salt: row.get(1)?,
+                    credential_token: row.get(2)?,
+                    pending_credential_token: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn save_collector_identity(&self, identity: &CollectorIdentityRecord) -> Result<()> {
+        let conn = self.connection()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            INSERT INTO collector_identity(
+                identity_id, machine_id, project_salt, credential_token,
+                pending_credential_token, created_at, updated_at
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(identity_id) DO UPDATE SET
+                machine_id = excluded.machine_id,
+                project_salt = excluded.project_salt,
+                credential_token = excluded.credential_token,
+                pending_credential_token = excluded.pending_credential_token,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                identity.machine_id,
+                identity.project_salt,
+                identity.credential_token,
+                identity.pending_credential_token,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_collector_credential(&self, token: Option<&str>) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            "UPDATE collector_identity SET credential_token = ?1, pending_credential_token = NULL, updated_at = ?2 WHERE identity_id = 1",
+            params![token, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Stage a new credential without destroying the currently usable one.
+    pub fn stage_collector_credential(&self, token: &str) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            "UPDATE collector_identity SET pending_credential_token = ?1, updated_at = ?2 WHERE identity_id = 1",
+            params![token, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a staged credential only after a batch has been acknowledged with
+    /// it. The transition is one SQLite write transaction.
+    pub fn commit_staged_collector_credential(&self) -> Result<bool> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let pending = tx
+            .query_row(
+                "SELECT pending_credential_token FROM collector_identity WHERE identity_id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(pending) = pending.flatten() else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE collector_identity SET credential_token = ?1, pending_credential_token = NULL, updated_at = ?2 WHERE identity_id = 1",
+            params![pending, Utc::now().to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn clear_staged_collector_credential(&self) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            "UPDATE collector_identity SET pending_credential_token = NULL, updated_at = ?1 WHERE identity_id = 1",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn collector_manifest(&self, source_key: &str) -> Result<Option<CollectorManifestRecord>> {
+        let conn = self.connection()?;
+        conn.query_row(
+            r#"
+            SELECT source_key, agent, local_path, file_fingerprint, parser_version,
+                item_count, cursor, parse_error, last_reconciled_at
+            FROM collector_source_manifests
+            WHERE source_key = ?1
+            "#,
+            params![source_key],
+            collector_manifest_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_collector_manifest(&self, record: &CollectorManifestRecord) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO collector_source_manifests(
+                source_key, agent, local_path, file_fingerprint, parser_version,
+                item_count, cursor, parse_error, last_reconciled_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(source_key) DO UPDATE SET
+                agent = excluded.agent,
+                local_path = excluded.local_path,
+                file_fingerprint = excluded.file_fingerprint,
+                parser_version = excluded.parser_version,
+                item_count = excluded.item_count,
+                cursor = excluded.cursor,
+                parse_error = excluded.parse_error,
+                last_reconciled_at = excluded.last_reconciled_at
+            "#,
+            params![
+                record.source_key,
+                record.agent,
+                record.local_path,
+                record.file_fingerprint,
+                record.parser_version,
+                record.item_count,
+                record.cursor,
+                record.parse_error,
+                record.last_reconciled_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn enqueue_collector_batch(
+        &self,
+        batch_id: &str,
+        machine_id: &str,
+        payload_json: &str,
+        now: &str,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO collector_outbox(
+                batch_id, machine_id, payload_json, attempts, next_attempt_at, created_at
+            ) VALUES (?1, ?2, ?3, 0, ?4, ?4)
+            ON CONFLICT(batch_id) DO NOTHING
+            "#,
+            params![batch_id, machine_id, payload_json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Advance every local manifest and append the immutable canonical request
+    /// bytes in one transaction. A crash before commit leaves both old
+    /// manifests and no new outbox item; a crash after commit leaves replayable
+    /// bytes and the manifest already advanced.
+    pub fn commit_collector_reconciliation(
+        &self,
+        manifests: &[CollectorManifestRecord],
+        batch_id: &str,
+        machine_id: &str,
+        payload_json: &str,
+        now: &str,
+    ) -> Result<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for record in manifests {
+            tx.execute(
+                r#"
+                INSERT INTO collector_source_manifests(
+                    source_key, agent, local_path, file_fingerprint, parser_version,
+                    item_count, cursor, parse_error, last_reconciled_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    agent = excluded.agent,
+                    local_path = excluded.local_path,
+                    file_fingerprint = excluded.file_fingerprint,
+                    parser_version = excluded.parser_version,
+                    item_count = excluded.item_count,
+                    cursor = excluded.cursor,
+                    parse_error = excluded.parse_error,
+                    last_reconciled_at = excluded.last_reconciled_at
+                "#,
+                params![
+                    record.source_key,
+                    record.agent,
+                    record.local_path,
+                    record.file_fingerprint,
+                    record.parser_version,
+                    record.item_count,
+                    record.cursor,
+                    record.parse_error,
+                    record.last_reconciled_at,
+                ],
+            )?;
+        }
+        let existing_payload = tx
+            .query_row(
+                "SELECT payload_json FROM collector_outbox WHERE batch_id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_payload) = existing_payload {
+            if existing_payload != payload_json {
+                anyhow::bail!("Collector batch_id is already bound to different canonical bytes");
+            }
+        } else {
+            tx.execute(
+                r#"
+                INSERT INTO collector_outbox(
+                    batch_id, machine_id, payload_json, attempts, next_attempt_at, created_at
+                ) VALUES (?1, ?2, ?3, 0, ?4, ?4)
+                "#,
+                params![batch_id, machine_id, payload_json, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn collector_outbox_ready(
+        &self,
+        now: &str,
+        limit: usize,
+    ) -> Result<Vec<CollectorOutboxRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT batch_id, machine_id, payload_json, attempts, next_attempt_at,
+                created_at, last_attempt_at, last_error
+            FROM collector_outbox
+            WHERE next_attempt_at <= ?1
+            ORDER BY created_at, batch_id
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![now, limit as i64], collector_outbox_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn collector_outbox_count(&self) -> Result<u64> {
+        let conn = self.connection()?;
+        count_row(&conn, "SELECT COUNT(*) FROM collector_outbox")
+    }
+
+    pub fn acknowledge_collector_batch(&self, batch_id: &str) -> Result<bool> {
+        self.acknowledge_collector_batch_if_matching(batch_id, batch_id)
+    }
+
+    pub fn acknowledge_collector_batch_if_matching(
+        &self,
+        expected_batch_id: &str,
+        acknowledged_batch_id: &str,
+    ) -> Result<bool> {
+        if expected_batch_id != acknowledged_batch_id {
+            return Ok(false);
+        }
+        let conn = self.connection()?;
+        Ok(conn.execute(
+            "DELETE FROM collector_outbox WHERE batch_id = ?1",
+            params![expected_batch_id],
+        )? > 0)
+    }
+
+    pub fn fail_collector_batch(
+        &self,
+        batch_id: &str,
+        attempts: u32,
+        next_attempt_at: &str,
+        attempted_at: &str,
+        error: &str,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            UPDATE collector_outbox
+            SET attempts = ?2,
+                next_attempt_at = ?3,
+                last_attempt_at = ?4,
+                last_error = ?5
+            WHERE batch_id = ?1
+            "#,
+            params![batch_id, attempts, next_attempt_at, attempted_at, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn collector_command_result(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<CollectorCommandResultRecord>> {
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT command_id, status, result_json, handled_at FROM collector_command_results WHERE command_id = ?1",
+            params![command_id],
+            |row| {
+                Ok(CollectorCommandResultRecord {
+                    command_id: row.get(0)?,
+                    status: row.get(1)?,
+                    result_json: row.get(2)?,
+                    handled_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Record receipt before executing a command. INSERT OR IGNORE makes the
+    /// side effect owner idempotent across a process crash/restart window.
+    pub fn begin_collector_command(&self, command_id: &str, handled_at: &str) -> Result<bool> {
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            r#"
+            INSERT INTO collector_command_results(command_id, status, result_json, handled_at)
+            VALUES (?1, 'started', '{}', ?2)
+            ON CONFLICT(command_id) DO NOTHING
+            "#,
+            params![command_id, handled_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn save_collector_command_result(
+        &self,
+        command_id: &str,
+        result_json: &str,
+        handled_at: &str,
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO collector_command_results(command_id, status, result_json, handled_at)
+            VALUES (?1, 'completed', ?2, ?3)
+            ON CONFLICT(command_id) DO UPDATE SET
+                status = 'completed',
+                result_json = excluded.result_json,
+                handled_at = excluded.handled_at
+            "#,
+            params![command_id, result_json, handled_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn acquire_collector_instance_lock(
+        &self,
+        owner_id: &str,
+        now: &str,
+        lease_until: &str,
+    ) -> Result<bool> {
+        let conn = self.connection()?;
+        let changed = conn.execute(
+            r#"
+            INSERT INTO collector_instance_lock(lock_id, owner_id, lease_until, acquired_at)
+            VALUES (1, ?1, ?3, ?2)
+            ON CONFLICT(lock_id) DO UPDATE SET
+                owner_id = excluded.owner_id,
+                lease_until = excluded.lease_until,
+                acquired_at = excluded.acquired_at
+            WHERE collector_instance_lock.lease_until <= ?2
+            "#,
+            params![owner_id, now, lease_until],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn release_collector_instance_lock(&self, owner_id: &str) -> Result<bool> {
+        let conn = self.connection()?;
+        Ok(conn.execute(
+            "DELETE FROM collector_instance_lock WHERE lock_id = 1 AND owner_id = ?1",
+            params![owner_id],
+        )? > 0)
+    }
+
+    pub fn collector_state(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.connection()?;
+        conn.query_row(
+            "SELECT state_value FROM collector_state WHERE state_key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn set_collector_state(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO collector_state(state_key, state_value, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value = excluded.state_value,
+                updated_at = excluded.updated_at
+            "#,
+            params![key, value, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn connection(&self) -> Result<Connection> {
         let conn = Connection::open(&self.path)
             .with_context(|| format!("opening SQLite database {}", self.path.display()))?;
@@ -166,6 +628,24 @@ impl Database {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
+    }
+
+    /// Migrate only the local Collector state database. This keeps the
+    /// outbound manifest/outbox file separate from dashboard usage history.
+    pub fn migrate_collector(&self) -> Result<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            "#,
+        )?;
+        self.migrate_collector_schema(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn migrate(&self) -> Result<()> {
@@ -268,6 +748,7 @@ impl Database {
             "#,
         )?;
         self.migrate_hub_schema(&tx)?;
+        self.migrate_collector_schema(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -322,6 +803,98 @@ impl Database {
             "UPDATE usage_events SET collector_event_fingerprint = raw_event_hash WHERE collector_event_fingerprint IS NULL",
             [],
         )?;
+        Ok(())
+    }
+
+    fn migrate_collector_schema(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS collector_identity (
+                identity_id INTEGER PRIMARY KEY CHECK(identity_id = 1),
+                machine_id TEXT NOT NULL,
+                project_salt TEXT NOT NULL,
+                credential_token TEXT,
+                pending_credential_token TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_source_manifests (
+                source_key TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                file_fingerprint TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                item_count INTEGER NOT NULL DEFAULT 0,
+                cursor TEXT,
+                parse_error TEXT,
+                last_reconciled_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_outbox (
+                batch_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_attempt_at TEXT,
+                last_error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_collector_outbox_ready
+                ON collector_outbox(next_attempt_at, created_at);
+
+            CREATE TABLE IF NOT EXISTS collector_command_results (
+                command_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'completed',
+                result_json TEXT NOT NULL,
+                handled_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_instance_lock (
+                lock_id INTEGER PRIMARY KEY CHECK(lock_id = 1),
+                owner_id TEXT NOT NULL,
+                lease_until TEXT NOT NULL,
+                acquired_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_commands (
+                command_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                command_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                claimed_at TEXT,
+                acknowledged_at TEXT,
+                result_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_collector_commands_pending
+                ON collector_commands(machine_id, acknowledged_at, created_at);
+            "#,
+        )
+        .context("applying Collector migrations")?;
+        let columns = table_columns(conn, "collector_identity")?;
+        if !columns
+            .iter()
+            .any(|column| column == "pending_credential_token")
+        {
+            conn.execute(
+                "ALTER TABLE collector_identity ADD COLUMN pending_credential_token TEXT",
+                [],
+            )?;
+        }
+        let command_columns = table_columns(conn, "collector_command_results")?;
+        if !command_columns.iter().any(|column| column == "status") {
+            conn.execute(
+                "ALTER TABLE collector_command_results ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -469,7 +1042,7 @@ impl Database {
                 r#"
                 SELECT provider, model, turn_id, reasoning_effort, prompt_tokens, completion_tokens, cache_read_tokens,
                     cache_write_tokens, reasoning_tokens, total_tokens, estimated_cost_usd,
-                    confidence, pricing_version, pricing_mode
+                    confidence, pricing_version, pricing_mode, parser_version
                 FROM usage_events
                 WHERE raw_event_hash = ?1
                 "#,
@@ -490,6 +1063,7 @@ impl Database {
                         confidence: row.get(11)?,
                         pricing_version: row.get(12)?,
                         pricing_mode: row.get(13)?,
+                        parser_version: row.get(14)?,
                     })
                 },
             )
@@ -1248,6 +1822,7 @@ impl UsageEventPricingState {
             && (self.confidence - event.confidence).abs() < 0.0000001
             && self.pricing_version == event.pricing_version
             && PricingMode::from_db(&self.pricing_mode) == event.pricing_mode
+            && self.parser_version == event.parser_version
     }
 }
 
@@ -1315,6 +1890,35 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
 
 fn count_row(conn: &Connection, sql: &str) -> Result<u64> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))? as u64)
+}
+
+fn collector_manifest_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CollectorManifestRecord> {
+    Ok(CollectorManifestRecord {
+        source_key: row.get(0)?,
+        agent: row.get(1)?,
+        local_path: row.get(2)?,
+        file_fingerprint: row.get(3)?,
+        parser_version: row.get(4)?,
+        item_count: row.get::<_, i64>(5)? as u64,
+        cursor: row.get(6)?,
+        parse_error: row.get(7)?,
+        last_reconciled_at: row.get(8)?,
+    })
+}
+
+fn collector_outbox_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectorOutboxRecord> {
+    Ok(CollectorOutboxRecord {
+        batch_id: row.get(0)?,
+        machine_id: row.get(1)?,
+        payload_json: row.get(2)?,
+        attempts: row.get::<_, i64>(3)? as u32,
+        next_attempt_at: row.get(4)?,
+        created_at: row.get(5)?,
+        last_attempt_at: row.get(6)?,
+        last_error: row.get(7)?,
+    })
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {

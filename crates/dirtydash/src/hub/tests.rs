@@ -1562,6 +1562,83 @@ fn fleet_identity_distinguishes_machine_and_agent_dimensions() {
 }
 
 #[tokio::test]
+async fn collector_command_endpoints_poll_and_ack_typed_owner_commands() {
+    let repo = test_repo();
+    let app = test_app(repo, ListenerTrustMode::Public);
+    let (cookie, csrf) = bootstrap_session(&app).await;
+    let credential = rotate_credential(&app, &cookie, &csrf).await;
+
+    let issue = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/collector-commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header(OWNER_CSRF_HEADER, &csrf)
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-a",
+                        "command": {
+                            "type": "refresh",
+                            "command_id": "command-refresh-1"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issue.status(), StatusCode::OK);
+
+    let poll = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/collector/commands?wait_seconds=0")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poll.status(), StatusCode::OK);
+    let body = json_response(poll).await;
+    assert_eq!(body["command"]["type"], "refresh");
+    assert_eq!(body["command"]["command_id"], "command-refresh-1");
+
+    let ack = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/collector/commands/ack")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", credential.token),
+                )
+                .body(Body::from(
+                    json!({
+                        "command_id": "command-refresh-1",
+                        "result": {"status": "queued"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn loopback_server_contract_stays_unchanged() {
     let repo = test_repo();
     let app = test_app(repo, ListenerTrustMode::Public);

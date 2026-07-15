@@ -16,7 +16,14 @@ use crate::config::Config;
 use crate::db::{local_machine, Database, SourceFileRecord};
 use crate::pricing::{self, PricingMode};
 
+/// Compatibility label retained for the local import report. Collector
+/// payloads use the per-parser versions returned by [`SourceKind::parser_version`].
 pub const PARSER_VERSION: &str = "dirtydash-v1.0.0";
+pub const CLAUDE_CODE_PARSER_VERSION: &str = "claude-code-v1";
+pub const CODEX_PARSER_VERSION: &str = "codex-v1";
+pub const OPENCODE_PARSER_VERSION: &str = "opencode-v1";
+pub const PI_AGENT_PARSER_VERSION: &str = "pi-agent-v1";
+pub const HERMES_AGENT_PARSER_VERSION: &str = "hermes-agent-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -25,6 +32,7 @@ pub enum SourceKind {
     Codex,
     OpenCode,
     PiAgent,
+    HermesAgent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +56,57 @@ pub struct ImportReport {
     pub updated_existing_events: u64,
     pub skipped_existing_events: u64,
     pub parse_errors: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParserDescriptor {
+    pub source: SourceKind,
+    pub parser_name: String,
+    pub parser_version: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectorParsedFile {
+    pub source: DetectedSource,
+    pub file: PathBuf,
+    pub file_fingerprint: String,
+    pub events: Vec<UsageEvent>,
+    pub parse_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollectorParserRegistry;
+
+impl CollectorParserRegistry {
+    pub fn descriptors(self) -> Vec<ParserDescriptor> {
+        SourceKind::all()
+            .into_iter()
+            .map(|source| ParserDescriptor {
+                source,
+                parser_name: source.parser_name().to_string(),
+                parser_version: source.parser_version().to_string(),
+            })
+            .collect()
+    }
+
+    /// Parse one local source artifact without writing usage rows or retaining
+    /// its body. Pricing lookup is read-only; the caller owns persistence.
+    pub fn parse_file(
+        self,
+        db: &Database,
+        source: &DetectedSource,
+        file: &Path,
+        machine: &str,
+        imported_at: &str,
+    ) -> Result<CollectorParsedFile> {
+        parse_source_file_for_collector(db, source, file, machine, imported_at)
+    }
+}
+
+pub type ParserRegistry = CollectorParserRegistry;
+
+pub fn parser_registry() -> CollectorParserRegistry {
+    CollectorParserRegistry
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,12 +312,23 @@ fn span_value(body: &str, key: &str) -> Option<String> {
 }
 
 impl SourceKind {
+    pub const fn all() -> [Self; 5] {
+        [
+            SourceKind::ClaudeCode,
+            SourceKind::Codex,
+            SourceKind::OpenCode,
+            SourceKind::PiAgent,
+            SourceKind::HermesAgent,
+        ]
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             SourceKind::ClaudeCode => "claude-code",
             SourceKind::Codex => "codex",
             SourceKind::OpenCode => "opencode",
             SourceKind::PiAgent => "pi-agent",
+            SourceKind::HermesAgent => "hermes-agent",
         }
     }
 
@@ -268,6 +338,17 @@ impl SourceKind {
             SourceKind::Codex => "codex-token-count-jsonl",
             SourceKind::OpenCode => "opencode-storage-json",
             SourceKind::PiAgent => "pi-agent-jsonl",
+            SourceKind::HermesAgent => "hermes-agent-metering",
+        }
+    }
+
+    pub fn parser_version(self) -> &'static str {
+        match self {
+            SourceKind::ClaudeCode => CLAUDE_CODE_PARSER_VERSION,
+            SourceKind::Codex => CODEX_PARSER_VERSION,
+            SourceKind::OpenCode => OPENCODE_PARSER_VERSION,
+            SourceKind::PiAgent => PI_AGENT_PARSER_VERSION,
+            SourceKind::HermesAgent => HERMES_AGENT_PARSER_VERSION,
         }
     }
 
@@ -275,7 +356,7 @@ impl SourceKind {
         match self {
             SourceKind::ClaudeCode | SourceKind::PiAgent => "anthropic",
             SourceKind::Codex => "openai",
-            SourceKind::OpenCode => "unknown",
+            SourceKind::OpenCode | SourceKind::HermesAgent => "unknown",
         }
     }
 
@@ -284,7 +365,8 @@ impl SourceKind {
             SourceKind::ClaudeCode => vec!["Claude Code".to_string(), "claude-code".to_string()],
             SourceKind::Codex => vec!["Codex CLI".to_string(), "codex".to_string()],
             SourceKind::OpenCode => vec!["OpenCode".to_string(), "opencode".to_string()],
-            SourceKind::PiAgent => vec!["pi-agent".to_string()],
+            SourceKind::PiAgent => vec!["Pi".to_string(), "pi-agent".to_string()],
+            SourceKind::HermesAgent => vec!["Hermes".to_string(), "hermes-agent".to_string()],
         }
     }
 }
@@ -298,6 +380,7 @@ impl std::str::FromStr for SourceKind {
             "codex" | "codex-cli" => Ok(SourceKind::Codex),
             "opencode" | "open-code" => Ok(SourceKind::OpenCode),
             "pi" | "pi-agent" | "pi_agent" => Ok(SourceKind::PiAgent),
+            "hermes" | "hermes-agent" | "hermes_agent" => Ok(SourceKind::HermesAgent),
             other => anyhow::bail!("unknown source kind {other}"),
         }
     }
@@ -337,11 +420,27 @@ impl UsageNumbers {
 
 pub fn scan_sources(config: &Config) -> Result<Vec<DetectedSource>> {
     let mut candidates = default_candidates()?;
+    candidates.extend(configured_candidates(config)?);
+    detect_candidates(candidates)
+}
+
+/// Scan only explicitly configured roots. Collectors use this boundary so a
+/// test or enrolled machine cannot accidentally walk unrelated home-directory
+/// data while preserving the legacy CLI's default discovery behavior.
+pub fn scan_configured_sources(config: &Config) -> Result<Vec<DetectedSource>> {
+    detect_candidates(configured_candidates(config)?)
+}
+
+fn configured_candidates(config: &Config) -> Result<Vec<(SourceKind, PathBuf)>> {
+    let mut candidates = Vec::new();
     for root in &config.source_roots {
         let kind: SourceKind = root.kind.parse()?;
         candidates.extend(normalize_source_paths(kind, root.path.clone()));
     }
+    Ok(candidates)
+}
 
+fn detect_candidates(candidates: Vec<(SourceKind, PathBuf)>) -> Result<Vec<DetectedSource>> {
     let mut seen = HashSet::new();
     let mut detected = Vec::new();
     for (kind, path) in candidates {
@@ -583,6 +682,11 @@ fn default_candidates() -> Result<Vec<(SourceKind, PathBuf)>> {
         ));
     }
 
+    let hermes_roots = env_paths("HERMES_HOME").unwrap_or_else(|| vec![home.join(".hermes")]);
+    for root in hermes_roots {
+        candidates.extend(normalize_source_paths(SourceKind::HermesAgent, root));
+    }
+
     Ok(candidates)
 }
 
@@ -631,10 +735,50 @@ fn normalize_source_path(kind: SourceKind, path: PathBuf) -> PathBuf {
             }
         }
         SourceKind::PiAgent => path,
+        SourceKind::HermesAgent => {
+            if path.ends_with("state.db") || path.ends_with("sessions") {
+                path
+            } else if path.join("state.db").exists() {
+                path.join("state.db")
+            } else if path.join("sessions").exists() {
+                path.join("sessions")
+            } else {
+                path
+            }
+        }
     }
 }
 
 fn normalize_source_paths(kind: SourceKind, path: PathBuf) -> Vec<(SourceKind, PathBuf)> {
+    if kind == SourceKind::HermesAgent {
+        let mut paths = Vec::new();
+        if path.ends_with("state.db") {
+            paths.push(path.clone());
+        } else if path.join("state.db").exists() {
+            paths.push(path.join("state.db"));
+        }
+        for relative in [
+            "sessions",
+            "webui/sessions/_run_journal",
+            "webui/sessions/_turn_journal",
+        ] {
+            let candidate = if path.ends_with("state.db") {
+                path.parent()
+                    .map(|parent| parent.join(relative))
+                    .unwrap_or_else(|| path.join(relative))
+            } else {
+                path.join(relative)
+            };
+            if candidate.exists() {
+                paths.push(candidate);
+            }
+        }
+        if paths.is_empty() {
+            paths.push(path);
+        }
+        return paths.into_iter().map(|path| (kind, path)).collect();
+    }
+
     if kind != SourceKind::Codex {
         return vec![(kind, normalize_source_path(kind, path))];
     }
@@ -684,18 +828,136 @@ fn matching_files(kind: SourceKind, path: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let file = entry.path();
-        let matches = match kind {
-            SourceKind::ClaudeCode | SourceKind::Codex | SourceKind::PiAgent => {
-                file.extension().is_some_and(|ext| ext == "jsonl")
-            }
-            SourceKind::OpenCode => file.extension().is_some_and(|ext| ext == "json"),
-        };
-        if matches {
+        if format_evidence(kind, file)? {
             files.push(file.to_path_buf());
         }
     }
     files.sort();
     Ok(files)
+}
+
+/// Detection is deliberately based on parseable format evidence rather than
+/// a filename extension. A malformed line does not hide a sibling valid line,
+/// while arbitrary `.jsonl`/`.json` files are not claimed as agent sources.
+fn format_evidence(kind: SourceKind, file: &Path) -> Result<bool> {
+    if kind == SourceKind::HermesAgent
+        && file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "state.db")
+    {
+        let mut header = [0_u8; 16];
+        let mut handle = fs::File::open(file)?;
+        use std::io::Read;
+        let read = handle.read(&mut header)?;
+        return Ok(read >= 15 && &header[..15] == b"SQLite format 3");
+    }
+
+    let extension = file.extension().and_then(|extension| extension.to_str());
+    let is_jsonl = extension == Some("jsonl");
+    let is_json = extension == Some("json");
+    if !is_jsonl && !is_json {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(file)?;
+    if is_json {
+        let value = match serde_json::from_str::<Value>(&raw) {
+            Ok(value) => value,
+            Err(_) => return Ok(false),
+        };
+        return Ok(value_is_source_evidence(kind, &value));
+    }
+
+    Ok(raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .is_some_and(|value| value_is_source_evidence(kind, &value))
+        }))
+}
+
+fn value_is_source_evidence(kind: SourceKind, value: &Value) -> bool {
+    if !extract_usage_numbers(value).has_usage() {
+        let payload_type = value
+            .pointer("/payload/type")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("type").and_then(Value::as_str));
+        if kind == SourceKind::Codex
+            && !matches!(payload_type, Some("token_count" | "turn_context"))
+        {
+            return false;
+        }
+        if kind == SourceKind::HermesAgent
+            && !matches!(
+                payload_type,
+                Some("metering" | "usage" | "session" | "turn")
+            )
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn parse_source_file_for_collector(
+    db: &Database,
+    source: &DetectedSource,
+    file: &Path,
+    machine: &str,
+    imported_at: &str,
+) -> Result<CollectorParsedFile> {
+    let codex_priority_evidence = if source.kind == SourceKind::Codex {
+        CodexPriorityEvidence::load(&source.path)
+    } else {
+        CodexPriorityEvidence::default()
+    };
+    let parsed = parse_file(
+        db,
+        source,
+        file,
+        machine,
+        imported_at,
+        ImportOptions {
+            metadata_only: true,
+        },
+        Some(&codex_priority_evidence),
+    )?;
+    Ok(CollectorParsedFile {
+        source: source.clone(),
+        file: file.to_path_buf(),
+        file_fingerprint: source_file_fingerprint(file)?,
+        events: parsed.events,
+        parse_error: parsed.parse_error,
+    })
+}
+
+pub fn parse_sources_for_collector(
+    db: &Database,
+    sources: &[DetectedSource],
+    machine: &str,
+    imported_at: &str,
+) -> Result<Vec<CollectorParsedFile>> {
+    let mut parsed = Vec::new();
+    for source in sources {
+        for file in matching_files(source.kind, &source.path)? {
+            parsed.push(parse_source_file_for_collector(
+                db,
+                source,
+                &file,
+                machine,
+                imported_at,
+            )?);
+        }
+    }
+    Ok(parsed)
+}
+
+pub fn source_file_fingerprint(file: &Path) -> Result<String> {
+    let bytes =
+        fs::read(file).with_context(|| format!("reading source fingerprint {}", file.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn parse_file(
@@ -717,11 +979,98 @@ fn parse_file(
             options,
             codex_priority_evidence,
         ),
-        SourceKind::ClaudeCode | SourceKind::PiAgent => {
-            parse_generic_jsonl(db, source, file, machine, imported_at, options)
+        SourceKind::ClaudeCode | SourceKind::PiAgent | SourceKind::HermesAgent => {
+            if source.kind == SourceKind::HermesAgent
+                && file.extension().and_then(|extension| extension.to_str()) == Some("db")
+            {
+                parse_hermes_state_db(db, source, file, machine, imported_at, options)
+            } else {
+                parse_generic_jsonl(db, source, file, machine, imported_at, options)
+            }
         }
         SourceKind::OpenCode => parse_generic_json(db, source, file, machine, imported_at, options),
     }
+}
+
+fn parse_hermes_state_db(
+    db: &Database,
+    source: &DetectedSource,
+    file: &Path,
+    machine: &str,
+    imported_at: &str,
+    options: ImportOptions,
+) -> Result<ParsedFile> {
+    use rusqlite::OpenFlags;
+
+    let connection = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening Hermes state database {}", file.display()))?;
+    let has_sessions = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? > 0;
+    if !has_sessions {
+        anyhow::bail!("Hermes state database has no sessions table");
+    }
+
+    let mut statement = connection.prepare("SELECT * FROM sessions")?;
+    let columns = statement
+        .column_names()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut events = Vec::new();
+    let mut parse_error = None;
+    let rows = statement.query_map([], |row| {
+        let mut object = serde_json::Map::new();
+        for (index, column) in columns.iter().enumerate() {
+            let value = row.get_ref(index)?;
+            let json = match value {
+                rusqlite::types::ValueRef::Null => Value::Null,
+                rusqlite::types::ValueRef::Integer(value) => Value::from(value),
+                rusqlite::types::ValueRef::Real(value) => Value::from(value),
+                rusqlite::types::ValueRef::Text(value) => {
+                    Value::String(String::from_utf8_lossy(value).into_owned())
+                }
+                rusqlite::types::ValueRef::Blob(_) => Value::Null,
+            };
+            object.insert(column.clone(), json);
+        }
+        Ok(Value::Object(object))
+    })?;
+
+    for (index, row) in rows.enumerate() {
+        match row {
+            Ok(value) => {
+                if let Some(event) = event_from_value(
+                    db,
+                    source,
+                    file,
+                    Some(format!("row {}", index + 1)),
+                    &value,
+                    machine,
+                    imported_at,
+                    options,
+                    None,
+                    None,
+                    None,
+                    None,
+                )? {
+                    events.push(event);
+                }
+            }
+            Err(error) => {
+                if parse_error.is_none() {
+                    parse_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(ParsedFile {
+        events,
+        parse_error,
+    })
 }
 
 fn parse_generic_jsonl(
@@ -1046,7 +1395,7 @@ fn event_from_usage(
         raw_path: file.display().to_string(),
         raw_span,
         parser_name: source.kind.parser_name().to_string(),
-        parser_version: PARSER_VERSION.to_string(),
+        parser_version: source.kind.parser_version().to_string(),
         raw_event_hash: hash,
         imported_at: imported_at.to_string(),
         pricing_version: reported_cost
@@ -1232,6 +1581,7 @@ const SESSION_KEYS: &[&str] = &[
     "sessionId",
     "conversation_id",
     "conversationId",
+    "id",
     "thread_id",
     "threadId",
 ];
@@ -1309,6 +1659,21 @@ fn extract_reported_cost(value: &Value) -> Option<f64> {
                 .filter(|cost| cost.is_finite() && *cost >= 0.0)
             {
                 return Some(cost);
+            }
+            for key in ["total_cost", "totalCost", "cost_usd", "costUsd", "cost"] {
+                if let Some(cost) = map
+                    .get(key)
+                    .and_then(|value| match value {
+                        Value::Object(object) => object
+                            .get("total")
+                            .or_else(|| object.get("value"))
+                            .and_then(value_to_f64),
+                        scalar => value_to_f64(scalar),
+                    })
+                    .filter(|cost| cost.is_finite() && *cost >= 0.0)
+                {
+                    return Some(cost);
+                }
             }
             map.values().find_map(extract_reported_cost)
         }
@@ -1393,21 +1758,37 @@ fn infer_project_path(source: &DetectedSource, file: &Path) -> String {
 
 fn raw_hash(
     source: SourceKind,
-    file: &Path,
+    _file: &Path,
     raw_span: Option<&str>,
     value: &Value,
 ) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(source.as_str().as_bytes());
     hasher.update(b"\n");
-    hasher.update(file.display().to_string().as_bytes());
-    hasher.update(b"\n");
+    // Exclude the local absolute path: this hash seeds the Collector
+    // fingerprint and must survive source relocation.
     if let Some(raw_span) = raw_span {
         hasher.update(raw_span.as_bytes());
     }
     hasher.update(b"\n");
     hasher.update(serde_json::to_vec(value)?);
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Stable identity material intentionally excludes local paths, project salts,
+/// pricing, parser version, and import time. Parser upgrades can therefore
+/// update an existing Hub event instead of creating a second event.
+pub fn stable_event_fingerprint(event: &UsageEvent) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(event.source.as_str().as_bytes());
+    hasher.update(b"\n");
+    // raw_event_hash is canonical source-record content plus parser span; it
+    // deliberately contains no local path. Do not include fallback session
+    // names, model/pricing fields, or parser-version labels here.
+    hasher.update(event.raw_span.as_deref().unwrap_or("").as_bytes());
+    hasher.update(b"\n");
+    hasher.update(event.raw_event_hash.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 trait FileStemString {

@@ -33,7 +33,9 @@ const OWNER_SESSION_COOKIE: &str = "dirtydash_owner_session";
 const OWNER_CSRF_HEADER: &str = "x-csrf-token";
 const BOOTSTRAP_SETUP_TOKEN_HEADER: &str = "x-dirtydash-setup-token";
 const TAILSCALE_USER_LOGIN: &str = "tailscale-user-login";
-const SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+pub const API_V1_PROTOCOL_VERSION: u32 = 1;
+// Internal compatibility alias for the Phase 2 test/repository code.
+const SUPPORTED_PROTOCOL_VERSION: u32 = API_V1_PROTOCOL_VERSION;
 const OWNER_SESSION_TTL_SECONDS: i64 = 60 * 60 * 12;
 const DEFAULT_CREDENTIAL_LABEL: &str = "default";
 
@@ -394,6 +396,67 @@ pub struct CollectorUsageEvent {
     pub pricing_version: String,
     #[serde(default = "default_metadata_only_true")]
     pub metadata_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum OwnerCommand {
+    Refresh {
+        command_id: String,
+    },
+    RotateCredential {
+        command_id: String,
+        credential_token: String,
+    },
+    Diagnostics {
+        command_id: String,
+    },
+    ApprovedUpdate {
+        command_id: String,
+        version: String,
+        sha256: String,
+    },
+}
+
+impl OwnerCommand {
+    pub fn command_id(&self) -> &str {
+        match self {
+            Self::Refresh { command_id }
+            | Self::RotateCredential { command_id, .. }
+            | Self::Diagnostics { command_id }
+            | Self::ApprovedUpdate { command_id, .. } => command_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandPollResponse {
+    pub command: Option<OwnerCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandAckRequest {
+    pub command_id: String,
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IssueCollectorCommandRequest {
+    pub machine_id: String,
+    pub command: OwnerCommand,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct IssueCollectorCommandResponse {
+    pub command_id: String,
+    pub machine_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectorCommandPollQuery {
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

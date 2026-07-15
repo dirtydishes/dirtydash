@@ -343,6 +343,100 @@ impl HubRepository {
         })
     }
 
+    pub(crate) fn issue_collector_command(
+        &self,
+        request: IssueCollectorCommandRequest,
+    ) -> Result<IssueCollectorCommandResponse, HubError> {
+        let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
+        let command_id = validate_identifier(request.command.command_id(), "command_id")?;
+        let command_json = serde_json::to_string(&request.command).map_err(HubError::internal)?;
+        let now = now_utc();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        conn.execute(
+            r#"
+            INSERT INTO collector_commands(command_id, machine_id, command_json, created_at)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+            params![command_id, machine_id, command_json, now],
+        )
+        .map_err(HubError::internal)?;
+        Ok(IssueCollectorCommandResponse {
+            command_id,
+            machine_id,
+        })
+    }
+
+    pub(crate) fn poll_collector_command(
+        &self,
+        auth: &AuthenticatedCollector,
+    ) -> Result<Option<OwnerCommand>, HubError> {
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let pending = tx
+            .query_row(
+                r#"
+                SELECT command_id, command_json
+                FROM collector_commands
+                WHERE machine_id = ?1
+                    AND acknowledged_at IS NULL
+                    AND (claimed_at IS NULL OR julianday(claimed_at) <= julianday(?2) - (60.0 / 86400.0))
+                ORDER BY created_at, command_id
+                LIMIT 1
+                "#,
+                params![auth.machine_id, now_utc()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((command_id, command_json)) = pending else {
+            tx.commit().map_err(HubError::internal)?;
+            return Ok(None);
+        };
+        tx.execute(
+            "UPDATE collector_commands SET claimed_at = ?2 WHERE command_id = ?1 AND acknowledged_at IS NULL",
+            params![command_id, now_utc()],
+        )
+        .map_err(HubError::internal)?;
+        tx.commit().map_err(HubError::internal)?;
+        let command = serde_json::from_str(&command_json).map_err(HubError::internal)?;
+        Ok(Some(command))
+    }
+
+    pub(crate) fn acknowledge_collector_command(
+        &self,
+        auth: &AuthenticatedCollector,
+        request: CollectorCommandAckRequest,
+    ) -> Result<(), HubError> {
+        let command_id = validate_identifier(&request.command_id, "command_id")?;
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        let changed = conn
+            .execute(
+                r#"
+                UPDATE collector_commands
+                SET acknowledged_at = ?3, result_json = ?4
+                WHERE command_id = ?1 AND machine_id = ?2 AND acknowledged_at IS NULL
+                "#,
+                params![
+                    command_id,
+                    auth.machine_id,
+                    now_utc(),
+                    serde_json::to_string(&request.result).map_err(HubError::internal)?
+                ],
+            )
+            .map_err(HubError::internal)?;
+        if changed == 0 {
+            return Err(HubError::not_found(
+                "collector-command-not-found",
+                "collector command was not found, belongs to another Machine, or was already acknowledged",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_final_insert_failure(&self) {
         *self

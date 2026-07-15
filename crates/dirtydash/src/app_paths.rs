@@ -7,6 +7,10 @@ use directories::ProjectDirs;
 pub struct AppPaths {
     pub config_path: PathBuf,
     pub db_path: PathBuf,
+    /// Collector state is intentionally separate from the local dashboard
+    /// history database. It contains manifests, credentials, and the durable
+    /// outbound outbox, not session bodies.
+    pub collector_db_path: PathBuf,
 }
 
 impl AppPaths {
@@ -18,6 +22,13 @@ impl AppPaths {
             config_override.unwrap_or_else(|| project_dirs.config_dir().join("config.toml"));
         let db_path =
             db_override.unwrap_or_else(|| project_dirs.data_dir().join("dirtydash.sqlite3"));
+        let collector_db_path = db_path.with_file_name(format!(
+            "{}-collector.sqlite3",
+            db_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("dirtydash")
+        ));
 
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)
@@ -31,6 +42,7 @@ impl AppPaths {
         Ok(Self {
             config_path,
             db_path,
+            collector_db_path,
         })
     }
 }

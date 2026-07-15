@@ -15,6 +15,10 @@ pub struct Config {
     /// Optional Hub runtime settings. Local loopback mode remains the default.
     #[serde(default)]
     pub hub: HubConfig,
+    /// Local outbound Collector settings. Collector state and credentials are
+    /// persisted in the separate Collector SQLite database.
+    #[serde(default)]
+    pub collector: CollectorConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,6 +59,40 @@ pub enum CookieTransportConfig {
     #[default]
     Secure,
     LoopbackHttp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorConfig {
+    #[serde(default)]
+    pub hub_url: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub credential_token: Option<String>,
+    #[serde(default = "default_collector_reconcile_seconds")]
+    pub reconcile_seconds: u64,
+    #[serde(default = "default_collector_watcher_debounce_millis")]
+    pub watcher_debounce_millis: u64,
+}
+
+fn default_collector_reconcile_seconds() -> u64 {
+    15 * 60
+}
+
+fn default_collector_watcher_debounce_millis() -> u64 {
+    500
+}
+
+impl Default for CollectorConfig {
+    fn default() -> Self {
+        Self {
+            hub_url: None,
+            machine_id: None,
+            credential_token: None,
+            reconcile_seconds: default_collector_reconcile_seconds(),
+            watcher_debounce_millis: default_collector_watcher_debounce_millis(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

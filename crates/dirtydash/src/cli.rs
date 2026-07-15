@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::app_paths::AppPaths;
+use crate::collector;
 use crate::config::Config;
 use crate::db::Database;
 use crate::importers::{self, ImportOptions};
@@ -32,7 +33,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Detect local Claude Code, Codex, OpenCode, and pi-agent sources.
+    /// Detect local Claude Code, Codex, OpenCode, Pi, and Hermes sources.
     Scan(ScanArgs),
     /// Import detected or configured local sources into SQLite.
     Import(ImportArgs),
@@ -40,6 +41,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Validate config, database, source paths, parser health, and pricing assumptions.
     Doctor(DoctorArgs),
+    /// Run the outbound-only local Collector reconciliation/runtime.
+    Collector(CollectorCommand),
     /// Configure pull-based SSH remotes.
     Remote(RemoteCommand),
     /// Inspect bundled pricing and manage manual overrides.
@@ -77,6 +80,32 @@ pub struct ServeArgs {
 
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorCommand {
+    #[command(subcommand)]
+    pub command: CollectorSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CollectorSubcommand {
+    /// Reconcile local harness sources and queue one durable outbound batch.
+    Reconcile(CollectorReconcileArgs),
+    /// Print metadata-only Collector diagnostics.
+    Diagnostics(CollectorDiagnosticsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorReconcileArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CollectorDiagnosticsArgs {
     #[arg(long)]
     pub json: bool,
 }
@@ -218,6 +247,7 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
         Some(Command::Import(args)) => import(&paths, &config, args),
         Some(Command::Serve(args)) => serve(&paths, args),
         Some(Command::Doctor(args)) => doctor(&paths, &config, args),
+        Some(Command::Collector(args)) => collector_command(&paths, &config, args),
         Some(Command::Remote(args)) => remote::run(&paths, &mut config, args),
         Some(Command::Pricing(args)) => pricing_command(&paths, args),
         Some(Command::Loop(args)) => loop_command(args),
@@ -300,6 +330,39 @@ fn doctor(paths: &AppPaths, config: &Config, args: DoctorArgs) -> Result<()> {
             println!("warnings:");
             for warning in report.warnings {
                 println!("- {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) -> Result<()> {
+    let usage_db = Database::open(&paths.db_path)?;
+    let collector_db = Database::open(&paths.collector_db_path)?;
+    let mut runtime = collector::Collector::from_config(usage_db, collector_db, config)?;
+    match args.command {
+        CollectorSubcommand::Reconcile(reconcile_args) => {
+            let report = runtime.reconcile_manual(chrono::Utc::now())?;
+            if reconcile_args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "collector reconciled {} files, queued {} events, batch {}",
+                    report.files_seen,
+                    report.events_queued,
+                    report.batch_id.as_deref().unwrap_or("none")
+                );
+            }
+        }
+        CollectorSubcommand::Diagnostics(diagnostics_args) => {
+            let report = runtime.diagnostics()?;
+            if diagnostics_args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "collector machine={} pending={} watcher_degraded={}",
+                    report.machine_id, report.pending_outbox, report.watcher.degraded
+                );
             }
         }
     }
