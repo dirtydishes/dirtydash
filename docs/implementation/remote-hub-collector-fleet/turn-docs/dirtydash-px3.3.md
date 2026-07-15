@@ -52,7 +52,7 @@ The implementation session is the sole mutable owner of the phase worktree. The 
 - Accepted importer/Hermes scout `ce920025-7b9f-4210-9b66-66b2539d467f` identified the monolithic importer facade, extension-only detection, global parser version, path-dependent raw hash, and the absence of Hermes. Its accepted output was incorporated from the parent-mediated scout transcript (runtime artifact removed at closeout).
 - Accepted runtime/outbox scout `f8288e54-8bf1-47bf-ac39-1a521fed9f50` confirmed the Phase 2 DTO/idempotency seams and required atomic manifest+canonical-outbox commit, matching-ack deletion, persisted retry state, command receipts, 20-second poll, and no Collector listener. Its accepted output was incorporated from the parent-mediated scout transcript (runtime artifact removed at closeout).
 - `importers.rs` keeps its existing CLI facade while exposing a side-effect-free `ParserRegistry`/Collector parse boundary. Hermes supports aliases, default state/session/journal roots, format-evidence detection, a read-only `state.db` sessions parser, JSONL fallback, and a per-parser provenance version.
-- Collector fingerprints exclude local paths, display salts, pricing, parser versions, and import time. The Collector builds separate typed redacted DTOs; `metadata_only` is forced true rather than copied from local import options.
+- Collector fingerprints exclude local paths, display salts, pricing, parser versions, and import time. The Collector builds separate typed redacted DTOs; `metadata_only` is forced true rather than copied from local import options. Complete reconciliation emits redacted tombstones for removed source files.
 - `AppPaths` now derives a separate Collector SQLite path. Its manifest advance and immutable serialized `IngestBatchRequest` outbox append share one SQLite transaction. Outbox rows survive restart/offline states and are deleted only after an exact batch acknowledgement.
 - Watch notifications are coalesced hints; startup, periodic fifteen-minute, manual, and watcher-fallback paths all use complete reconciliation. Failure is persisted and visible as degraded status. No inbound Collector port or deployment/fleet UI was added.
 - Owner commands are typed and allowlisted for refresh, two-phase credential staging/commit, metadata-only diagnostics, and approved version/digest updates. Minimal authenticated Hub poll/ack and owner issue endpoints reuse the Phase 2 identity/ingestion contracts.
@@ -90,7 +90,7 @@ Evidence:
 
 ## PR And Commits
 
-- Implementation commit: `cfe13e4` (`feat: add durable outbound collector runtime`).
+- Implementation commits: `cfe13e4` (`feat: add durable outbound collector runtime`) and `b87597d` (removed-source tombstones/manifest completeness).
 - Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`, state open.
 - Coordinator retains independent review, CI disposition, merge, and Beads/phase advancement ownership.
 
