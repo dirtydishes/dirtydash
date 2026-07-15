@@ -73,7 +73,7 @@ No separate review session was run in this bounded checkout. Local correctness e
 
 Owner: implementation session
 
-State: local gates passed; remote CI pending after push
+State: local gates passed; remote CI running on PR #12
 
 Evidence:
 
@@ -86,7 +86,7 @@ Evidence:
 
 ## PR And Commits
 
-Pending commit/push and one PR from `lavender/remote-hub-collector-fleet-5-fleet` into `lavender/remote-hub-collector-fleet-implementation`.
+Commit `d2ace45` pushed from `lavender/remote-hub-collector-fleet-5-fleet`; PR #12 targets `lavender/remote-hub-collector-fleet-implementation`.
 
 ## Beads Updates And Follow-Ups
 
@@ -102,4 +102,4 @@ Archive and permanent deletion are deliberately separate operations. Hosted sign
 
 ## Closeout
 
-Implementation and local validation are complete. Remove any generated/session artifacts before commit, push the branch, and create the single integration-targeted PR.
+Implementation and local validation are complete. `.pi-subagents/` is absent, commit `d2ace45` is pushed, and the single integration-targeted PR is #12.
