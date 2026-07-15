@@ -1627,12 +1627,29 @@ fn migration_removes_legacy_plaintext_collector_command_credentials() {
     )
     .unwrap();
     conn.execute(
+        "INSERT INTO collector_commands(command_id, machine_id, command_json, created_at, result_json) VALUES ('legacy-ack-result', 'machine-a', ?1, '2026-07-15T00:00:00Z', ?2)",
+        params![
+            r#"{"type":"refresh","command_id":"legacy-ack-result"}"#,
+            r#"{"status":"ok","credential":"ddcol_legacy-ack.LEGACY_ACK_SECRET_SENTINEL"}"#,
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO collector_commands(command_id, machine_id, command_json, created_at, result_json) VALUES ('historical-safe', 'machine-a', ?1, '2026-07-15T00:00:00Z', ?2)",
+        params![
+            r#"{"type":"refresh","command_id":"historical-safe"}"#,
+            r#"{"status":"ok","message":"historical result preserved"}"#,
+        ],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO collector_command_results(command_id, result_json, handled_at) VALUES ('legacy-result', ?1, '2026-07-15T00:00:00Z')",
         params![r#"{"credential_token":"LEGACY_SECRET_SENTINEL"}"#],
     )
     .unwrap();
     drop(conn);
 
+    db.migrate().unwrap();
     db.migrate().unwrap();
     let conn = db.connection().unwrap();
     let command_count: i64 = conn
@@ -1651,6 +1668,51 @@ fn migration_removes_legacy_plaintext_collector_command_credentials() {
         )
         .unwrap();
     assert!(!result_json.contains("LEGACY_SECRET_SENTINEL"));
+    let command_result_json: String = conn
+        .query_row(
+            "SELECT result_json FROM collector_commands WHERE command_id = 'legacy-ack-result'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        command_result_json,
+        r#"{"type":"rejected","reason":"legacy credential result redacted"}"#
+    );
+    let historical_result_json: String = conn
+        .query_row(
+            "SELECT result_json FROM collector_commands WHERE command_id = 'historical-safe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        historical_result_json,
+        r#"{"status":"ok","message":"historical result preserved"}"#
+    );
+
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for table in tables {
+        let query = format!("SELECT * FROM \"{table}\"");
+        let mut statement = conn.prepare(&query).unwrap();
+        let mut rows = statement.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            for index in 0..row.as_ref().column_count() {
+                if let Ok(value) = row.get::<_, String>(index) {
+                    assert!(
+                        !value.contains("LEGACY_ACK_SECRET_SENTINEL"),
+                        "legacy acknowledgement secret in {table}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

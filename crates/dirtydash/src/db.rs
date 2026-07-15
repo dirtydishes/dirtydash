@@ -1285,6 +1285,16 @@ impl Database {
         )?;
         conn.execute(
             r#"
+            UPDATE collector_commands
+            SET result_json = '{"type":"rejected","reason":"legacy credential result redacted"}'
+            WHERE result_json LIKE '%credential_token%'
+                OR result_json LIKE '%ddcol_%'
+                OR result_json LIKE '%secret%'
+            "#,
+            [],
+        )?;
+        conn.execute(
+            r#"
             UPDATE collector_command_results
             SET result_json = '{"type":"rejected","reason":"legacy credential result redacted"}'
             WHERE result_json LIKE '%credential_token%'
