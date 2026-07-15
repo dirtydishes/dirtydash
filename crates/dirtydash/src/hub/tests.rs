@@ -1617,20 +1617,28 @@ fn migration_upgrades_existing_v1_schema_additively() {
 
 #[test]
 fn migration_removes_legacy_plaintext_collector_command_credentials() {
+    const LEGACY_COMMAND_SENTINEL: &str = "LEGACY_COMMAND_SECRET_SENTINEL";
+    const LEGACY_RESULT_SENTINEL: &str = "LEGACY_RESULT_SECRET_SENTINEL";
+    const LEGACY_ACK_SENTINEL: &str = "LEGACY_ACK_SECRET_SENTINEL";
+
     let dir = tempdir().unwrap();
     let db = Database::open(dir.path().join("dirtydash.sqlite3")).unwrap();
     db.migrate().unwrap();
     let conn = db.connection().unwrap();
     conn.execute(
         "INSERT INTO collector_commands(command_id, machine_id, command_json, created_at) VALUES ('legacy-secret', 'machine-a', ?1, '2026-07-15T00:00:00Z')",
-        params![r#"{"type":"rotate-credential","command_id":"legacy-secret","credential_token":"LEGACY_SECRET_SENTINEL"}"#],
+        params![format!(
+            r#"{{"type":"rotate-credential","command_id":"legacy-secret","credential_token":"{LEGACY_COMMAND_SENTINEL}"}}"#
+        )],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO collector_commands(command_id, machine_id, command_json, created_at, result_json) VALUES ('legacy-ack-result', 'machine-a', ?1, '2026-07-15T00:00:00Z', ?2)",
         params![
             r#"{"type":"refresh","command_id":"legacy-ack-result"}"#,
-            r#"{"status":"ok","credential":"ddcol_legacy-ack.LEGACY_ACK_SECRET_SENTINEL"}"#,
+            format!(
+                r#"{{"status":"ok","credential":"ddcol_legacy-ack.{LEGACY_ACK_SENTINEL}"}}"#
+            ),
         ],
     )
     .unwrap();
@@ -1644,7 +1652,9 @@ fn migration_removes_legacy_plaintext_collector_command_credentials() {
     .unwrap();
     conn.execute(
         "INSERT INTO collector_command_results(command_id, result_json, handled_at) VALUES ('legacy-result', ?1, '2026-07-15T00:00:00Z')",
-        params![r#"{"credential_token":"LEGACY_SECRET_SENTINEL"}"#],
+        params![format!(
+            r#"{{"credential_token":"{LEGACY_RESULT_SENTINEL}"}}"#
+        )],
     )
     .unwrap();
     drop(conn);
@@ -1654,8 +1664,8 @@ fn migration_removes_legacy_plaintext_collector_command_credentials() {
     let conn = db.connection().unwrap();
     let command_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM collector_commands WHERE command_json LIKE '%LEGACY_SECRET_SENTINEL%'",
-            [],
+            "SELECT COUNT(*) FROM collector_commands WHERE command_json LIKE ?1",
+            params![format!("%{LEGACY_COMMAND_SENTINEL}%")],
             |row| row.get(0),
         )
         .unwrap();
@@ -1667,7 +1677,7 @@ fn migration_removes_legacy_plaintext_collector_command_credentials() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(!result_json.contains("LEGACY_SECRET_SENTINEL"));
+    assert!(!result_json.contains(LEGACY_RESULT_SENTINEL));
     let command_result_json: String = conn
         .query_row(
             "SELECT result_json FROM collector_commands WHERE command_id = 'legacy-ack-result'",
@@ -1698,17 +1708,23 @@ fn migration_removes_legacy_plaintext_collector_command_credentials() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    for table in tables {
-        let query = format!("SELECT * FROM \"{table}\"");
-        let mut statement = conn.prepare(&query).unwrap();
-        let mut rows = statement.query([]).unwrap();
-        while let Some(row) = rows.next().unwrap() {
-            for index in 0..row.as_ref().column_count() {
-                if let Ok(value) = row.get::<_, String>(index) {
-                    assert!(
-                        !value.contains("LEGACY_ACK_SECRET_SENTINEL"),
-                        "legacy acknowledgement secret in {table}"
-                    );
+    for sentinel in [
+        LEGACY_COMMAND_SENTINEL,
+        LEGACY_RESULT_SENTINEL,
+        LEGACY_ACK_SENTINEL,
+    ] {
+        for table in &tables {
+            let query = format!("SELECT * FROM \"{table}\"");
+            let mut statement = conn.prepare(&query).unwrap();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for index in 0..row.as_ref().column_count() {
+                    if let Ok(value) = row.get::<_, String>(index) {
+                        assert!(
+                            !value.contains(sentinel),
+                            "legacy credential sentinel {sentinel} in {table}"
+                        );
+                    }
                 }
             }
         }
