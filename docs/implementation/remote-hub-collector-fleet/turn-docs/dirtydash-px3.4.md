@@ -111,21 +111,27 @@ No Beads state was mutated, no merge was performed, and the coordinator still ow
 
 ## Review
 
-Pending independent fresh review of this repair pass. Live signing keys, real SSH hosts/managers, public certificates, and tailnet consent remain unavailable external gates; no evidence is fabricated.
+Approved after five independent `thermo-nuclear-code-quality-review` rounds and four bounded repair passes.
+
+- Review hardened reviewed-plan binding, publisher trust, canonical SSH/known-host identity, secret storage, SQLite seed/rollback semantics, enrollment retries/password flow, service verification, listener trust, and module structure.
+- Follow-up rounds added durable publisher anchoring, binary-safe password-authenticated transfer, exact DB/WAL/SHM and service/listener snapshots, production-adapter dangerous-path tests, fail-closed systemd LoadState handling, and exact systemd/launchd loaded/running restoration.
+- Final independent review approved `a04ed7c`/`45cd9d6` with no changes required.
+- External residual evidence remains unavailable: production signing keys/artifacts, real SSH hosts, real Linux/macOS service managers, public TLS issuance, and real-tailnet Tailscale consent/identity.
 
 ## CI And Gates
 
-Owner: implementation session for local gates; coordinator for independent review and terminal CI
+Owner: coordinator
 
-State: local-gates-passed; live-release-evidence-unavailable
+State: `ci-unavailable-with-evidence`
 
 Evidence:
 
-- `cargo fmt --all`: passed.
-- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- GitHub reported no configured check runs for PR #11.
+- Coordinator reran `cargo fmt --all --check`: passed.
+- Coordinator reran `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - Thermo-nuclear repair validation covers persisted reviewed plans, durable publisher anchoring/replacement rejection, canonical SSH/host-key trust, controlled live-PTY password/sudo success/failure/redaction, secret snapshots/permissions, no-sqlite3 byte-level valid/malformed/WAL paths, actual listener/service/current-pointer rollback, old Hub/Collector rollback health, manual-recovery status, listener CIDRs/peer trust, execution restart, redaction, absent-systemd quiesce, and loaded-inactive launchd rollback.
-- `cargo test --all-targets --all-features`: passed (109 unit tests, 9 CLI tests, 14 Collector integration tests).
-- `npm --prefix dashboard run build`: passed with Vite production output.
+- Coordinator reran `cargo test --all-targets`: passed (109 unit tests, 9 CLI tests, 14 Collector integration tests).
+- Coordinator reran `npm --prefix dashboard run build`: passed with Vite production output.
 - Local Hub smoke: `target/debug/dirtydash serve --hub --listener public --host 127.0.0.1 --port 4598` started a real connect-info router and `/healthz` returned `{"service":"dirtydash-hub","status":"ok"}`.
 - `git diff --check` and allowed-path/protected-artifact checks: passed; protected conversion/migration artifacts are byte-identical to `HEAD`.
 - Live production signing, SSH alias/manual host enrollment, changed-key behavior against real hosts, systemd/launchd manager operations, Tailscale consent, public TLS certificates, and real release artifact deployment were not available in this isolated environment.
@@ -139,11 +145,13 @@ Evidence:
 - Final service-state repair commit `e355e08` (`fix: repair phase 4 service state rollback`).
 - Final systemd-state repair commit `a04ed7c` (`fix: make systemd state rollback fail closed`).
 - Phase PR: [#11](https://github.com/dirtydishes/dirtydash/pull/11), head `lavender/remote-hub-collector-fleet-4-deployment`, base `lavender/remote-hub-collector-fleet-implementation`.
-- Branch pushed to `origin`; merge remains coordinator-owned.
+- Merged: 2026-07-15 at merge commit `e2461b8`.
 
 ## Beads Updates And Follow-Ups
 
-Loop creation established the issue and dependency graph.
+- `dirtydash-px3.4` closed after acceptance, independent review, repair evidence, coordinator gates, and PR merge.
+- Phase 5 (`dirtydash-px3.5`) is now ready.
+- Live signing/SSH/service-manager/TLS/tailnet proof remains an explicit external release gate for Phase 7 rather than fabricated Phase 4 evidence.
 
 ## Plan Amendments
 
@@ -155,4 +163,4 @@ Deployment credentials are memory-only and must never enter arguments, environme
 
 ## Closeout
 
-Implementation, repair validation, commit, and phase-branch push are complete. Independent review, coordinator terminal CI, and integration-branch merge remain coordinator-owned; no Beads state was mutated and no merge was performed.
+Phase 4 complete. Signed-artifact verification, Hub deployment planning/apply, non-root services, listener modes, SSH enrollment, secret handling, rollback, and legacy drafts are implemented; all local review blockers were repaired; final review approved; coordinator gates passed; unavailable CI/live gates are documented; Beads is closed; and PR #11 is merged into the integration branch.
