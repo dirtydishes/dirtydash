@@ -4,7 +4,7 @@ Canonical tracker: Beads epic `dirtydash-px3`
 
 This file is a compact resume aid only. If this file disagrees with Beads, Beads wins.
 
-Status: interrupted for approved replanning; the active Phase 5 repair owner is finishing one clean checkpoint
+Status: interrupted for approved replanning; no implementation or review owner is active
 
 Stream: `remote-hub-collector-fleet`
 
@@ -18,9 +18,9 @@ Current phase: 5 — Fleet management, re-sliced into bounded closure issues
 
 Current Beads issue: `dirtydash-px3.5` (`in_progress`, blocked by `dirtydash-px3.8` through `dirtydash-px3.13`)
 
-Current PR: #12 (`lavender/remote-hub-collector-fleet-5-fleet`, open and unmerged)
+Current PR: #12 (`lavender/remote-hub-collector-fleet-5-fleet`, head `67ec5ec`, open and unmerged)
 
-Current execution strategy: the existing Phase 5 repair owner may finish, test, commit, and push its current checkout; the coordinator must not launch another reviewer, repair owner, or phase afterward
+Current execution strategy: stopped; select only a ready tracer-bullet issue from Beads. The current ready slices are `dirtydash-px3.8`, `dirtydash-px3.9`, and `dirtydash-px3.13`
 
 Last completed phase: 4 — Hub deployment and enrollment (`dirtydash-px3.4`, PR #11)
 
@@ -82,4 +82,4 @@ Phase 7 delivery:
 
 ## Last Coordinator Update
 
-The long-running Pi coordinator was stopped from launching new work. Its current Phase 5 repair owner may produce one final checkpoint, but Phase 5 remains open and PR #12 remains unmerged. Beads now routes subsequent work through independently verifiable tracer-bullet issues instead of the original giant phase units.
+The long-running Pi coordinator and its Phase 5 repair owner are stopped. The preserved repair checkout was externally verified, committed as `67ec5ec`, and pushed to PR #12; all Rust and dashboard gates passed. Phase 5 remains open and PR #12 remains unmerged. Beads now routes subsequent work through independently verifiable tracer-bullet issues instead of the original giant phase units.
