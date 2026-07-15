@@ -99,7 +99,8 @@ Evidence:
 
 ## PR And Commits
 
-- Commit `1c84e3c` (`feat: add signed hub deployment and ssh enrollment`).
+- Base implementation commit `1c84e3c` (`feat: add signed hub deployment and ssh enrollment`).
+- Repair commit `c6aeb38` (`fix: harden phase 4 deployment and enrollment`).
 - Phase PR: [#11](https://github.com/dirtydishes/dirtydash/pull/11), head `lavender/remote-hub-collector-fleet-4-deployment`, base `lavender/remote-hub-collector-fleet-implementation`.
 - Branch pushed to `origin`; merge remains coordinator-owned.
 
@@ -117,4 +118,4 @@ Deployment credentials are memory-only and must never enter arguments, environme
 
 ## Closeout
 
-Implementation, local validation, commit, push, and one phase PR are complete. Independent review, coordinator terminal CI, and integration-branch merge remain coordinator-owned.
+Implementation, repair validation, commit, and phase-branch push are complete. Independent review, coordinator terminal CI, and integration-branch merge remain coordinator-owned; no Beads state was mutated and no merge was performed.
