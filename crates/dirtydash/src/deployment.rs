@@ -2589,8 +2589,19 @@ fn sqlite_header_command(path: &str) -> String {
 }
 
 const LAUNCHD_RUNNING_PATTERN: &str = r"(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)";
-const SYSTEMD_STOP_IF_PRESENT_COMMAND: &str =
-    "state=$(systemctl --user show \"$service\" --property=LoadState --no-pager 2>/dev/null); case \"$state\" in *LoadState=not-found*) :;; *) systemctl --user stop \"$service\";; esac";
+const SYSTEMD_STOP_IF_PRESENT_COMMAND: &str = "if ! state=$(systemctl --user show \"$service\" --property=LoadState --no-pager 2>/dev/null); then echo 'systemd unit state query failed' >&2; exit 129; fi; load=$(printf '%s\\n' \"$state\" | sed -n 's/^LoadState=//p' | head -n 1); case \"$load\" in not-found) :;; '') echo 'systemd unit state omitted LoadState' >&2; exit 130;; *) systemctl --user stop \"$service\";; esac";
+
+fn systemd_snapshot_state_command() -> &'static str {
+    "for service in dirtydash-hub.service dirtydash-collector.service; do if ! state=$(systemctl --user show \"$service\" --property=LoadState --property=ActiveState --property=UnitFileState --no-pager 2>/dev/null); then echo 'systemd unit state query failed' >&2; exit 129; fi; load=$(printf '%s\\n' \"$state\" | sed -n 's/^LoadState=//p' | head -n 1); active=$(printf '%s\\n' \"$state\" | sed -n 's/^ActiveState=//p' | head -n 1); unit=$(printf '%s\\n' \"$state\" | sed -n 's/^UnitFileState=//p' | head -n 1); case \"$load\" in not-found) printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\";; '') echo 'systemd unit state omitted LoadState' >&2; exit 130;; *) printf 'loaded\\n' > \"$snapshot_tmp/$service.loaded\";; esac; case \"$active\" in active) printf 'active\\n' > \"$snapshot_tmp/$service.active\";; inactive) printf 'inactive\\n' > \"$snapshot_tmp/$service.active\";; *) echo 'systemd unit state returned an unsupported ActiveState' >&2; exit 131;; esac; if ! printf '%s\\n' \"$state\" | grep -q '^UnitFileState='; then echo 'systemd unit state omitted UnitFileState' >&2; exit 132; fi; printf '%s\\n' \"$state\" > \"$snapshot_tmp/$service.state\"; printf '%s\\n' \"$unit\" > \"$snapshot_tmp/$service.enabled\"; done"
+}
+
+fn systemd_state_assertion_command(snapshot: &str) -> String {
+    let snapshot = shell_quote(snapshot);
+    format!(
+        "if ! state=$(systemctl --user show \"$service\" --property=LoadState --property=ActiveState --no-pager 2>/dev/null); then echo 'systemd unit state verification failed' >&2; exit 143; fi; load=$(printf '%s\\n' \"$state\" | sed -n 's/^LoadState=//p' | head -n 1); active=$(printf '%s\\n' \"$state\" | sed -n 's/^ActiveState=//p' | head -n 1); expected_load=$(cat {snapshot}/$service.loaded); case \"$expected_load\" in loaded) test -n \"$load\"; test \"$load\" != not-found;; unloaded) test \"$load\" = not-found;; *) exit 144;; esac; expected_active=$(cat {snapshot}/$service.active); case \"$expected_active\" in active) test \"$active\" = active;; inactive) test \"$active\" = inactive;; *) exit 145;; esac",
+        snapshot = snapshot,
+    )
+}
 
 fn launchd_running_check(job: &str) -> String {
     format!(
@@ -2621,9 +2632,7 @@ fn snapshot_command(
     .collect::<Vec<_>>()
     .join(" ");
     let service_state = match platform {
-        ServicePlatform::Systemd => {
-            "for service in dirtydash-hub.service dirtydash-collector.service; do if state=$(systemctl --user show \"$service\" --property=LoadState --property=ActiveState --property=UnitFileState --no-pager 2>/dev/null); then printf '%s\\n' \"$state\" > \"$snapshot_tmp/$service.state\"; load=$(printf '%s\\n' \"$state\" | sed -n 's/^LoadState=//p' | head -n 1); active=$(printf '%s\\n' \"$state\" | sed -n 's/^ActiveState=//p' | head -n 1); unit=$(printf '%s\\n' \"$state\" | sed -n 's/^UnitFileState=//p' | head -n 1); case \"$load\" in loaded) printf 'loaded\\n' > \"$snapshot_tmp/$service.loaded\";; *) printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\";; esac; case \"$active\" in active) printf 'active\\n' > \"$snapshot_tmp/$service.active\";; *) printf 'inactive\\n' > \"$snapshot_tmp/$service.active\";; esac; printf '%s\\n' \"$unit\" > \"$snapshot_tmp/$service.enabled\"; else printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\"; printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; printf 'disabled\\n' > \"$snapshot_tmp/$service.enabled\"; printf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=disabled\\n' > \"$snapshot_tmp/$service.state\"; fi; done".to_string()
-        }
+        ServicePlatform::Systemd => systemd_snapshot_state_command().to_string(),
         ServicePlatform::Launchd => {
             format!(
                 "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do if state=$(launchctl print \"$domain/$service\" 2>/dev/null); then printf '%s\\n' \"$state\" > \"$snapshot_tmp/$service.state\"; printf 'loaded\\n' > \"$snapshot_tmp/$service.loaded\"; if printf '%s\\n' \"$state\" | grep -Eq '{LAUNCHD_RUNNING_PATTERN}'; then printf 'active\\n' > \"$snapshot_tmp/$service.active\"; else printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; fi; else printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\"; printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; : > \"$snapshot_tmp/$service.state\"; fi; done"
@@ -2745,10 +2754,10 @@ fn rollback_service_restart_command(
     snapshot: Option<&str>,
     service_dir: Option<&str>,
 ) -> String {
-    let Some(snapshot) = snapshot else {
+    let Some(snapshot_path) = snapshot else {
         return service_restart_command(platform).to_string();
     };
-    let snapshot = shell_quote(snapshot);
+    let snapshot = shell_quote(snapshot_path);
     let service_dir = service_dir.map(shell_quote).unwrap_or_else(|| {
         match platform {
             ServicePlatform::Systemd => "\"$HOME/.config/dirtydash/systemd/user\"",
@@ -2757,10 +2766,15 @@ fn rollback_service_restart_command(
         .to_string()
     });
     match platform {
-        ServicePlatform::Systemd => format!(
-            "systemctl --user daemon-reload; for service in dirtydash-hub.service dirtydash-collector.service; do if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then unit=$(cat {snapshot}/$service.enabled); case \"$unit\" in enabled*) systemctl --user enable \"$service\";; *) systemctl --user disable \"$service\" 2>/dev/null || true;; esac; if grep -qx active {snapshot}/$service.active 2>/dev/null; then systemctl --user start \"$service\"; systemctl --user is-active --quiet \"$service\"; else {systemd_stop_if_present}; if systemctl --user is-active --quiet \"$service\"; then exit 141; fi; fi; else {systemd_stop_if_present}; systemctl --user disable \"$service\" 2>/dev/null || true; systemctl --user reset-failed \"$service\" 2>/dev/null || true; if systemctl --user is-active --quiet \"$service\"; then exit 142; fi; fi; done",
-            systemd_stop_if_present = SYSTEMD_STOP_IF_PRESENT_COMMAND,
-        ),
+        ServicePlatform::Systemd => {
+            let state_assertion = systemd_state_assertion_command(snapshot_path);
+            format!(
+                "systemctl --user daemon-reload; for service in dirtydash-hub.service dirtydash-collector.service; do if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then unit=$(cat {snapshot}/$service.enabled); case \"$unit\" in enabled*) systemctl --user enable \"$service\";; *) systemctl --user disable \"$service\" 2>/dev/null || true;; esac; if grep -qx active {snapshot}/$service.active 2>/dev/null; then systemctl --user start \"$service\"; systemctl --user is-active --quiet \"$service\"; else {systemd_stop_if_present}; if systemctl --user is-active --quiet \"$service\"; then exit 141; fi; fi; {state_assertion}; else {systemd_stop_if_present}; systemctl --user disable \"$service\" 2>/dev/null || true; systemctl --user reset-failed \"$service\" 2>/dev/null || true; if systemctl --user is-active --quiet \"$service\"; then exit 142; fi; {state_assertion}; fi; done",
+                snapshot = snapshot,
+                systemd_stop_if_present = SYSTEMD_STOP_IF_PRESENT_COMMAND,
+                state_assertion = state_assertion,
+            )
+        },
         ServicePlatform::Launchd => format!(
             "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do plist={service_dir}/$service.plist; job=\"$domain/$service\"; if ! launchctl bootout \"$job\" 2>/dev/null; then if launchctl print \"$job\" >/dev/null 2>&1; then exit 143; fi; fi; if launchctl print \"$job\" >/dev/null 2>&1; then exit 144; fi; if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then launchctl bootstrap \"$domain\" \"$plist\"; if ! launchctl print \"$job\" >/dev/null 2>&1; then exit 145; fi; if grep -qx active {snapshot}/$service.active 2>/dev/null; then launchctl kickstart -k \"$job\"; if ! {running_check}; then exit 146; fi; else if {running_check}; then launchctl kill TERM \"$job\" 2>/dev/null || true; fi; if {running_check}; then exit 147; fi; fi; else if {running_check}; then exit 148; fi; fi; done",
             running_check = launchd_running_check("\"$job\""),

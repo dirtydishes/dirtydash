@@ -279,6 +279,78 @@ exec /bin/sh -c "$last"
     );
 }
 
+#[cfg(unix)]
+fn stateful_systemd_scripts(ssh: &Path, bin: &Path, state: &Path, home: &Path) {
+    executable_script(
+        &bin.join("systemctl"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+state_dir={state}
+service=''
+for arg in "$@"; do
+    case "$arg" in
+        dirtydash-hub.service|dirtydash-collector.service) service=$arg ;;
+    esac
+done
+case "$*" in
+    *daemon-reload*) exit 0 ;;
+esac
+if [ -z "$service" ]; then exit 2; fi
+load=not-found
+active=inactive
+unit=disabled
+if [ -f "$state_dir/$service.load" ]; then load=$(cat "$state_dir/$service.load"); fi
+if [ -f "$state_dir/$service.active" ]; then active=$(cat "$state_dir/$service.active"); fi
+if [ -f "$state_dir/$service.unit" ]; then unit=$(cat "$state_dir/$service.unit"); fi
+case "$*" in
+    *show*) printf 'LoadState=%s\nActiveState=%s\nUnitFileState=%s\n' "$load" "$active" "$unit" ;;
+    *stop*) printf 'inactive\n' > "$state_dir/$service.active" ;;
+    *start*|*restart*) mkdir -p "$state_dir"; printf 'loaded\n' > "$state_dir/$service.load"; printf 'active\n' > "$state_dir/$service.active" ;;
+    *is-active*) test "$active" = active ;;
+    *enable*) mkdir -p "$state_dir"; printf 'enabled\n' > "$state_dir/$service.unit" ;;
+    *disable*) mkdir -p "$state_dir"; printf 'disabled\n' > "$state_dir/$service.unit" ;;
+    *reset-failed*) printf 'inactive\n' > "$state_dir/$service.active" ;;
+    *) exit 0 ;;
+esac
+"#,
+            state = shell_quote(&state.display().to_string()),
+        ),
+    );
+    executable_script(
+        ssh,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+socket=''
+operation=''
+last=''
+while [ "$#" -gt 0 ]; do
+    arg=$1
+    shift
+    case "$arg" in
+        -S) socket=$1; shift ;;
+        -O) operation=$1; shift ;;
+        -o|-p|-i) shift ;;
+        *) last=$arg ;;
+    esac
+done
+if [ "$operation" = exit ]; then
+    rm -f "$socket"
+    exit 0
+fi
+export PATH={bin}:$PATH
+case "$last" in
+    *"printf 'os="*) printf 'os=Linux\narch=x86_64\nuser=deploy\nuid=1000\nhome=%s\n' {home} ; exit 0 ;;
+esac
+exec /bin/sh -c "$last"
+"#,
+            bin = shell_quote(&bin.display().to_string()),
+            home = shell_quote(&home.display().to_string()),
+        ),
+    );
+}
+
 fn facts() -> RemoteFacts {
     RemoteFacts {
         platform: TargetPlatform {
@@ -769,6 +841,309 @@ esac
 
 #[cfg(unix)]
 #[test]
+fn systemd_snapshot_rejects_manager_failures_instead_of_marking_units_unloaded() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut remote_facts = facts();
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = None;
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable_script(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$*" in
+  *show*) printf 'permission denied\n' >&2; exit 77 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let snapshot = action_command(&RemoteAction::SnapshotRollbackState {
+        paths: paths.clone(),
+        platform: ServicePlatform::Systemd,
+        listener: ListenerPlan::default(),
+    })
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    assert!(!Command::new("sh")
+        .args(["-c", &snapshot])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(!Path::new(&format!("{}/deployment-rollback", paths.state_dir)).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn systemd_snapshot_treats_only_not_found_as_unloaded() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut remote_facts = facts();
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = None;
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable_script(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$*" in
+  *show*) printf 'LoadState=masked\nActiveState=inactive\nUnitFileState=\n' ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let snapshot = action_command(&RemoteAction::SnapshotRollbackState {
+        paths: paths.clone(),
+        platform: ServicePlatform::Systemd,
+        listener: ListenerPlan::default(),
+    })
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    assert!(Command::new("sh")
+        .args(["-c", &snapshot])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    let snapshot_dir = PathBuf::from(format!("{}/deployment-rollback", paths.state_dir));
+    for name in ["dirtydash-hub.service", "dirtydash-collector.service"] {
+        assert_eq!(
+            fs::read_to_string(snapshot_dir.join(format!("{name}.loaded")))
+                .unwrap()
+                .trim(),
+            "loaded"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn production_systemd_runner_installs_and_restarts_fresh_absent_units() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("remote-home");
+    let bin = dir.path().join("bin");
+    let state = dir.path().join("systemd-state");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    stateful_systemd_scripts(&dir.path().join("fake-ssh"), &bin, &state, &home);
+    let mut remote_facts = facts();
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = None;
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    fs::create_dir_all(&paths.service_dir).unwrap();
+    let known_hosts = dir.path().join("known_hosts");
+    fs::write(&known_hosts, b"example ssh-ed25519 AQID\n").unwrap();
+    fs::write(
+        known_hosts.with_extension("fingerprints.json"),
+        r#"{"example":{"fingerprint":"sha256:test"}}"#,
+    )
+    .unwrap();
+    let target = CanonicalSshTarget::from_ssh_config(
+        "deploy@example",
+        "hostname example\nport 22\nuser deploy\nproxycommand none\n",
+    )
+    .unwrap();
+    let mut executor = SshRemoteExecutor::from_canonical_target(target, &known_hosts)
+        .unwrap()
+        .with_ssh_program(dir.path().join("fake-ssh"));
+
+    for (name, contents) in [
+        (
+            "dirtydash-hub.service",
+            b"[Service]\nExecStart=hub\n".as_slice(),
+        ),
+        (
+            "dirtydash-collector.service",
+            b"[Service]\nExecStart=collector\n".as_slice(),
+        ),
+    ] {
+        assert!(!state.join(format!("{name}.load")).exists());
+        executor
+            .run(RemoteAction::InstallService {
+                path: Path::new(&paths.service_dir)
+                    .join(name)
+                    .display()
+                    .to_string(),
+                contents: String::from_utf8(contents.to_vec()).unwrap(),
+                mode: 0o644,
+            })
+            .unwrap();
+    }
+    assert!(!state.join("dirtydash-hub.service.load").exists());
+    assert!(!state.join("dirtydash-collector.service.load").exists());
+
+    let result = executor
+        .run(RemoteAction::RestartServices {
+            platform: ServicePlatform::Systemd,
+        })
+        .unwrap();
+    assert_eq!(result.status, RemoteStatus::Success);
+    for name in ["dirtydash-hub.service", "dirtydash-collector.service"] {
+        assert_eq!(
+            fs::read_to_string(state.join(format!("{name}.load")))
+                .unwrap()
+                .trim(),
+            "loaded"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join(format!("{name}.active")))
+                .unwrap()
+                .trim(),
+            "active"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn production_systemd_rollback_preserves_loaded_inactive_hub_and_collector() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("remote-home");
+    let bin = dir.path().join("bin");
+    let state = dir.path().join("systemd-state");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    stateful_systemd_scripts(&dir.path().join("fake-ssh"), &bin, &state, &home);
+    executable_script(
+        &bin.join("tailscale"),
+        r#"#!/bin/sh
+if [ "$1" = serve ] && [ "$2" = status ] && [ "$3" = --json ]; then printf '{}'; exit 0; fi
+exit 0
+"#,
+    );
+    let mut remote_facts = facts();
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = Some(format!("{}/old", home.display()));
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    let old_release = PathBuf::from(remote_facts.current_release.clone().unwrap());
+    fs::create_dir_all(&old_release).unwrap();
+    executable_script(&old_release.join("dirtydash"), "#!/bin/sh\nexit 0\n");
+    fs::create_dir_all(Path::new(&paths.current).parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&old_release, &paths.current).unwrap();
+    fs::create_dir_all(&paths.service_dir).unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-hub.service"),
+        b"old-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-collector.service"),
+        b"old-collector",
+    )
+    .unwrap();
+    for name in ["dirtydash-hub.service", "dirtydash-collector.service"] {
+        fs::write(state.join(format!("{name}.load")), b"loaded").unwrap();
+        fs::write(state.join(format!("{name}.active")), b"inactive").unwrap();
+        fs::write(state.join(format!("{name}.unit")), b"enabled").unwrap();
+    }
+    let known_hosts = dir.path().join("known_hosts");
+    fs::write(&known_hosts, b"example ssh-ed25519 AQID\n").unwrap();
+    fs::write(
+        known_hosts.with_extension("fingerprints.json"),
+        r#"{"example":{"fingerprint":"sha256:test"}}"#,
+    )
+    .unwrap();
+    let target = CanonicalSshTarget::from_ssh_config(
+        "deploy@example",
+        "hostname example\nport 22\nuser deploy\nproxycommand none\n",
+    )
+    .unwrap();
+    let mut executor = SshRemoteExecutor::from_canonical_target(target, &known_hosts)
+        .unwrap()
+        .with_ssh_program(dir.path().join("fake-ssh"));
+    executor
+        .run(RemoteAction::SnapshotRollbackState {
+            paths: paths.clone(),
+            platform: ServicePlatform::Systemd,
+            listener: ListenerPlan::default(),
+        })
+        .unwrap();
+    let snapshot = PathBuf::from(format!("{}/deployment-rollback", paths.state_dir));
+    for name in ["dirtydash-hub.service", "dirtydash-collector.service"] {
+        assert_eq!(
+            fs::read_to_string(snapshot.join(format!("{name}.loaded")))
+                .unwrap()
+                .trim(),
+            "loaded"
+        );
+        assert_eq!(
+            fs::read_to_string(snapshot.join(format!("{name}.active")))
+                .unwrap()
+                .trim(),
+            "inactive"
+        );
+        fs::write(state.join(format!("{name}.active")), b"active").unwrap();
+    }
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-hub.service"),
+        b"replacement-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dirtydash-collector.service"),
+        b"replacement-collector",
+    )
+    .unwrap();
+    fs::create_dir_all(&paths.release_dir).unwrap();
+    fs::write(
+        Path::new(&paths.release_dir).join("dirtydash"),
+        b"new-artifact",
+    )
+    .unwrap();
+    fs::remove_file(&paths.current).unwrap();
+    std::os::unix::fs::symlink(&paths.release_dir, &paths.current).unwrap();
+
+    let result = executor
+        .run(RemoteAction::Rollback {
+            current: paths.current.clone(),
+            previous: Some(old_release.display().to_string()),
+            database_path: None,
+            database_backup: None,
+            database_wal_backup: None,
+            database_shm_backup: None,
+            config_path: None,
+            service_dir: Some(paths.service_dir.clone()),
+            platform: ServicePlatform::Systemd,
+            listener: Some(ListenerPlan::default()),
+            snapshot_dir: Some(snapshot.display().to_string()),
+        })
+        .unwrap();
+    assert_eq!(result.status, RemoteStatus::Success);
+    for name in ["dirtydash-hub.service", "dirtydash-collector.service"] {
+        assert_eq!(
+            fs::read_to_string(state.join(format!("{name}.load")))
+                .unwrap()
+                .trim(),
+            "loaded"
+        );
+        assert_eq!(
+            fs::read_to_string(state.join(format!("{name}.active")))
+                .unwrap()
+                .trim(),
+            "inactive"
+        );
+    }
+    assert_eq!(fs::read_link(&paths.current).unwrap(), old_release);
+    assert_eq!(
+        fs::read(Path::new(&paths.service_dir).join("dirtydash-hub.service")).unwrap(),
+        b"old-hub"
+    );
+    assert_eq!(
+        fs::read(Path::new(&paths.service_dir).join("dirtydash-collector.service")).unwrap(),
+        b"old-collector"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn fresh_seeded_host_rolls_back_to_absent_database_and_unloaded_services() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
@@ -783,7 +1158,7 @@ fn fresh_seeded_host_rolls_back_to_absent_database_and_unloaded_services() {
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$*" in
-  *show*) printf 'LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\n' ;;
+  *show*) printf 'LoadState=not-found\nActiveState=inactive\nUnitFileState=\n' ;;
   *stop*) exit 91 ;;
   *is-active*) exit 3 ;;
   *) exit 0 ;;
