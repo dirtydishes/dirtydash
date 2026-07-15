@@ -13,6 +13,11 @@ impl HubRepository {
             final_insert_failure: Arc::new(Mutex::new(false)),
         }
     }
+
+    pub(crate) fn db_path(&self) -> std::path::PathBuf {
+        self.db.path().to_path_buf()
+    }
+
     pub(crate) fn rotate_collector_credential(
         &self,
         request: RotateCollectorCredentialRequest,
@@ -29,17 +34,33 @@ impl HubRepository {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(HubError::internal)?;
-        tx.execute(
-            r#"
-            INSERT INTO machines(machine_id, display_name, enrolled_at, last_seen_at)
-            VALUES (?1, ?2, ?3, ?3)
-            ON CONFLICT(machine_id) DO UPDATE SET
-                display_name = excluded.display_name,
-                revoked_at = NULL
-            "#,
-            params![machine_id, display_name, now],
-        )
-        .map_err(HubError::internal)?;
+        let existing: Option<(Option<String>, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT revoked_at, archived_at, state_revision FROM machines WHERE machine_id = ?1",
+                params![machine_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        if let Some((revoked_at, archived_at, revision)) = existing {
+            if revoked_at.is_some() || archived_at.is_some() {
+                return Err(HubError::conflict(
+                    "machine-archived",
+                    "credential rotation cannot resurrect an archived Machine",
+                ));
+            }
+            tx.execute(
+                "UPDATE machines SET display_name = ?2, state_revision = ?3 + 1 WHERE machine_id = ?1 AND revoked_at IS NULL AND archived_at IS NULL",
+                params![machine_id, display_name, revision],
+            )
+            .map_err(HubError::internal)?;
+        } else {
+            tx.execute(
+                "INSERT INTO machines(machine_id, display_name, enrolled_at, last_seen_at, state_revision) VALUES (?1, ?2, ?3, ?3, 0)",
+                params![machine_id, display_name, now],
+            )
+            .map_err(HubError::internal)?;
+        }
         // Rotation is an overlap window, not an immediate cutover. The old
         // credential remains valid until the Collector proves the replacement
         // by authenticating a successful request.
@@ -99,6 +120,7 @@ impl HubRepository {
         bearer_token: &str,
     ) -> Result<AuthenticatedCollector, HubError> {
         let bearer_token = validate_non_empty(bearer_token, "collector bearer token")?;
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let token = bearer_token.strip_prefix("ddcol_").ok_or_else(|| {
             HubError::unauthorized(
                 "collector-auth-required",
@@ -422,6 +444,19 @@ impl HubRepository {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(HubError::internal)?;
+        let active_machine: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM machines WHERE machine_id = ?1 AND revoked_at IS NULL AND archived_at IS NULL)",
+                params![validated.machine_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if !active_machine {
+            return Err(HubError::unauthorized(
+                "collector-revoked",
+                "Collector credentials are revoked for this Machine",
+            ));
+        }
 
         let existing_batch = tx
             .query_row(
@@ -461,8 +496,14 @@ impl HubRepository {
         }
 
         tx.execute(
-            "UPDATE machines SET last_seen_at = ?2 WHERE machine_id = ?1",
-            params![validated.machine_id, committed_at],
+            "UPDATE machines SET last_seen_at = ?2, last_sync_at = ?3, collector_version = ?4, collector_protocol_version = ?5 WHERE machine_id = ?1 AND archived_at IS NULL AND revoked_at IS NULL",
+            params![
+                validated.machine_id,
+                committed_at,
+                validated.sync_run.finished_at,
+                validated.sync_run.collector_version,
+                validated.protocol_version,
+            ],
         )
         .map_err(HubError::internal)?;
 
@@ -574,7 +615,7 @@ impl HubRepository {
             params![
                 validated.machine_id,
                 validated.batch_id,
-                SUPPORTED_PROTOCOL_VERSION,
+                validated.protocol_version,
                 auth.credential_id,
                 validated.request_fingerprint,
                 validated.events.len() as u64,
@@ -608,16 +649,70 @@ impl HubRepository {
     ) -> Result<IssueCollectorCommandResponse, HubError> {
         let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
         let command_id = validate_identifier(request.command.command_id(), "command_id")?;
-        if let OwnerCommand::RotateCredential { rotation_id, .. } = &request.command {
-            validate_identifier(rotation_id, "rotation_id")?;
+        match &request.command {
+            OwnerCommand::RotateCredential { rotation_id, .. } => {
+                validate_identifier(rotation_id, "rotation_id")?;
+            }
+            OwnerCommand::ApprovedUpdate {
+                version, sha256, ..
+            } => {
+                if version.is_empty()
+                    || !version.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+                    })
+                    || sha256.len() != 64
+                    || !sha256
+                        .chars()
+                        .all(|character| character.is_ascii_hexdigit())
+                {
+                    return Err(HubError::unprocessable(
+                        "invalid-approved-update",
+                        "Collector updates require a safe version and SHA-256 digest",
+                    ));
+                }
+            }
+            OwnerCommand::Refresh { .. }
+            | OwnerCommand::Repair { .. }
+            | OwnerCommand::Diagnostics { .. } => {}
         }
         let command = serde_json::to_value(&request.command).map_err(HubError::internal)?;
         validate_command_has_no_secret(&command)?;
         let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
         let now = now_utc();
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
-        let conn = self.db.connection().map_err(HubError::internal)?;
-        let existing = conn
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let machine: Option<(Option<String>, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT revoked_at, archived_at, state_revision FROM machines WHERE machine_id = ?1",
+                params![machine_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((revoked_at, archived_at, state_revision)) = machine else {
+            return Err(HubError::not_found(
+                "machine-not-found",
+                "Collector command target Machine was not found",
+            ));
+        };
+        if revoked_at.is_some() || archived_at.is_some() {
+            return Err(HubError::conflict(
+                "machine-archived",
+                "archived Machines cannot receive Collector commands",
+            ));
+        }
+        if let Some(expected) = request.expected_state_revision {
+            if expected != state_revision {
+                return Err(HubError::conflict(
+                    "machine-state-conflict",
+                    "Machine state changed; reload before issuing this action",
+                ));
+            }
+        }
+        let existing = tx
             .query_row(
                 "SELECT machine_id, command_json FROM collector_commands WHERE command_id = ?1",
                 params![command_id],
@@ -635,12 +730,13 @@ impl HubRepository {
                     "command_id is already bound to a different machine or command",
                 ));
             }
+            tx.commit().map_err(HubError::internal)?;
             return Ok(IssueCollectorCommandResponse {
                 command_id,
                 machine_id,
             });
         }
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO collector_commands(command_id, machine_id, command_json, created_at)
             VALUES (?1, ?2, ?3, ?4)
@@ -648,6 +744,19 @@ impl HubRepository {
             params![command_id, machine_id, command_json, now],
         )
         .map_err(HubError::internal)?;
+        let revision_changed = tx
+            .execute(
+                "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND state_revision = ?2 AND archived_at IS NULL",
+                params![machine_id, state_revision],
+            )
+            .map_err(HubError::internal)?;
+        if revision_changed == 0 {
+            return Err(HubError::conflict(
+                "machine-state-conflict",
+                "Machine lifecycle changed while issuing the Collector command",
+            ));
+        }
+        tx.commit().map_err(HubError::internal)?;
         // Keep a permit if the poller is between its immediate DB check and
         // registering the long-poll future; this closes the command wake race.
         self.command_notify.notify_one();
@@ -666,6 +775,19 @@ impl HubRepository {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(HubError::internal)?;
+        let active_machine: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM machines WHERE machine_id = ?1 AND revoked_at IS NULL AND archived_at IS NULL)",
+                params![auth.machine_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if !active_machine {
+            return Err(HubError::unauthorized(
+                "collector-revoked",
+                "Collector credentials are revoked for this Machine",
+            ));
+        }
         let pending = tx
             .query_row(
                 r#"
@@ -704,6 +826,11 @@ impl HubRepository {
         let command_id = validate_identifier(&request.command_id, "command_id")?;
         validate_ack_result_has_no_secret(&request.result)?;
         let result_json = serde_json::to_string(&request.result).map_err(HubError::internal)?;
+        let diagnostics_result = request
+            .result
+            .get("Diagnostics")
+            .or_else(|| request.result.get("diagnostics"))
+            .cloned();
         let write_guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let conn = self.db.connection().map_err(HubError::internal)?;
         let existing = conn
@@ -759,6 +886,9 @@ impl HubRepository {
         .map_err(HubError::internal)?;
         drop(conn);
         drop(write_guard);
+        if let Some(diagnostics) = diagnostics_result {
+            self.record_collector_diagnostics(&auth.machine_id, &diagnostics)?;
+        }
         self.prove_collector_credential(auth)?;
         Ok(())
     }

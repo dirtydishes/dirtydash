@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "test:contract": "node tests/machines-contract.test.mjs",
     "dev": "vite --host 127.0.0.1"
   },
   "dependencies": {

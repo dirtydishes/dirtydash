@@ -766,7 +766,7 @@ async fn collector_credential_rotation_and_revocation_work() {
     let second = rotate_credential(&app, &cookie, &csrf).await;
     assert_ne!(first.credential_id, second.credential_id);
 
-    let initial = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let initial = ingest_request(API_V1_PROTOCOL_VERSION);
     // The old token remains usable during the overlap window.
     let first_overlap = ingest(&app, &first.token, &initial).await;
     assert_eq!(first_overlap.status(), StatusCode::OK);
@@ -862,7 +862,7 @@ async fn collector_rotation_uses_non_secret_instruction_and_secret_free_hub_pers
     assert_eq!(activate_retry.status(), StatusCode::OK);
 
     let replacement_token = format!("ddcol_{rotation_id}.{replacement_secret}");
-    let mut overlap_request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut overlap_request = ingest_request(API_V1_PROTOCOL_VERSION);
     overlap_request.batch_id = "rotation-overlap".to_string();
     overlap_request.sync_run.sync_run_id = "rotation-overlap-sync".to_string();
     assert_eq!(
@@ -926,7 +926,7 @@ async fn collector_rotation_uses_non_secret_instruction_and_secret_free_hub_pers
         .unwrap();
     assert_eq!(proof_retry.status(), StatusCode::OK);
 
-    let mut old_request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut old_request = ingest_request(API_V1_PROTOCOL_VERSION);
     old_request.batch_id = "rotation-old".to_string();
     old_request.sync_run.sync_run_id = "rotation-old-sync".to_string();
     assert_eq!(
@@ -1099,7 +1099,7 @@ async fn duplicate_batches_and_retries_are_idempotent() {
     let app = test_app(repo.clone(), ListenerTrustMode::Public);
     let (cookie, csrf) = bootstrap_session(&app).await;
     let issued = rotate_credential(&app, &cookie, &csrf).await;
-    let request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let request = ingest_request(API_V1_PROTOCOL_VERSION);
 
     let first = ingest(&app, &issued.token, &request).await;
     assert_eq!(first.status(), StatusCode::OK);
@@ -1113,7 +1113,7 @@ async fn duplicate_batches_and_retries_are_idempotent() {
     assert_eq!(second_body.get("idempotent_replay").unwrap(), true);
     assert_eq!(second_body.get("skipped_events").unwrap(), 1);
 
-    let mut conflicting = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut conflicting = ingest_request(API_V1_PROTOCOL_VERSION);
     conflicting.events[0].total_tokens = 999;
     let conflict = ingest(&app, &issued.token, &conflicting).await;
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
@@ -1134,7 +1134,7 @@ async fn collector_pricing_mode_round_trips_reported_and_codex_priority() {
     let (cookie, csrf) = bootstrap_session(&app).await;
     let issued = rotate_credential(&app, &cookie, &csrf).await;
 
-    let mut reported = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut reported = ingest_request(API_V1_PROTOCOL_VERSION);
     reported.batch_id = "batch-reported".to_string();
     reported.sync_run.sync_run_id = "sync-reported".to_string();
     reported.events[0].collector_event_fingerprint = "fingerprint-reported".to_string();
@@ -1145,7 +1145,7 @@ async fn collector_pricing_mode_round_trips_reported_and_codex_priority() {
         StatusCode::OK
     );
 
-    let mut priority = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut priority = ingest_request(API_V1_PROTOCOL_VERSION);
     priority.batch_id = "batch-priority".to_string();
     priority.sync_run.sync_run_id = "sync-priority".to_string();
     priority.events[0].collector_event_fingerprint = "fingerprint-priority".to_string();
@@ -1270,7 +1270,7 @@ async fn partial_batch_failures_roll_back_everything() {
     let app = test_app(repo.clone(), ListenerTrustMode::Public);
     let (cookie, csrf) = bootstrap_session(&app).await;
     let issued = rotate_credential(&app, &cookie, &csrf).await;
-    let mut request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut request = ingest_request(API_V1_PROTOCOL_VERSION);
     request.events.push(CollectorUsageEvent {
         project_key: "/private/path".to_string(),
         collector_event_fingerprint: "fingerprint-2".to_string(),
@@ -1370,7 +1370,7 @@ async fn display_identifiers_and_checkpoints_reject_prompt_like_content() {
     let body = json_response(response).await;
     assert_eq!(body.get("code").unwrap(), "invalid-display-identifier");
 
-    let mut event_request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut event_request = ingest_request(API_V1_PROTOCOL_VERSION);
     event_request.batch_id = "batch-prompt-event".to_string();
     event_request.sync_run.sync_run_id = "sync-prompt-event".to_string();
     event_request.events[0].session_key = "ignore previous instructions".to_string();
@@ -1410,7 +1410,7 @@ fn final_insert_sqlite_failure_rolls_back_every_batch_table() {
         .unwrap();
     repo.inject_final_insert_failure();
     let error = repo
-        .ingest_batch(&auth, ingest_request(SUPPORTED_PROTOCOL_VERSION))
+        .ingest_batch(&auth, ingest_request(API_V1_PROTOCOL_VERSION))
         .unwrap_err();
     assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(error.message, "the Hub could not complete the request");
@@ -1466,7 +1466,7 @@ fn independently_constructed_repositories_race_same_batch_idempotently() {
     let repo_b = HubRepository::new(db.clone());
     let auth_a = repo_a.authenticate_collector_bearer(&issued.token).unwrap();
     let auth_b = repo_b.authenticate_collector_bearer(&issued.token).unwrap();
-    let batch_a = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let batch_a = ingest_request(API_V1_PROTOCOL_VERSION);
     let batch_b = batch_a.clone();
     let handle_a = std::thread::spawn(move || repo_a.ingest_batch(&auth_a, batch_a));
     let handle_b = std::thread::spawn(move || repo_b.ingest_batch(&auth_b, batch_b));
@@ -1513,7 +1513,7 @@ async fn non_utc_rfc3339_input_is_normalized_before_persistence() {
     let app = test_app(repo.clone(), ListenerTrustMode::Public);
     let (cookie, csrf) = bootstrap_session(&app).await;
     let issued = rotate_credential(&app, &cookie, &csrf).await;
-    let mut request = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let mut request = ingest_request(API_V1_PROTOCOL_VERSION);
     request.sync_run.started_at = "2026-03-09T01:59:00-08:00".to_string();
     request.sync_run.finished_at = "2026-03-09T02:01:00-08:00".to_string();
     request.events[0].occurred_at = "2026-03-09T01:59:30-08:00".to_string();
@@ -2022,8 +2022,8 @@ fn concurrent_collectors_share_wal_database_without_duplicates() {
     let auth_a = repo_a.authenticate_collector_bearer(&issued.token).unwrap();
     let auth_b = repo_b.authenticate_collector_bearer(&issued.token).unwrap();
 
-    let batch_a = ingest_request(SUPPORTED_PROTOCOL_VERSION);
-    let mut batch_b = ingest_request(SUPPORTED_PROTOCOL_VERSION);
+    let batch_a = ingest_request(API_V1_PROTOCOL_VERSION);
+    let mut batch_b = ingest_request(API_V1_PROTOCOL_VERSION);
     batch_b.batch_id = "batch-2".to_string();
     batch_b.events[0].collector_event_fingerprint = "fingerprint-2".to_string();
     batch_b.events[0].session_key = "session-beta".to_string();
@@ -2396,4 +2396,531 @@ async fn duplicate_trusted_headers_are_rejected_not_merged() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[test]
+fn machine_health_is_derived_from_observations_and_protocol_window() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    fn base<'a>(last_seen: Option<&'a str>) -> MachineHealthInput<'a> {
+        MachineHealthInput {
+            archived: false,
+            last_seen_at: last_seen,
+            last_sync_at: last_seen,
+            pending_action: false,
+            diagnostics_action_required: false,
+            credentials_active: 1,
+            protocol: ProtocolCompatibility::Current,
+            desired_version: None,
+            current_version: Some("1.0.0"),
+        }
+    }
+    assert_eq!(
+        derive_machine_health(base(Some("2026-07-15T11:59:00Z")), now),
+        MachineHealth::Online
+    );
+    assert_eq!(
+        derive_machine_health(
+            MachineHealthInput {
+                pending_action: true,
+                ..base(Some("2026-07-15T11:59:00Z"))
+            },
+            now
+        ),
+        MachineHealth::Syncing
+    );
+    assert_eq!(
+        derive_machine_health(base(Some("2026-07-15T11:50:00Z")), now),
+        MachineHealth::Stale
+    );
+    assert_eq!(
+        derive_machine_health(base(Some("2026-07-15T10:00:00Z")), now),
+        MachineHealth::Offline
+    );
+    assert_eq!(
+        derive_machine_health(
+            MachineHealthInput {
+                desired_version: Some("2.0.0"),
+                ..base(Some("2026-07-15T11:59:00Z"))
+            },
+            now
+        ),
+        MachineHealth::UpdateAvailable
+    );
+    assert_eq!(
+        derive_machine_health(
+            MachineHealthInput {
+                protocol: ProtocolCompatibility::Previous,
+                ..base(Some("2026-07-15T11:59:00Z"))
+            },
+            now
+        ),
+        MachineHealth::Online
+    );
+    assert_eq!(
+        derive_machine_health(
+            MachineHealthInput {
+                protocol: ProtocolCompatibility::Unsupported,
+                ..base(Some("2026-07-15T11:59:00Z"))
+            },
+            now
+        ),
+        MachineHealth::ActionRequired
+    );
+}
+
+#[test]
+fn archived_machine_retains_history_but_cannot_rotate_and_delete_is_typed() {
+    let repo = test_repo();
+    repo.bootstrap_owner(BootstrapOwnerRequest {
+        username: "owner".to_string(),
+        password: "correct horse battery staple".to_string(),
+        time_zone: "UTC".to_string(),
+        tailscale_identity: None,
+    })
+    .unwrap();
+    let issued = repo
+        .rotate_collector_credential(RotateCollectorCredentialRequest {
+            machine_id: "machine-archive".to_string(),
+            display_name: "Archive Test".to_string(),
+            credential_label: "default".to_string(),
+        })
+        .unwrap();
+    let auth = repo.authenticate_collector_bearer(&issued.token).unwrap();
+    let mut archive_request = ingest_request(API_V1_PROTOCOL_VERSION);
+    archive_request.machine_id = "machine-archive".to_string();
+    archive_request.batch_id = "archive-batch".to_string();
+    archive_request.sync_run.sync_run_id = "archive-sync".to_string();
+    repo.ingest_batch(&auth, archive_request).unwrap();
+    let machine = repo.machine("machine-archive").unwrap();
+    let archived = repo
+        .archive_machine(
+            "machine-archive",
+            MachineLifecycleRequest {
+                expected_state_revision: machine.state_revision,
+                display_name: "Archive Test".to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(archived.lifecycle, MachineLifecycle::Archived);
+    assert_eq!(archived.usage_event_count, 1);
+    assert_eq!(archived.credentials_total, 1);
+    assert_eq!(archived.credentials_active, 0);
+    assert!(matches!(
+        repo.rotate_collector_credential(RotateCollectorCredentialRequest {
+            machine_id: "machine-archive".to_string(),
+            display_name: "Archive Test".to_string(),
+            credential_label: "default".to_string(),
+        }),
+        Err(error) if error.code == "machine-archived"
+    ));
+    assert!(matches!(
+        repo.permanent_delete_machine(
+            "machine-archive",
+            PermanentDeleteMachineRequest {
+                expected_state_revision: archived.state_revision,
+                display_name: "Archive Test".to_string(),
+                confirmation: "Archive Test".to_string(),
+            }
+        ),
+        Err(error) if error.code == "typed-confirmation-required"
+    ));
+    repo.permanent_delete_machine(
+        "machine-archive",
+        PermanentDeleteMachineRequest {
+            expected_state_revision: archived.state_revision,
+            display_name: "Archive Test".to_string(),
+            confirmation: "DELETE Archive Test".to_string(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        repo.machine("machine-archive"),
+        Err(error) if error.code == "machine-not-found"
+    ));
+}
+
+#[test]
+fn previous_protocol_is_accepted_and_latest_protocol_is_recorded() {
+    let repo = test_repo();
+    repo.bootstrap_owner(BootstrapOwnerRequest {
+        username: "owner".to_string(),
+        password: "correct horse battery staple".to_string(),
+        time_zone: "UTC".to_string(),
+        tailscale_identity: None,
+    })
+    .unwrap();
+    let issued = repo
+        .rotate_collector_credential(RotateCollectorCredentialRequest {
+            machine_id: "machine-previous".to_string(),
+            display_name: "Previous Protocol".to_string(),
+            credential_label: "default".to_string(),
+        })
+        .unwrap();
+    let auth = repo.authenticate_collector_bearer(&issued.token).unwrap();
+    let mut previous_request = ingest_request(API_PREVIOUS_PROTOCOL_VERSION);
+    previous_request.machine_id = "machine-previous".to_string();
+    previous_request.batch_id = "previous-batch".to_string();
+    previous_request.sync_run.sync_run_id = "previous-sync".to_string();
+    let response = repo.ingest_batch(&auth, previous_request);
+    assert!(response.is_ok());
+    let machine = repo.machine("machine-previous").unwrap();
+    assert_eq!(
+        machine.collector_protocol_version,
+        Some(API_PREVIOUS_PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        machine.protocol_compatibility,
+        ProtocolCompatibility::Previous
+    );
+    assert!(repo.ingest_batch(&auth, ingest_request(2)).is_err());
+}
+
+fn update_evidence() -> FleetUpdateEvidence {
+    FleetUpdateEvidence {
+        version: "2.0.0".to_string(),
+        artifact_sha256: "a".repeat(64),
+        publisher_key_id: "release-key".to_string(),
+        publisher_fingerprint: format!("sha256:{}", "b".repeat(64)),
+        manifest_sha256: "c".repeat(64),
+        signature_verified: true,
+    }
+}
+
+#[test]
+fn fleet_update_requires_hub_gate_and_isolates_collector_failure() {
+    let repo = test_repo();
+    repo.bootstrap_owner(BootstrapOwnerRequest {
+        username: "owner".to_string(),
+        password: "correct horse battery staple".to_string(),
+        time_zone: "UTC".to_string(),
+        tailscale_identity: None,
+    })
+    .unwrap();
+    let mut credentials = Vec::new();
+    for machine_id in ["machine-update-a", "machine-update-b"] {
+        let issued = repo
+            .rotate_collector_credential(RotateCollectorCredentialRequest {
+                machine_id: machine_id.to_string(),
+                display_name: machine_id.to_string(),
+                credential_label: "default".to_string(),
+            })
+            .unwrap();
+        let auth = repo.authenticate_collector_bearer(&issued.token).unwrap();
+        let mut request = ingest_request(API_V1_PROTOCOL_VERSION);
+        request.machine_id = machine_id.to_string();
+        request.batch_id = format!("batch-{machine_id}");
+        request.sync_run.sync_run_id = format!("sync-{machine_id}");
+        repo.ingest_batch(&auth, request).unwrap();
+        credentials.push(issued);
+    }
+    let evidence = update_evidence();
+    let update = repo
+        .create_fleet_update(FleetUpdateRequest {
+            version: evidence.version.clone(),
+            artifact_sha256: evidence.artifact_sha256.clone(),
+            publisher_key_id: evidence.publisher_key_id.clone(),
+            publisher_fingerprint: evidence.publisher_fingerprint.clone(),
+            manifest_sha256: evidence.manifest_sha256.clone(),
+            signed_manifest: None,
+            machine_ids: vec![
+                "machine-update-a".to_string(),
+                "machine-update-b".to_string(),
+            ],
+        })
+        .unwrap()
+        .update;
+    assert!(repo
+        .start_collector_update(&update.update_id, "machine-update-a")
+        .is_err());
+    let snapshot = repo
+        .record_hub_snapshot(&update.update_id, &evidence)
+        .unwrap();
+    let after_hub = repo
+        .record_hub_health(
+            &update.update_id,
+            FleetHubHealthRequest {
+                expected_state_revision: snapshot.state_revision,
+                healthy: true,
+                restarted: true,
+                health_checked: true,
+                hub_version: evidence.version.clone(),
+                evidence: evidence.clone(),
+                failure_reason: None,
+            },
+        )
+        .unwrap();
+    let action_a = repo
+        .start_collector_update(&update.update_id, "machine-update-a")
+        .unwrap();
+    let action_b = repo
+        .start_collector_update(&update.update_id, "machine-update-b")
+        .unwrap();
+    let current = repo.fleet_update(&update.update_id).unwrap();
+    let node_a = current
+        .nodes
+        .iter()
+        .find(|node| node.machine_id == "machine-update-a")
+        .unwrap();
+    let node_b = current
+        .nodes
+        .iter()
+        .find(|node| node.machine_id == "machine-update-b")
+        .unwrap();
+    let completed_a = repo
+        .complete_collector_update(
+            &update.update_id,
+            "machine-update-a",
+            FleetUpdateNodeCompletion {
+                expected_state_revision: node_a.state_revision,
+                collector_version: evidence.version.clone(),
+                protocol_version: API_V1_PROTOCOL_VERSION,
+                restarted: true,
+                health_checked: true,
+                signed_evidence: evidence.clone(),
+                failure_reason: None,
+            },
+        )
+        .unwrap();
+    let completed = repo
+        .complete_collector_update(
+            &update.update_id,
+            "machine-update-b",
+            FleetUpdateNodeCompletion {
+                expected_state_revision: node_b.state_revision,
+                collector_version: "1.0.0".to_string(),
+                protocol_version: API_V1_PROTOCOL_VERSION,
+                restarted: false,
+                health_checked: false,
+                signed_evidence: evidence,
+                failure_reason: Some("collector restart failed".to_string()),
+            },
+        )
+        .unwrap();
+    assert_eq!(completed_a.status, "collectors-queued");
+    assert_eq!(completed.status, "completed-with-failures");
+    assert_eq!(
+        completed
+            .nodes
+            .iter()
+            .filter(|node| node.status == "succeeded")
+            .count(),
+        1
+    );
+    assert_eq!(
+        completed
+            .nodes
+            .iter()
+            .filter(|node| node.status == "rolled-back")
+            .count(),
+        1
+    );
+    assert_ne!(action_a.command_id, action_b.command_id);
+    assert_eq!(after_hub.status, "collectors-queued");
+    let _ = credentials;
+}
+
+#[derive(Default)]
+struct OrderedFleetExecutor {
+    events: Vec<String>,
+    failed_machine: Option<String>,
+}
+
+impl FleetUpdateExecutor for OrderedFleetExecutor {
+    fn snapshot_hub(&mut self, _: &FleetUpdateEvidence) -> anyhow::Result<()> {
+        self.events.push("hub-snapshot".to_string());
+        Ok(())
+    }
+    fn update_hub(&mut self, _: &FleetUpdateEvidence) -> anyhow::Result<()> {
+        self.events.push("hub-update".to_string());
+        Ok(())
+    }
+    fn health_check_hub(&mut self, _: &FleetUpdateEvidence) -> anyhow::Result<()> {
+        self.events.push("hub-health".to_string());
+        Ok(())
+    }
+    fn snapshot_collector(&mut self, machine_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+        self.events.push(format!("snapshot-{machine_id}"));
+        Ok(())
+    }
+    fn update_collector(
+        &mut self,
+        machine_id: &str,
+        _: &FleetUpdateEvidence,
+    ) -> anyhow::Result<()> {
+        self.events.push(format!("update-{machine_id}"));
+        Ok(())
+    }
+    fn restart_and_health_check_collector(
+        &mut self,
+        machine_id: &str,
+        _: &str,
+        _: &FleetUpdateEvidence,
+    ) -> anyhow::Result<()> {
+        self.events.push(format!("health-{machine_id}"));
+        if self.failed_machine.as_deref() == Some(machine_id) {
+            anyhow::bail!("health failed")
+        }
+        Ok(())
+    }
+    fn rollback_collector(&mut self, machine_id: &str, _: Option<&str>) -> anyhow::Result<()> {
+        self.events.push(format!("rollback-{machine_id}"));
+        Ok(())
+    }
+}
+
+#[test]
+fn fleet_coordinator_snapshots_hub_first_and_rolls_back_one_node_only() {
+    let evidence = update_evidence();
+    let mut coordinator = FleetUpdateCoordinator::new(OrderedFleetExecutor {
+        failed_machine: Some("machine-b".to_string()),
+        ..Default::default()
+    });
+    let report = coordinator
+        .execute_for_test(
+            &evidence,
+            "2.0.0",
+            &[
+                FleetUpdateRequestNode {
+                    machine_id: "machine-a".to_string(),
+                    previous_version: Some("1.0.0".to_string()),
+                },
+                FleetUpdateRequestNode {
+                    machine_id: "machine-b".to_string(),
+                    previous_version: Some("1.0.0".to_string()),
+                },
+            ],
+        )
+        .unwrap();
+    assert!(report.hub_healthy);
+    assert_eq!(report.collectors[0].status, "succeeded");
+    assert_eq!(report.collectors[1].status, "rolled-back");
+    assert_eq!(
+        coordinator.executor().events,
+        vec![
+            "hub-snapshot",
+            "hub-update",
+            "hub-health",
+            "snapshot-machine-a",
+            "update-machine-a",
+            "health-machine-a",
+            "snapshot-machine-b",
+            "update-machine-b",
+            "health-machine-b",
+            "rollback-machine-b"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn hosted_machines_and_enrollment_resources_require_owner_session_and_csrf() {
+    let repo = test_repo();
+    let app = test_app(repo, ListenerTrustMode::Public);
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/machines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let (cookie, csrf) = bootstrap_session(&app).await;
+    let csrf_refresh = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/session/csrf")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(csrf_refresh.status(), StatusCode::OK);
+    let refreshed_csrf = json_response(csrf_refresh).await["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let machines = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/machines")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(machines.status(), StatusCode::OK);
+    assert_eq!(json_response(machines).await, json!([]));
+    let csrf_required = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/collector-commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from(
+                    json!({
+                        "machine_id": "missing-machine",
+                        "command": {"type": "refresh", "command_id": "missing-refresh"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(csrf_required.status(), StatusCode::FORBIDDEN);
+    let enrollment = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/enrollment")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header(OWNER_CSRF_HEADER, &refreshed_csrf)
+                .body(Body::from(
+                    json!({
+                        "id": "draft-workstation",
+                        "machine_id": "machine-workstation",
+                        "display_name": "Workstation",
+                        "connection": {"kind": "alias", "alias": "workstation"},
+                        "auth": "password"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enrollment.status(), StatusCode::OK);
+    let enrollment_body = json_response(enrollment).await;
+    assert_eq!(enrollment_body["state"], "target-draft");
+    assert_eq!(enrollment_body["machine_id"], "machine-workstation");
+    let drafts = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/enrollment")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drafts.status(), StatusCode::OK);
+    assert_eq!(json_response(drafts).await.as_array().unwrap().len(), 1);
+    let _ = csrf;
 }

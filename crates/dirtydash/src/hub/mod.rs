@@ -14,6 +14,7 @@ pub use crate::pricing::PricingMode;
 
 mod auth;
 mod errors;
+mod fleet;
 mod ingestion;
 mod protocol;
 mod repository;
@@ -21,6 +22,14 @@ mod router;
 #[cfg(test)]
 mod tests;
 
+pub use fleet::{
+    derive_machine_health, CollectorCompatibility, FleetHubHealthRequest, FleetUpdateCoordinator,
+    FleetUpdateEvidence, FleetUpdateExecutor, FleetUpdateNodeCompletion, FleetUpdateNodeResult,
+    FleetUpdatePlanResponse, FleetUpdateReport, FleetUpdateRequest, FleetUpdateRequestNode,
+    FleetUpdateRun, FleetUpdateSnapshotResponse, MachineActionResponse, MachineHealth,
+    MachineHealthInput, MachineLifecycle, MachineLifecycleRequest, MachineRecord, MachineStatus,
+    PermanentDeleteMachineRequest, ProtocolCompatibility,
+};
 pub use router::{
     build_router, build_router_with_config, build_router_with_config_and_connect_info,
 };
@@ -83,8 +92,10 @@ const OWNER_CSRF_HEADER: &str = "x-csrf-token";
 const BOOTSTRAP_SETUP_TOKEN_HEADER: &str = "x-dirtydash-setup-token";
 const TAILSCALE_USER_LOGIN: &str = "tailscale-user-login";
 pub const API_V1_PROTOCOL_VERSION: u32 = 1;
-// Internal compatibility alias for the Phase 2 test/repository code.
-const SUPPORTED_PROTOCOL_VERSION: u32 = API_V1_PROTOCOL_VERSION;
+/// The one previous wire version retained for staged Collector rollouts.
+pub const API_PREVIOUS_PROTOCOL_VERSION: u32 = 0;
+pub const SUPPORTED_PROTOCOL_VERSIONS: [u32; 2] =
+    [API_V1_PROTOCOL_VERSION, API_PREVIOUS_PROTOCOL_VERSION];
 const OWNER_SESSION_TTL_SECONDS: i64 = 60 * 60 * 12;
 const DEFAULT_CREDENTIAL_LABEL: &str = "default";
 
@@ -242,6 +253,7 @@ pub struct HubRouterConfig {
     trusted_proxy: Option<TrustedProxyConfig>,
     bootstrap_boundary: BootstrapBoundary,
     bootstrap_setup_token: Option<String>,
+    publisher_policy: Option<crate::deployment::PublisherTrustPolicy>,
 }
 
 impl std::fmt::Debug for HubRouterConfig {
@@ -257,8 +269,21 @@ impl std::fmt::Debug for HubRouterConfig {
                 "bootstrap_setup_token",
                 &self.bootstrap_setup_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "publisher_policy_configured",
+                &self.publisher_policy.is_some(),
+            )
             .finish()
     }
+}
+
+fn publisher_policy_from_config(
+    config: &crate::config::HubConfig,
+) -> Option<crate::deployment::PublisherTrustPolicy> {
+    let key_id = config.allowed_publisher_key_id.as_deref()?;
+    let fingerprint = config.allowed_publisher_fingerprint.as_deref()?;
+    let public_key = hex::decode(config.allowed_publisher_public_key.as_deref()?).ok()?;
+    crate::deployment::PublisherTrustPolicy::new(key_id, fingerprint, &public_key).ok()
 }
 
 impl HubRouterConfig {
@@ -279,6 +304,7 @@ impl HubRouterConfig {
                 | ListenerTrustMode::TrustedProxy => BootstrapBoundary::Disabled,
             },
             bootstrap_setup_token: None,
+            publisher_policy: None,
         }
     }
 
@@ -316,6 +342,14 @@ impl HubRouterConfig {
         self.trusted_proxy = Some(trusted_proxy);
         self.trust_mode = ListenerTrustMode::TrustedProxy;
         self.cookie_transport = CookieTransportSecurity::Secure;
+        self
+    }
+
+    pub fn with_publisher_policy(
+        mut self,
+        publisher_policy: crate::deployment::PublisherTrustPolicy,
+    ) -> Self {
+        self.publisher_policy = Some(publisher_policy);
         self
     }
 
@@ -370,6 +404,7 @@ impl HubRouterConfig {
         if let Some(setup_token) = &config.bootstrap_setup_token {
             router_config = router_config.with_bootstrap_setup_token(setup_token.clone());
         }
+        router_config.publisher_policy = publisher_policy_from_config(config);
         router_config
     }
 }
@@ -378,6 +413,8 @@ impl HubRouterConfig {
 struct HubState {
     repo: HubRepository,
     config: HubRouterConfig,
+    enrollment_root: PathBuf,
+    known_hosts_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -511,6 +548,9 @@ pub enum OwnerCommand {
     Refresh {
         command_id: String,
     },
+    Repair {
+        command_id: String,
+    },
     RotateCredential {
         command_id: String,
         rotation_id: String,
@@ -529,6 +569,7 @@ impl OwnerCommand {
     pub fn command_id(&self) -> &str {
         match self {
             Self::Refresh { command_id }
+            | Self::Repair { command_id }
             | Self::RotateCredential { command_id, .. }
             | Self::Diagnostics { command_id }
             | Self::ApprovedUpdate { command_id, .. } => command_id,
@@ -574,6 +615,8 @@ pub struct CollectorCredentialRotationResponse {
 pub struct IssueCollectorCommandRequest {
     pub machine_id: String,
     pub command: OwnerCommand,
+    #[serde(default)]
+    pub expected_state_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -676,6 +719,7 @@ pub(crate) struct IssuedCollectorCredential {
 pub(crate) struct ValidatedIngestBatch {
     batch_id: String,
     machine_id: String,
+    protocol_version: u32,
     sync_run: ValidatedSyncRun,
     source_manifests: Vec<ValidatedSourceManifest>,
     checkpoints: Vec<ValidatedCheckpoint>,

@@ -8,9 +8,11 @@ The fleet deployment path is separate from the historical Docker/Nginx helper be
 [hub]
 allowed_publisher_key_id = "release-key-2026"
 allowed_publisher_fingerprint = "sha256:<64 lowercase hexadecimal characters>"
+# Required by hosted Hub enrollment and fleet-update APIs.
+allowed_publisher_public_key = "<32-byte Ed25519 public key as 64 hexadecimal characters>"
 ```
 
-If either value is absent, deployment fails closed. The manifest and public-key files are release evidence only; replacing either file, or supplying replacement publisher flags, cannot authorize a different publisher.
+If either trust-anchor value is absent, deployment fails closed; hosted enrollment and fleet-update APIs additionally require the pinned public key. The manifest and public-key files are release evidence only; replacing either file, or supplying replacement publisher flags, cannot authorize a different publisher.
 
 Run the concrete read-only probe first. It resolves the target with `ssh -G`, observes the effective host key, verifies the pinned publisher, probes target facts, and persists a secret-free plan/checkpoint:
 

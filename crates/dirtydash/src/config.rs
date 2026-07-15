@@ -45,6 +45,10 @@ pub struct HubConfig {
     pub allowed_publisher_key_id: Option<String>,
     #[serde(default)]
     pub allowed_publisher_fingerprint: Option<String>,
+    /// Hex-encoded Ed25519 publisher key used by hosted enrollment and fleet updates.
+    /// It is public trust material, never a signing secret.
+    #[serde(default)]
+    pub allowed_publisher_public_key: Option<String>,
     /// One-time setup secret for bootstrap when the local setup route is not available.
     ///
     /// This value is loaded from [`SecretStore`].  It is deliberately skipped
@@ -79,8 +83,11 @@ impl HubConfig {
         if let Some(proxy) = &self.trusted_proxy {
             proxy.validate()?;
         }
-        if self.allowed_publisher_key_id.is_some() != self.allowed_publisher_fingerprint.is_some() {
-            bail!("publisher allowlist requires both key ID and fingerprint");
+        if self.allowed_publisher_key_id.is_some() != self.allowed_publisher_fingerprint.is_some()
+            || (self.allowed_publisher_public_key.is_some()
+                && self.allowed_publisher_key_id.is_none())
+        {
+            bail!("publisher allowlist requires a key ID and fingerprint; public key is required for hosted signed operations");
         }
         if self
             .allowed_publisher_key_id
@@ -92,6 +99,20 @@ impl HubConfig {
                 .is_some_and(|value| value.trim().is_empty())
         {
             bail!("publisher allowlist values cannot be empty");
+        }
+        if let Some(public_key) = &self.allowed_publisher_public_key {
+            let bytes =
+                hex::decode(public_key).context("publisher public key must be hexadecimal")?;
+            let key_id = self
+                .allowed_publisher_key_id
+                .as_deref()
+                .context("publisher public key requires a key ID")?;
+            let fingerprint = self
+                .allowed_publisher_fingerprint
+                .as_deref()
+                .context("publisher public key requires a fingerprint")?;
+            crate::deployment::PublisherTrustPolicy::new(key_id, fingerprint, &bytes)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
         Ok(())
     }
@@ -183,6 +204,10 @@ impl fmt::Debug for HubConfig {
             .field(
                 "allowed_publisher_fingerprint",
                 &self.allowed_publisher_fingerprint,
+            )
+            .field(
+                "allowed_publisher_public_key",
+                &self.allowed_publisher_public_key,
             )
             .field(
                 "bootstrap_setup_token",

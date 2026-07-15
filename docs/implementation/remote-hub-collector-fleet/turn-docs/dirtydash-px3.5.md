@@ -10,54 +10,96 @@ Owners can safely understand and operate Machine lifecycle, health, credentials,
 
 ## Orchestration Brief
 
-Not started. Record execution, checkout, callback, CI, and review ownership before broad work.
+```json
+{
+  "phase_issue_id": "dirtydash-px3.5",
+  "risk": "high",
+  "strategy": "sessions",
+  "implementation_owner": "one durable Luna-max Pi implementation session bound to lavender/remote-hub-collector-fleet-5-fleet",
+  "review_independence": "a separate fresh Luna-max Pi thermo-nuclear review session after implementation ownership returns",
+  "delegation_plan": [
+    "Sol-low read-only pi-subagents scouts inventory fleet lifecycle/update backend seams and existing dashboard interaction/design-system seams",
+    "the durable implementation session applies frontend-design and impeccable product-register guidance and owns all backend/frontend/test mutations plus one PR",
+    "fresh review receives separate Sol-low security/correctness and accessibility/UX evidence; bounded fixes return to one mutable owner"
+  ],
+  "model_and_effort_rationale": "Machine lifecycle/destructive semantics, rolling updates, credential controls, and a dense accessible administrative UI justify Luna max for implementation/review; bounded scouts use Sol low.",
+  "required_evidence": [
+    "hosted UI completes the Phase 4 Hub-side SSH enrollment flow",
+    "explicit text+icon Machine states and compatibility status",
+    "distinct refresh, rotate, repair, archive, typed-confirm deletion semantics",
+    "snapshot-first Hub update then per-Collector update with independent rollback",
+    "current+previous protocol compatibility tests",
+    "keyboard, responsive desktop/tablet, reduced-motion, contrast and non-color status evidence",
+    "cargo and dashboard gates, independent review, terminal CI state"
+  ],
+  "user_constraints": [
+    "separate implementation and review sessions",
+    "parent-mediated Sol-low pi-subagents scouts",
+    "merge the phase PR into lavender/remote-hub-collector-fleet-implementation before advancing"
+  ]
+}
+```
+
+The implementation session is sole mutable owner. The coordinator owns Beads, integration, CI, and callbacks. The Machines UI must preserve Dirtydash's calm, dense, terminal-native product register rather than introducing generic SaaS cards.
 
 ## Adaptations
 
-None.
+- The phase PR targets the integration branch rather than `main`.
+- Administrative actions require tablet/desktop affordances; smaller screens may remain read-only rather than compressing destructive controls unsafely.
 
 ## Discoveries And Decisions
 
-None.
+- Machine state is derived from observation timestamps, pending commands, diagnostics, credentials, protocol compatibility, and desired/current Collector versions; it is not an opaque persisted health enum.
+- Archive/remove revokes credentials while retaining the Machine root and history. Permanent deletion is separate, requires exact `DELETE <display_name>` confirmation plus revision/name checks, and cascades inside one transaction.
+- Hosted enrollment reuses the Phase 4 `EnrollmentWorkflow`, `SshEnrollmentBackend`, managed known-hosts, and `DeploymentRunner` seams. Drafts persist sanitized state only; secrets remain request-scoped.
+- Fleet updates require an anchored Ed25519 signed manifest, persist Hub snapshot/update/health before Collector nodes, and record independent node receipts/rollback states. Only current and previous Collector protocols are accepted.
+- `.pi-subagents/` was removed before closeout; no mutable harness/session artifacts are part of the worktree.
 
 ## Implementation And Delegation Evidence
 
-Not started.
+The bound implementation checkout contains the Hub fleet repository/router, additive schema migration, Collector repair command, hosted enrollment endpoints, signed rollout persistence/coordinator, and Machines workspace. The dashboard uses native Tab order, tablist arrow/Home/End navigation, explicit icon-plus-text states, focus-visible styling, reduced-motion support, desktop/tablet action gating, and typed deletion confirmation. The focused contract test covers stepper/status/dialog/read-only/focus/reduced-motion vocabulary.
 
 ## Changed Behavior And Files
 
-None.
+- Backend: `crates/dirtydash/src/hub/fleet.rs`, `hub/router.rs`, `hub/repository.rs`, `hub/auth.rs`, `hub/mod.rs`, `hub/protocol.rs`, `db.rs`, `config.rs`, `enrollment.rs`, and `collector.rs`.
+- Frontend: `dashboard/src/machines.tsx`, `dashboard/src/main.tsx`, `dashboard/src/styles.css`, generated `dashboard/dist` assets, and `dashboard/tests/machines-contract.test.mjs`.
+- Documentation: this turn document and the existing phase loop-state handoff.
 
 ## Review
 
-Pending.
+No separate review session was run in this bounded checkout. Local correctness evidence is the full Rust test suite, strict Clippy, formatting/diff checks, dashboard production build, and Machines contract test listed below.
 
 ## CI And Gates
 
-Owner: unassigned
+Owner: implementation session
 
-State: unresolved
+State: local gates passed; remote CI pending after push
 
 Evidence:
 
-None.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo test --all-targets --all-features` passed: 115 unit/integration tests plus collector/CLI suites.
+- `npm --prefix dashboard run build` passed.
+- `npm --prefix dashboard run test:contract` passed: `Machines DOM/a11y contract: passed`.
+- `git diff --check` passed.
 
 ## PR And Commits
 
-None.
+Pending commit/push and one PR from `lavender/remote-hub-collector-fleet-5-fleet` into `lavender/remote-hub-collector-fleet-implementation`.
 
 ## Beads Updates And Follow-Ups
 
-Loop creation established the issue and dependency graph.
+Beads was not mutated in this child session. The parent coordinator retains issue status, review callbacks, integration merge, and any follow-up issue filing.
 
 ## Plan Amendments
 
-None.
+The implementation added a dedicated diagnostics action endpoint and an explicit signed-artifact coordinator entry point accepting only Deployment-verified artifacts; test-only evidence remains confined to Rust test builds.
 
 ## Context To Keep
 
-Archive and permanent deletion are deliberately separate operations.
+Archive and permanent deletion are deliberately separate operations. Hosted signed enrollment/update operations fail closed unless the Hub has the configured publisher public key, key ID, and fingerprint.
 
 ## Closeout
 
-Not started.
+Implementation and local validation are complete. Remove any generated/session artifacts before commit, push the branch, and create the single integration-targeted PR.

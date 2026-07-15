@@ -601,6 +601,7 @@ pub struct CollectorDiagnostics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CommandOutcome {
     Refreshed { batch_id: Option<String> },
+    Repaired { batch_id: Option<String> },
     CredentialRotationStaged,
     Diagnostics(CollectorDiagnostics),
     UpdateAccepted { version: String, sha256: String },
@@ -1596,6 +1597,14 @@ impl Collector {
             OwnerCommand::Refresh { .. } => {
                 let report = self.reconcile_manual(now)?;
                 Ok(CommandOutcome::Refreshed {
+                    batch_id: report.batch_id,
+                })
+            }
+            OwnerCommand::Repair { .. } => {
+                // Repair deliberately reuses the complete reconciliation path;
+                // it does not create a second SSH or parser state machine.
+                let report = self.reconcile_manual(now)?;
+                Ok(CommandOutcome::Repaired {
                     batch_id: report.batch_id,
                 })
             }

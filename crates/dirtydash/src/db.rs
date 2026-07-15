@@ -1334,7 +1334,16 @@ impl Database {
                 enrolled_at TEXT NOT NULL,
                 revoked_at TEXT,
                 last_seen_at TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                archived_at TEXT,
+                desired_version TEXT,
+                collector_version TEXT,
+                collector_protocol_version INTEGER,
+                last_sync_at TEXT,
+                diagnostics_json TEXT,
+                diagnostics_status TEXT,
+                diagnostics_at TEXT,
+                state_revision INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS collector_credentials (
@@ -1469,6 +1478,47 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_usage_events_ingest_batch
                 ON usage_events(ingest_batch_id);
 
+            CREATE TABLE IF NOT EXISTS fleet_update_runs (
+                update_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                artifact_sha256 TEXT NOT NULL,
+                publisher_key_id TEXT NOT NULL,
+                publisher_fingerprint TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                hub_snapshot_at TEXT,
+                hub_updated_at TEXT,
+                hub_health_at TEXT,
+                completed_at TEXT,
+                failure_reason TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                state_revision INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS fleet_update_nodes (
+                update_id TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                previous_version TEXT,
+                snapshot_at TEXT,
+                update_started_at TEXT,
+                restarted_at TEXT,
+                health_checked_at TEXT,
+                rolled_back_at TEXT,
+                failure_reason TEXT,
+                collector_protocol_version INTEGER,
+                evidence_json TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                state_revision INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(update_id, machine_id),
+                FOREIGN KEY(update_id) REFERENCES fleet_update_runs(update_id) ON DELETE CASCADE,
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_fleet_update_nodes_machine
+                ON fleet_update_nodes(machine_id, status);
+
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (2, datetime('now'));
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -1476,6 +1526,31 @@ impl Database {
             "#,
         )
         .context("applying hub schema migrations")?;
+        for (column, definition) in [
+            ("archived_at", "TEXT"),
+            ("desired_version", "TEXT"),
+            ("collector_version", "TEXT"),
+            ("collector_protocol_version", "INTEGER"),
+            ("last_sync_at", "TEXT"),
+            ("diagnostics_json", "TEXT"),
+            ("diagnostics_status", "TEXT"),
+            ("diagnostics_at", "TEXT"),
+            ("state_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            ensure_column(conn, "machines", column, definition)?;
+        }
+        ensure_column(
+            conn,
+            "fleet_update_runs",
+            "attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "fleet_update_nodes",
+            "attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -2387,6 +2462,19 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(columns)
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    if !table_columns(conn, table)?
+        .iter()
+        .any(|item| item == column)
+    {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn local_machine() -> String {

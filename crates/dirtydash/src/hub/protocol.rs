@@ -11,10 +11,10 @@ pub(crate) fn validate_ingest_batch(
     request: IngestBatchRequest,
     authenticated_machine_id: &str,
 ) -> Result<ValidatedIngestBatch, HubError> {
-    if request.protocol_version != SUPPORTED_PROTOCOL_VERSION {
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
         return Err(HubError::conflict(
             "incompatible-protocol-version",
-            "this Hub only accepts protocol_version=1 for /api/v1 requests",
+            "this Hub accepts only the current and previous Collector protocol versions",
         ));
     }
     let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
@@ -146,6 +146,7 @@ pub(crate) fn validate_ingest_batch(
     Ok(ValidatedIngestBatch {
         batch_id,
         machine_id,
+        protocol_version: request.protocol_version,
         sync_run,
         source_manifests,
         checkpoints,

@@ -330,7 +330,8 @@ impl HostKeyObservation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum HostKeyStatus {
     Unknown,
     Matching,
@@ -488,6 +489,10 @@ pub struct EnrollmentDraft {
     pub id: String,
     pub connection: ConnectionSpec,
     pub auth_method: PersistedAuthMethod,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub state: EnrollmentState,
     pub blocker: EnrollmentBlocker,
     pub host_fingerprint: Option<String>,
@@ -518,6 +523,8 @@ impl EnrollmentDraft {
             id,
             connection,
             auth_method: auth_method.persisted_reference(),
+            machine_id: None,
+            display_name: None,
             state: EnrollmentState::TargetDraft,
             blocker: EnrollmentBlocker::None,
             host_fingerprint: None,
@@ -657,7 +664,7 @@ pub trait EnrollmentBackend {
     fn cleanup(&mut self, draft: &EnrollmentDraft, secrets: &EnrollmentSecrets) -> Result<()>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostTrustOutcome {
     pub status: HostKeyStatus,
     pub fingerprint: String,
