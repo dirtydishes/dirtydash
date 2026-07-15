@@ -28,7 +28,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::deployment::{
     DeploymentPlan, DeploymentReceipt, DeploymentRequest, DeploymentRunner, PublisherTrustPolicy,
@@ -459,6 +459,12 @@ pub struct EnrollmentReceipt {
     pub plan_hash: String,
     pub release: String,
     pub artifact_sha256: String,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub collector_credential_id: Option<String>,
+    #[serde(default)]
+    pub collector_hub_url: Option<String>,
     pub artifact_size: u64,
     pub publisher_key_id: String,
     pub hub_health_verified: bool,
@@ -473,6 +479,9 @@ impl From<DeploymentReceipt> for EnrollmentReceipt {
             plan_hash: receipt.plan_hash,
             release: receipt.release,
             artifact_sha256: receipt.artifact_sha256,
+            machine_id: None,
+            collector_credential_id: None,
+            collector_hub_url: None,
             artifact_size: receipt.artifact_size,
             publisher_key_id: receipt.publisher_key_id,
             hub_health_verified: receipt.hub_health_verified,
@@ -488,6 +497,12 @@ pub struct EnrollmentDraft {
     pub state_version: u32,
     pub id: String,
     pub connection: ConnectionSpec,
+    /// Non-secret binding for the one Hub-side credential row reserved for
+    /// this enrollment. The token itself is never persisted here.
+    #[serde(default)]
+    pub collector_credential_id: Option<String>,
+    #[serde(default)]
+    pub collector_credential_state: Option<String>,
     pub auth_method: PersistedAuthMethod,
     #[serde(default)]
     pub machine_id: Option<String>,
@@ -522,6 +537,8 @@ impl EnrollmentDraft {
             state_version: ENROLLMENT_STATE_VERSION,
             id,
             connection,
+            collector_credential_id: None,
+            collector_credential_state: None,
             auth_method: auth_method.persisted_reference(),
             machine_id: None,
             display_name: None,
@@ -625,6 +642,11 @@ pub struct EnrollmentExecution<'a> {
     pub database_seed: Option<&'a [u8]>,
     pub listener: &'a ListenerPlan,
     pub secrets: &'a EnrollmentSecrets,
+    /// Request-scoped Hub-issued credential material. It is passed only to the
+    /// binary-safe remote secret-store stdin seam and is never part of a draft.
+    pub collector_credential_token: Option<&'a [u8]>,
+    pub collector_machine_id: Option<&'a str>,
+    pub collector_hub_url: Option<&'a str>,
 }
 
 pub trait EnrollmentBackend {
@@ -1003,6 +1025,32 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         listener: &ListenerPlan,
         secrets: &EnrollmentSecrets,
     ) -> Result<EnrollmentReceipt> {
+        self.execute_with_collector(
+            id,
+            immutable_plan,
+            artifact,
+            database_seed,
+            listener,
+            secrets,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_collector(
+        &mut self,
+        id: &str,
+        immutable_plan: &DeploymentPlan,
+        artifact: &VerifiedArtifact,
+        database_seed: Option<&[u8]>,
+        listener: &ListenerPlan,
+        secrets: &EnrollmentSecrets,
+        collector_credential_token: Option<&[u8]>,
+        collector_machine_id: Option<&str>,
+        collector_hub_url: Option<&str>,
+    ) -> Result<EnrollmentReceipt> {
         let mut draft = self.store.load(id)?;
         if draft.blocker == EnrollmentBlocker::ManualRecoveryRequired {
             bail!("manual recovery is required before enrollment can be retried");
@@ -1059,8 +1107,11 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             database_seed,
             listener,
             secrets,
+            collector_credential_token,
+            collector_machine_id,
+            collector_hub_url,
         }) {
-            Ok(receipt) => {
+            Ok(mut receipt) => {
                 if receipt.plan_hash != immutable_plan.plan_hash {
                     return self.fail_execute(
                         &mut draft,
@@ -1068,6 +1119,21 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
                         "installer receipt did not match the reviewed plan",
                         secrets,
                     );
+                }
+                if let Some(machine_id) = collector_machine_id {
+                    let Some(credential_id) = draft.collector_credential_id.clone() else {
+                        return self.fail_execute(
+                            &mut draft,
+                            EnrollmentBlocker::PlanInvalidated,
+                            "Collector credential binding is missing from the enrollment draft",
+                            secrets,
+                        );
+                    };
+                    receipt.machine_id = Some(machine_id.to_string());
+                    receipt.collector_credential_id = Some(credential_id);
+                    receipt.collector_hub_url = collector_hub_url.map(ToOwned::to_owned);
+                    draft.collector_credential_state =
+                        Some("installed-pending-confirmation".to_string());
                 }
                 draft.receipt = Some(receipt.clone());
                 draft.last_error = None;
@@ -1470,6 +1536,9 @@ impl EnrollmentBackend for SshEnrollmentBackend {
             database_seed,
             listener,
             secrets,
+            collector_credential_token,
+            collector_machine_id,
+            collector_hub_url,
         } = request;
         let auth = auth_from_persisted(&draft.auth_method)?;
         if plan.plan_hash != plan_hash {
@@ -1486,6 +1555,10 @@ impl EnrollmentBackend for SshEnrollmentBackend {
             listener: listener.clone(),
             database_seed: database_seed.map(ToOwned::to_owned),
             approved_plan_hash: Some(plan_hash.to_string()),
+            collector_credential_token: collector_credential_token
+                .map(|token| Zeroizing::new(token.to_owned())),
+            collector_machine_id: collector_machine_id.map(ToOwned::to_owned),
+            collector_hub_url: collector_hub_url.map(ToOwned::to_owned),
         };
         let mut runner = DeploymentRunner::new(executor, self.publisher_policy.clone())
             .with_reviewed_plan(plan.clone());

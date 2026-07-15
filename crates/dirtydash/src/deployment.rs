@@ -33,6 +33,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
+use crate::config::SecretSnapshot;
 use crate::listener::{ListenerAccessMode, ListenerPlan, TailscaleServeState};
 use crate::service::{ServicePlatform, ServiceSpec};
 use crate::ssh::{validate_target_input, CanonicalSshTarget};
@@ -599,6 +600,7 @@ pub struct DeploymentPaths {
     pub hub_db_backup: String,
     pub collector_db: String,
     pub config_file: String,
+    pub secrets_file: String,
     pub known_hosts: String,
     pub service_dir: String,
 }
@@ -629,6 +631,7 @@ impl DeploymentPaths {
             hub_db_backup: format!("{data_dir}/dirtydash.sqlite3.previous"),
             collector_db: format!("{data_dir}/dirtydash-collector.sqlite3"),
             config_file: format!("{config_dir}/config.toml"),
+            secrets_file: format!("{config_dir}/secrets.json"),
             known_hosts: format!("{config_dir}/known_hosts"),
             service_dir,
         })
@@ -1136,6 +1139,7 @@ pub enum RemoteAction {
     },
     VerifyReceipt {
         release: String,
+        current: String,
         port: u16,
         platform: ServicePlatform,
     },
@@ -1169,6 +1173,14 @@ pub trait RemoteExecutor {
     fn detect(&mut self) -> Result<RemoteFacts>;
     fn run(&mut self, action: RemoteAction) -> Result<RemoteResult>;
     fn upload(&mut self, destination: &str, bytes: &[u8], mode: u32) -> Result<RemoteResult>;
+
+    /// Secret-bearing enrollment bytes use a dedicated request-scoped stdin
+    /// path. The production SSH adapter writes a private remote temporary file,
+    /// fsyncs it, and atomically installs the final `0600` secrets file; no
+    /// caller-visible local temporary file is created.
+    fn upload_secret(&mut self, destination: &str, bytes: &[u8]) -> Result<RemoteResult> {
+        self.upload(destination, bytes, 0o600)
+    }
 
     /// Production adapters expose the one canonical target used for all
     /// operations.  Test adapters may omit it because their typed actions do
@@ -1295,6 +1307,11 @@ pub struct DeploymentRequest {
     pub listener: ListenerPlan,
     pub database_seed: Option<Vec<u8>>,
     pub approved_plan_hash: Option<String>,
+    /// Hosted enrollment supplies the already-issued credential only for this
+    /// request. It is never part of a plan/checkpoint or a typed remote action.
+    pub collector_credential_token: Option<Zeroizing<Vec<u8>>>,
+    pub collector_machine_id: Option<String>,
+    pub collector_hub_url: Option<String>,
 }
 
 impl std::fmt::Debug for DeploymentRequest {
@@ -1312,6 +1329,15 @@ impl std::fmt::Debug for DeploymentRequest {
                     .map(|seed| ("[REDACTED]", seed.len())),
             )
             .field("approved_plan_hash", &self.approved_plan_hash)
+            .field(
+                "collector_credential_token",
+                &self
+                    .collector_credential_token
+                    .as_ref()
+                    .map(|token| ("[REDACTED]", token.len())),
+            )
+            .field("collector_machine_id", &self.collector_machine_id)
+            .field("collector_hub_url", &self.collector_hub_url)
             .finish()
     }
 }
@@ -1328,7 +1354,22 @@ impl DeploymentRequest {
             listener,
             database_seed: None,
             approved_plan_hash: None,
+            collector_credential_token: None,
+            collector_machine_id: None,
+            collector_hub_url: None,
         }
+    }
+
+    pub fn with_collector_credentials(
+        mut self,
+        machine_id: impl Into<String>,
+        hub_url: impl Into<String>,
+        token: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.collector_machine_id = Some(machine_id.into());
+        self.collector_hub_url = Some(hub_url.into());
+        self.collector_credential_token = Some(Zeroizing::new(token.into()));
+        self
     }
 }
 
@@ -1545,7 +1586,12 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                     "install database seed",
                 )?;
             }
-            let runtime_config = plan.listener.render_runtime_toml()?;
+            let collector_update_target = format!("{}/dirtydash", paths.current);
+            let runtime_config = plan.listener.render_runtime_toml_with_collector_details(
+                request.collector_hub_url.as_deref(),
+                request.collector_machine_id.as_deref(),
+                Some(&collector_update_target),
+            )?;
             require_success(
                 self.executor.run(RemoteAction::InstallRuntimeConfig {
                     config_path: paths.config_file.clone(),
@@ -1553,6 +1599,20 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                 }),
                 "install runtime configuration",
             )?;
+            if let Some(token) = request.collector_credential_token.as_deref() {
+                let snapshot = SecretSnapshot {
+                    bootstrap_setup_token: None,
+                    collector_credential_token: Some(
+                        String::from_utf8(token.to_vec())
+                            .context("Collector credential is not valid UTF-8")?,
+                    ),
+                };
+                let bytes = serde_json::to_vec_pretty(&snapshot)?;
+                require_success(
+                    self.executor.upload_secret(&paths.secrets_file, &bytes),
+                    "install Collector secret store",
+                )?;
+            }
             for service in rendered_services {
                 require_success(
                     self.executor.run(RemoteAction::InstallService {
@@ -1615,6 +1675,7 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
             require_success(
                 self.executor.run(RemoteAction::VerifyReceipt {
                     release: plan.release.clone(),
+                    current: paths.current.clone(),
                     port: plan.listener.local_port,
                     platform: facts.platform.service_platform(),
                 }),
@@ -2526,6 +2587,48 @@ impl RemoteExecutor for SshRemoteExecutor {
         })
     }
 
+    fn upload_secret(&mut self, destination: &str, bytes: &[u8]) -> Result<RemoteResult> {
+        validate_remote_text(destination, "remote secret destination")?;
+        let temp = format!("{destination}.secret-tmp-{}", crate::hub::random_token(8));
+        let command = format!(
+            "set -eu; umask 077; trap 'rm -f {temp}' EXIT; dd bs=1 count={count} 2>/dev/null > {temp}; chmod 600 {temp}; if command -v python3 >/dev/null 2>&1; then python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' {temp}; else sync; fi; mv -f {temp} {destination}; trap - EXIT; test \"$(stat -c %a {destination} 2>/dev/null || stat -f %Lp {destination})\" = 600",
+            count = bytes.len(),
+            temp = shell_quote(&temp),
+            destination = shell_quote(destination),
+        );
+        if self.live_secrets.is_some() {
+            return self.with_authenticated_control(|socket, secrets| {
+                let mut args = self.control_args(socket);
+                args.push(command.clone());
+                run_binary_safe_process(&self.ssh_program, &args, Some(bytes), secrets)
+            });
+        }
+        let mut process = Command::new(&self.ssh_program);
+        process
+            .args(self.base_args())
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = process
+            .spawn()
+            .context("starting SSH secret-store upload")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(bytes)?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "remote secret-store upload failed with status {}",
+                output.status.code().unwrap_or(-1)
+            );
+        }
+        Ok(RemoteResult::success(redact_error(
+            &String::from_utf8_lossy(&output.stdout),
+            &[],
+        )))
+    }
+
     fn upload(&mut self, destination: &str, bytes: &[u8], mode: u32) -> Result<RemoteResult> {
         validate_remote_text(destination, "remote upload destination")?;
         if !matches!(mode, 0o600 | 0o644 | 0o755) {
@@ -2542,11 +2645,10 @@ impl RemoteExecutor for SshRemoteExecutor {
             format!("cat > {}", shell_quote(&temp))
         };
         let command = format!(
-            "set -eu; umask 077; {input_command}; chmod {:o} {}; mv -f {} {}",
-            mode,
-            shell_quote(&temp),
-            shell_quote(&temp),
-            shell_quote(destination),
+            "set -eu; umask 077; trap 'rm -f {temp}' EXIT; {input_command}; chmod {mode:o} {temp}; if command -v python3 >/dev/null 2>&1; then python3 -c 'import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' {temp}; else sync; fi; mv -f {temp} {destination}; trap - EXIT",
+            mode = mode,
+            temp = shell_quote(&temp),
+            destination = shell_quote(destination),
             input_command = input_command,
         );
         if self.live_secrets.is_some() {
@@ -2640,7 +2742,7 @@ fn snapshot_command(
         }
     };
     Ok(format!(
-        "set -eu; umask 077; snapshot={snapshot}; snapshot_tmp={snapshot_tmp}; if [ -e \"$snapshot\" ]; then echo 'existing rollback snapshot requires manual recovery' >&2; exit 125; fi; rm -rf -- \"$snapshot_tmp\"; trap 'rm -rf -- \"$snapshot_tmp\"' EXIT; mkdir -p \"$snapshot_tmp\"; if [ -e {release_dir} ] || [ -L {release_dir} ]; then echo 'target release already exists; refusing to overwrite it' >&2; exit 126; fi; for protected in {backup} {wal_backup} {shm_backup} {seed}; do if [ -e \"$protected\" ] || [ -L \"$protected\" ]; then echo 'deployment temporary path already exists' >&2; exit 127; fi; done; snapshot_copy() {{ source=$1; destination=$2; missing=$3; if [ -e \"$source\" ] || [ -L \"$source\" ]; then cp -p \"$source\" \"$snapshot_tmp/$destination\"; else : > \"$snapshot_tmp/$missing\"; fi; }}; if [ -L {current} ]; then readlink {current} > \"$snapshot_tmp/current.target\"; : > \"$snapshot_tmp/current.symlink\"; elif [ -e {current} ]; then if [ -d {current} ]; then echo 'current pointer is an unsupported directory' >&2; exit 128; fi; cp -p {current} \"$snapshot_tmp/current.file\"; : > \"$snapshot_tmp/current.regular\"; else : > \"$snapshot_tmp/current.missing\"; fi; snapshot_copy {config} config.toml .missing-config; snapshot_copy {database} database .missing-database; snapshot_copy {database}-wal database-wal .missing-database-wal; snapshot_copy {database}-shm database-shm .missing-database-shm; for service in {service_files}; do name=$(basename \"$service\"); snapshot_copy \"$service\" \"$name\" \".missing-$name\"; done; {service_state}; : > \"$snapshot_tmp/hub-port\"; for service in {service_files}; do if [ -f \"$service\" ]; then port=$(sed -nE 's/.*--port[ =]([0-9]+).*/\\1/p' \"$service\" | head -n 1); if [ -z \"$port\" ]; then port=$(grep -A1 '<string>--port</string>' \"$service\" 2>/dev/null | sed -n '2p' | sed -nE 's|.*<string>([0-9]+)</string>.*|\\1|p'); fi; if [ -n \"$port\" ]; then printf '%s\\n' \"$port\" > \"$snapshot_tmp/hub-port\"; break; fi; fi; done; printf '%s\\n' {requested_port} > \"$snapshot_tmp/requested-port\"; if command -v tailscale >/dev/null 2>&1; then if tailscale serve status --json > \"$snapshot_tmp/tailscale-serve.json\" 2>/dev/null; then tailscale serve status > \"$snapshot_tmp/tailscale-serve.txt\" 2>/dev/null || true; if [ -s \"$snapshot_tmp/tailscale-serve.json\" ] && ! grep -Eq '^[[:space:]]*(\\{{[[:space:]]*\\}}|null|\\[[[:space:]]*\\])' \"$snapshot_tmp/tailscale-serve.json\"; then printf 'enabled\\n' > \"$snapshot_tmp/listener-state\"; port=$(sed -nE 's/.*127\\.0\\.0\\.1:([0-9]+).*/\\1/p' \"$snapshot_tmp/tailscale-serve.txt\" | head -n 1); backend=$(sed -nE 's/.*proxy (https?:\\/\\/[^ ]+).*/\\1/p' \"$snapshot_tmp/tailscale-serve.txt\" | head -n 1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\" > \"$snapshot_tmp/listener-port\"; fi; if [ -n \"$backend\" ]; then printf '%s\\n' \"$backend\" > \"$snapshot_tmp/listener-backend\"; fi; else printf 'not-configured\\n' > \"$snapshot_tmp/listener-state\"; fi; else printf 'unavailable\\n' > \"$snapshot_tmp/listener-state\"; fi; else printf 'unavailable\\n' > \"$snapshot_tmp/listener-state\"; fi; mv -f \"$snapshot_tmp\" \"$snapshot\"; trap - EXIT",
+        "set -eu; umask 077; snapshot={snapshot}; snapshot_tmp={snapshot_tmp}; if [ -e \"$snapshot\" ]; then echo 'existing rollback snapshot requires manual recovery' >&2; exit 125; fi; rm -rf -- \"$snapshot_tmp\"; trap 'rm -rf -- \"$snapshot_tmp\"' EXIT; mkdir -p \"$snapshot_tmp\"; if [ -e {release_dir} ] || [ -L {release_dir} ]; then echo 'target release already exists; refusing to overwrite it' >&2; exit 126; fi; for protected in {backup} {wal_backup} {shm_backup} {seed}; do if [ -e \"$protected\" ] || [ -L \"$protected\" ]; then echo 'deployment temporary path already exists' >&2; exit 127; fi; done; snapshot_copy() {{ source=$1; destination=$2; missing=$3; if [ -e \"$source\" ] || [ -L \"$source\" ]; then cp -p \"$source\" \"$snapshot_tmp/$destination\"; else : > \"$snapshot_tmp/$missing\"; fi; }}; if [ -L {current} ]; then readlink {current} > \"$snapshot_tmp/current.target\"; : > \"$snapshot_tmp/current.symlink\"; elif [ -e {current} ]; then if [ -d {current} ]; then echo 'current pointer is an unsupported directory' >&2; exit 128; fi; cp -p {current} \"$snapshot_tmp/current.file\"; : > \"$snapshot_tmp/current.regular\"; else : > \"$snapshot_tmp/current.missing\"; fi; snapshot_copy {config} config.toml .missing-config; snapshot_copy {database} database .missing-database; snapshot_copy {database}-wal database-wal .missing-database-wal; snapshot_copy {database}-shm database-shm .missing-database-shm; for service in {service_files}; do name=$(basename \"$service\"); snapshot_copy \"$service\" \"$name\" \".missing-$name\"; done; {service_state}; : > \"$snapshot_tmp/hub-port\"; for service in {service_files}; do if [ -f \"$service\" ]; then port=$(sed -nE 's/.*--port[ =]([0-9]+).*/\\1/p' \"$service\" | head -n 1); if [ -z \"$port\" ]; then port=$(grep -A1 '<string>--port</string>' \"$service\" 2>/dev/null | sed -n '2p' | sed -nE 's|.*<string>([0-9]+)</string>.*|\\1|p'); fi; if [ -n \"$port\" ]; then printf '%s\\n' \"$port\" > \"$snapshot_tmp/hub-port\"; break; fi; fi; done; printf '%s\\n' {requested_port} > \"$snapshot_tmp/requested-port\"; if command -v tailscale >/dev/null 2>&1; then if tailscale serve status --json > \"$snapshot_tmp/tailscale-serve.json\" 2>/dev/null; then tailscale serve status > \"$snapshot_tmp/tailscale-serve.txt\" 2>/dev/null || true; if [ -s \"$snapshot_tmp/tailscale-serve.json\" ] && ! grep -Eq '^[[:space:]]*(\\{{[[:space:]]*\\}}|null|\\[[[:space:]]*\\])' \"$snapshot_tmp/tailscale-serve.json\"; then printf 'enabled\\n' > \"$snapshot_tmp/listener-state\"; port=$(sed -nE 's/.*127\\.0\\.0\\.1:([0-9]+).*/\\1/p' \"$snapshot_tmp/tailscale-serve.txt\" | head -n 1); backend=$(sed -nE 's/.*proxy (https?:\\/\\/[^ ]+).*/\\1/p' \"$snapshot_tmp/tailscale-serve.txt\" | head -n 1); if [ -n \"$port\" ]; then printf '%s\\n' \"$port\" > \"$snapshot_tmp/listener-port\"; fi; if [ -n \"$backend\" ]; then printf '%s\\n' \"$backend\" > \"$snapshot_tmp/listener-backend\"; fi; else printf 'not-configured\\n' > \"$snapshot_tmp/listener-state\"; fi; else printf 'unavailable\\n' > \"$snapshot_tmp/listener-state\"; fi; else printf 'unavailable\\n' > \"$snapshot_tmp/listener-state\"; fi; chmod 700 \"$snapshot_tmp\"; find \"$snapshot_tmp\" -type f -exec chmod 600 {{}} +; mv -f \"$snapshot_tmp\" \"$snapshot\"; trap - EXIT",
         snapshot = shell_quote(&snapshot),
         snapshot_tmp = shell_quote(&snapshot_tmp),
         current = shell_quote(&paths.current),
@@ -3032,10 +3134,11 @@ fn action_command(action: &RemoteAction) -> Result<String> {
         RemoteAction::ConfigureTailscale { port } => Ok(format!(
             "set -eu; command -v tailscale >/dev/null; tailscale serve --https=443 http://127.0.0.1:{port}",
         )),
-        RemoteAction::VerifyReceipt { release, port, platform } => Ok(format!(
-            "set -eu; test -x {}/dirtydash; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null; {}",
-            shell_quote(release),
-            service_health_command(*platform),
+        RemoteAction::VerifyReceipt { release, current, port, platform } => Ok(format!(
+            "set -eu; test -L {current}; test \"$(readlink {current})\" = \"$(dirname {current})/releases/{release}\"; test -x {current}/dirtydash; {current}/dirtydash --version | grep -F -- {release} >/dev/null; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null; {service_health}",
+            release = shell_quote(release),
+            current = shell_quote(current),
+            service_health = service_health_command(*platform),
         )),
         RemoteAction::Rollback {
             current,

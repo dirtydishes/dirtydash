@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Current Collector wire protocol accepted by the Hub.
 pub const CURRENT_COLLECTOR_PROTOCOL_VERSION: u32 = API_V1_PROTOCOL_VERSION;
@@ -217,6 +217,7 @@ pub struct FleetUpdateRun {
     pub created_at: String,
     pub started_at: Option<String>,
     pub hub_snapshot_at: Option<String>,
+    pub hub_restart_requested_at: Option<String>,
     pub hub_updated_at: Option<String>,
     pub hub_health_at: Option<String>,
     pub completed_at: Option<String>,
@@ -377,6 +378,14 @@ pub(crate) fn fleet_update_command_id(update_id: &str, machine_id: &str) -> Stri
     format!("fleet-update-{}", &digest[..24])
 }
 
+pub(crate) fn fleet_rollback_command_id(update_id: &str, machine_id: &str) -> String {
+    let digest = sha256_hex(&format!("rollback:{update_id}:{machine_id}"));
+    format!("fleet-rollback-{}", &digest[..24])
+}
+
+const COLLECTOR_UPDATE_TIMEOUT: Duration = Duration::minutes(5);
+const HUB_UPDATE_TIMEOUT: Duration = Duration::minutes(5);
+
 impl HubRepository {
     pub(crate) fn list_machines(&self) -> HubResult<Vec<MachineRecord>> {
         let conn = self.db.connection().map_err(HubError::internal)?;
@@ -426,50 +435,6 @@ impl HubRepository {
             .into_iter()
             .find(|machine| machine.machine_id == machine_id)
             .ok_or_else(|| HubError::not_found("machine-not-found", "Machine was not found"))
-    }
-
-    pub(crate) fn ensure_machine(
-        &self,
-        machine_id: &str,
-        display_name: &str,
-    ) -> HubResult<MachineRecord> {
-        let machine_id = validate_identifier(machine_id, "machine_id")?;
-        let display_name = validate_non_empty(display_name, "display_name")?;
-        let now = now_utc();
-        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
-        let mut conn = self.db.connection().map_err(HubError::internal)?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(HubError::internal)?;
-        let existing: Option<(String, Option<String>, Option<String>)> = tx
-            .query_row(
-                "SELECT display_name, revoked_at, archived_at FROM machines WHERE machine_id = ?1",
-                params![machine_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(HubError::internal)?;
-        if let Some((_, revoked_at, archived_at)) = existing {
-            if revoked_at.is_some() || archived_at.is_some() {
-                return Err(HubError::conflict(
-                    "machine-archived",
-                    "an archived Machine cannot be resurrected; create a new Machine ID",
-                ));
-            }
-            tx.execute(
-                "UPDATE machines SET display_name = ?2, state_revision = state_revision + 1 WHERE machine_id = ?1",
-                params![machine_id, display_name],
-            )
-            .map_err(HubError::internal)?;
-        } else {
-            tx.execute(
-                "INSERT INTO machines(machine_id, display_name, enrolled_at, last_seen_at, state_revision) VALUES (?1, ?2, ?3, ?3, 0)",
-                params![machine_id, display_name, now],
-            )
-            .map_err(HubError::internal)?;
-        }
-        tx.commit().map_err(HubError::internal)?;
-        self.machine(&machine_id)
     }
 
     pub(crate) fn archive_machine(
@@ -524,6 +489,7 @@ impl HubRepository {
                 "Machine name or state revision changed; reload before retrying",
             ));
         }
+        self.reject_active_machine_update(&tx, &machine_id)?;
         let changed = tx
             .execute(
                 r#"
@@ -599,6 +565,33 @@ impl HubRepository {
                 "Machine must be archived and unchanged before permanent deletion",
             ));
         }
+        self.reject_active_machine_update(&tx, &machine_id)?;
+        let audit_rows: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM fleet_update_nodes WHERE machine_id = ?1",
+                params![machine_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if audit_rows > 0 {
+            return Err(HubError::conflict(
+                "machine-update-audit-retained",
+                "Machine update history must be retained; archive the Machine instead of deleting it",
+            ));
+        }
+        let enrollment_rows: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM enrollment_credentials WHERE machine_id = ?1",
+                params![machine_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if enrollment_rows > 0 {
+            return Err(HubError::conflict(
+                "machine-enrollment-audit-retained",
+                "Machine enrollment credential history must be retained; archive the Machine instead of deleting it",
+            ));
+        }
         // Revoke inside the same immediate transaction before the cascading
         // delete.  This closes the authenticate/archive/delete race and makes
         // the audit intent explicit even when foreign-key cleanup follows.
@@ -630,6 +623,27 @@ impl HubRepository {
         )
         .map_err(HubError::internal)?;
         tx.commit().map_err(HubError::internal)
+    }
+
+    pub(crate) fn reject_active_machine_update(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        machine_id: &str,
+    ) -> HubResult<()> {
+        let active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fleet_update_nodes n JOIN fleet_update_runs r ON r.update_id = n.update_id WHERE n.machine_id = ?1 AND n.status IN ('queued', 'updating', 'rolling-back') AND r.status NOT IN ('completed', 'completed-with-failures', 'failed'))",
+                params![machine_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if active {
+            return Err(HubError::conflict(
+                "machine-update-active",
+                "Machine lifecycle, repair, rotation, and deletion actions are blocked while an update is active",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn record_collector_diagnostics(
@@ -742,6 +756,12 @@ impl HubRepository {
                 .filter(|machine| matches!(machine.lifecycle, MachineLifecycle::Active))
                 .map(|machine| machine.machine_id)
                 .collect();
+        }
+        if machine_ids.is_empty() {
+            return Err(HubError::unprocessable(
+                "empty-update-target",
+                "fleet update requires at least one active Machine target",
+            ));
         }
         let unique = machine_ids.iter().collect::<BTreeSet<_>>();
         if unique.len() != machine_ids.len() {
@@ -878,7 +898,7 @@ impl HubRepository {
             .query_row(
                 r#"SELECT update_id, version, artifact_sha256, publisher_key_id,
                     publisher_fingerprint, manifest_sha256, status, created_at,
-                    started_at, hub_snapshot_at, hub_updated_at, hub_health_at,
+                    started_at, hub_snapshot_at, hub_restart_requested_at, hub_updated_at, hub_health_at,
                     completed_at, failure_reason, attempts, state_revision
                 FROM fleet_update_runs WHERE update_id = ?1"#,
                 params![update_id],
@@ -920,6 +940,7 @@ impl HubRepository {
         }
         if let Some(parent) = snapshot_path.parent() {
             fs::create_dir_all(parent).map_err(HubError::internal)?;
+            set_private_directory(parent).map_err(HubError::internal)?;
         }
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let mut conn = self.db.connection().map_err(HubError::internal)?;
@@ -950,14 +971,20 @@ impl HubRepository {
             params![snapshot_path.to_string_lossy().to_string()],
         )
         .map_err(HubError::internal)?;
+        set_private_file(&snapshot_path).map_err(HubError::internal)?;
+        if let Some(parent) = snapshot_path.parent() {
+            sync_parent_directory(parent).map_err(HubError::internal)?;
+        }
         let bytes = fs::read(&snapshot_path).map_err(HubError::internal)?;
         let digest = hex::encode(Sha256::digest(&bytes));
         let conn = self.db.connection().map_err(HubError::internal)?;
-        conn.execute(
+        if let Err(error) = conn.execute(
             "INSERT INTO fleet_update_snapshots(update_id, target_kind, machine_id, snapshot_path, snapshot_sha256, created_at) VALUES (?1, 'hub', NULL, ?2, ?3, ?4)",
             params![update_id, snapshot_path.to_string_lossy().to_string(), digest, now],
-        )
-        .map_err(HubError::internal)?;
+        ) {
+            let _ = fs::remove_file(&snapshot_path);
+            return Err(HubError::internal(error));
+        }
         self.fleet_update(&update_id)
             .map(|update| FleetUpdateSnapshotResponse {
                 update_id,
@@ -1029,6 +1056,15 @@ impl HubRepository {
     pub(crate) fn record_hub_health_server(&self, update_id: &str) -> HubResult<FleetUpdateRun> {
         let update_id = validate_identifier(update_id, "update_id")?;
         let update = self.fleet_update(&update_id)?;
+        if update.status == "hub-updating"
+            && update
+                .started_at
+                .as_deref()
+                .and_then(parse_timestamp)
+                .is_some_and(|started| Utc::now() > started + HUB_UPDATE_TIMEOUT)
+        {
+            return self.fail_hub_update(&update_id, "Hub restart/health reconciliation timed out");
+        }
         let runtime: Option<(String, String, String, String)> = self
             .db
             .connection()
@@ -1061,12 +1097,14 @@ impl HubRepository {
             // a client-confirmed health failure.
             return self.fleet_update(&update_id);
         };
-        let snapshot_at = update
-            .hub_snapshot_at
+        let update_started_at = update
+            .started_at
             .as_deref()
-            .ok_or_else(|| HubError::internal("Hub snapshot timestamp is missing"))?;
-        let runtime_is_newer =
-            parse_utc_timestamp(&runtime_started_at)? > parse_utc_timestamp(snapshot_at)?;
+            .or(update.hub_snapshot_at.as_deref())
+            .ok_or_else(|| HubError::internal("Hub update start timestamp is missing"))?;
+        let runtime_is_newer = parse_utc_timestamp(&runtime_started_at)?
+            > parse_utc_timestamp(update_started_at)?
+            && parse_utc_timestamp(&health_checked_at)? > parse_utc_timestamp(update_started_at)?;
         if !runtime_is_newer {
             return self.fleet_update(&update_id);
         }
@@ -1104,7 +1142,13 @@ impl HubRepository {
     ) -> HubResult<FleetUpdateRun> {
         let update = self.fleet_update(update_id)?;
         if update.status == "planned" {
-            self.record_hub_snapshot_server(update_id)?;
+            if let Err(error) = self.record_hub_snapshot_server(update_id) {
+                let _ = self.fail_hub_update(update_id, "Hub snapshot creation failed");
+                if let Ok(path) = self.hub_snapshot_path(update_id) {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
             if let Err(error) = self.apply_hub_update_artifact(
                 &update,
                 artifact_dir,
@@ -1112,17 +1156,63 @@ impl HubRepository {
                 service_manager,
             ) {
                 let _ = self.fail_hub_update(update_id, "Hub artifact application failed");
-                let _ = self.restore_hub_update_target(update_target);
+                let _ = self.restore_hub_update_target(update_id, update_target);
                 return Err(error);
             }
             // Restart is deliberately delegated to one fixed service manager;
             // completion is reconciled after the next Hub process generation
             // records its runtime proof. This request never asserts health.
-            if let Err(error) = self.request_hub_restart(service_manager) {
+            if let Err(error) =
+                self.request_hub_restart(service_manager, update_id, update_target.cloned())
+            {
                 let _ = self.fail_hub_update(update_id, "Hub restart request failed");
-                let _ = self.restore_hub_update_target(update_target);
+                let _ = self.restore_hub_update_target(update_id, update_target);
                 return Err(error);
             }
+        } else if update.status == "hub-updating"
+            && !self.hub_runtime_ready(&update)?
+            && update
+                .started_at
+                .as_deref()
+                .and_then(parse_timestamp)
+                .is_none_or(|started| Utc::now() <= started + HUB_UPDATE_TIMEOUT)
+        {
+            // A process crash can strand the durable run after the snapshot or
+            // binary replacement but before the restart request. Reconcile the
+            // same target without replacing the original rollback snapshot.
+            if let Err(error) = self.apply_hub_update_artifact(
+                &update,
+                artifact_dir,
+                update_target,
+                service_manager,
+            ) {
+                let _ = self.fail_hub_update(update_id, "Hub artifact recovery failed");
+                let _ = self.restore_hub_update_target(update_id, update_target);
+                return Err(error);
+            }
+            self.request_hub_restart(service_manager, update_id, update_target.cloned())?;
+        }
+        self.reconcile_server_fleet_update(update_id, update_target)
+    }
+
+    pub(crate) fn reconcile_server_fleet_update_with_runtime(
+        &self,
+        update_id: &str,
+        artifact_dir: Option<&PathBuf>,
+        update_target: Option<&PathBuf>,
+        service_manager: Option<&str>,
+    ) -> HubResult<FleetUpdateRun> {
+        let update = self.fleet_update(update_id)?;
+        if update.status == "hub-updating"
+            && !self.hub_runtime_ready(&update)?
+            && update
+                .started_at
+                .as_deref()
+                .and_then(parse_timestamp)
+                .is_none_or(|started| Utc::now() <= started + HUB_UPDATE_TIMEOUT)
+        {
+            self.apply_hub_update_artifact(&update, artifact_dir, update_target, service_manager)?;
+            self.request_hub_restart(service_manager, update_id, update_target.cloned())?;
         }
         self.reconcile_server_fleet_update(update_id, update_target)
     }
@@ -1132,13 +1222,14 @@ impl HubRepository {
         update_id: &str,
         update_target: Option<&PathBuf>,
     ) -> HubResult<FleetUpdateRun> {
+        self.mark_stranded_collector_updates(update_id)?;
         self.reconcile_collector_update_commands(update_id)?;
         let update = self.fleet_update(update_id)?;
         if update.status == "hub-updating" {
             let update = self.record_hub_health_server(update_id)?;
             if update.status != "collectors-queued" {
                 if update.status == "failed" {
-                    self.restore_hub_update_target(update_target)?;
+                    self.restore_hub_update_target(update_id, update_target)?;
                 }
                 return Ok(update);
             }
@@ -1146,10 +1237,63 @@ impl HubRepository {
         let update = self.fleet_update(update_id)?;
         if update.status == "collectors-queued" {
             for node in update.nodes.iter().filter(|node| node.status == "queued") {
-                self.start_collector_update(update_id, &node.machine_id)?;
+                if let Err(_error) = self.start_collector_update(update_id, &node.machine_id) {
+                    self.rollback_queued_collector_update(
+                        update_id,
+                        &node.machine_id,
+                        "Collector update could not start; node was rolled back",
+                    )?;
+                }
             }
         }
         self.finish_update_if_terminal(update_id)
+    }
+
+    fn rollback_queued_collector_update(
+        &self,
+        update_id: &str,
+        machine_id: &str,
+        reason: &str,
+    ) -> HubResult<()> {
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE fleet_update_nodes SET status = 'rolled-back', rolled_back_at = ?3, failure_reason = ?4, attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND machine_id = ?2 AND status = 'queued'",
+            params![update_id, machine_id, now_utc(), reason],
+        )
+        .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE machines SET desired_version = (SELECT previous_desired_version FROM fleet_update_nodes WHERE update_id = ?1 AND machine_id = ?2), state_revision = state_revision + 1 WHERE machine_id = ?2 AND archived_at IS NULL AND revoked_at IS NULL",
+            params![update_id, machine_id],
+        )
+        .map_err(HubError::internal)?;
+        tx.commit().map_err(HubError::internal)
+    }
+
+    fn hub_runtime_ready(&self, update: &FleetUpdateRun) -> HubResult<bool> {
+        let Some(started_at) = update.started_at.as_deref() else {
+            return Ok(false);
+        };
+        let runtime: Option<(String, String, String)> = self
+            .db
+            .connection()
+            .map_err(HubError::internal)?
+            .query_row(
+                "SELECT runtime_version, started_at, health_checked_at FROM hub_runtime_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((version, runtime_started_at, health_checked_at)) = runtime else {
+            return Ok(false);
+        };
+        Ok(version == update.version
+            && parse_utc_timestamp(&runtime_started_at)? > parse_utc_timestamp(started_at)?
+            && parse_utc_timestamp(&health_checked_at)? > parse_utc_timestamp(started_at)?)
     }
 
     fn apply_hub_update_artifact(
@@ -1185,17 +1329,65 @@ impl HubRepository {
             HubError::unprocessable("fleet-runtime-invalid", "Hub update target has no parent")
         })?;
         fs::create_dir_all(parent).map_err(HubError::internal)?;
-        let backup = update_target.with_extension("previous");
-        if update_target.exists() {
+        let backup = hub_binary_backup_path(update_target, &update.update_id);
+        let missing = hub_binary_missing_marker(update_target, &update.update_id);
+        if update_target.exists() && !backup.exists() {
             fs::copy(update_target, &backup).map_err(HubError::internal)?;
+            set_executable_mode(&backup).map_err(HubError::internal)?;
+        } else if !update_target.exists() && !backup.exists() && !missing.exists() {
+            fs::File::create(&missing).map_err(HubError::internal)?;
+            set_private_file(&missing).map_err(HubError::internal)?;
+        }
+        let existing_digest = update_target
+            .exists()
+            .then(|| fs::read(update_target).ok())
+            .flatten()
+            .map(|bytes| hex::encode(Sha256::digest(bytes)));
+        if existing_digest
+            .as_deref()
+            .is_some_and(|digest| digest.eq_ignore_ascii_case(&update.artifact_sha256))
+        {
+            return Ok(());
         }
         let temporary = parent.join(format!(".fleet-{}.tmp", random_token(8)));
-        fs::write(&temporary, artifact).map_err(HubError::internal)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(HubError::internal)?;
+        use std::io::Write;
+        file.write_all(&artifact).map_err(HubError::internal)?;
+        file.sync_all().map_err(HubError::internal)?;
+        drop(file);
+        set_executable_mode(&temporary).map_err(HubError::internal)?;
         fs::rename(&temporary, update_target).map_err(HubError::internal)?;
+        sync_parent_directory(parent).map_err(HubError::internal)?;
         Ok(())
     }
 
-    fn reconcile_collector_update_commands(&self, update_id: &str) -> HubResult<()> {
+    fn mark_stranded_collector_updates(&self, update_id: &str) -> HubResult<()> {
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let cutoff = (Utc::now() - COLLECTOR_UPDATE_TIMEOUT).to_rfc3339();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE fleet_update_nodes SET status = 'rolling-back', failure_reason = COALESCE(failure_reason, 'Collector update receipt timed out; rollback requested'), attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND status = 'updating' AND update_started_at IS NOT NULL AND update_started_at <= ?2",
+            params![update_id, cutoff],
+        )
+        .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE machines SET desired_version = (SELECT previous_desired_version FROM fleet_update_nodes n WHERE n.update_id = ?1 AND n.machine_id = machines.machine_id), state_revision = state_revision + 1 WHERE machine_id IN (SELECT machine_id FROM fleet_update_nodes WHERE update_id = ?1 AND status = 'rolling-back') AND archived_at IS NULL AND COALESCE(desired_version, '') <> COALESCE((SELECT previous_desired_version FROM fleet_update_nodes n WHERE n.update_id = ?1 AND n.machine_id = machines.machine_id), '')",
+            params![update_id],
+        )
+        .map_err(HubError::internal)?;
+        tx.commit().map_err(HubError::internal)?;
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_collector_update_commands(&self, update_id: &str) -> HubResult<()> {
         let update_id = validate_identifier(update_id, "update_id")?;
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let mut conn = self.db.connection().map_err(HubError::internal)?;
@@ -1221,19 +1413,35 @@ impl HubRepository {
             return Ok(());
         }
         let nodes = tx
-            .prepare("SELECT machine_id FROM fleet_update_nodes WHERE update_id = ?1 AND status = 'updating'")
+            .prepare("SELECT machine_id, status, state_revision FROM fleet_update_nodes WHERE update_id = ?1 AND status IN ('updating', 'rolling-back')")
             .map_err(HubError::internal)?
-            .query_map(params![update_id], |row| row.get::<_, String>(0))
+            .query_map(params![update_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })
             .map_err(HubError::internal)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(HubError::internal)?;
-        for machine_id in nodes {
-            let command_id = fleet_update_command_id(&update_id, &machine_id);
-            let command = OwnerCommand::ApprovedUpdate {
-                command_id: command_id.clone(),
-                update_id: update_id.clone(),
-                version: version.clone(),
-                sha256: sha256.clone(),
+        for (machine_id, node_status, node_revision) in nodes {
+            let (command_id, command) = if node_status == "rolling-back" {
+                let command_id = fleet_rollback_command_id(&update_id, &machine_id);
+                let command = OwnerCommand::RollbackUpdate {
+                    command_id: command_id.clone(),
+                    update_id: update_id.clone(),
+                    version: version.clone(),
+                    sha256: sha256.clone(),
+                    expected_state_revision: node_revision,
+                };
+                (command_id, command)
+            } else {
+                let command_id = fleet_update_command_id(&update_id, &machine_id);
+                let command = OwnerCommand::ApprovedUpdate {
+                    command_id: command_id.clone(),
+                    update_id: update_id.clone(),
+                    version: version.clone(),
+                    sha256: sha256.clone(),
+                    expected_state_revision: node_revision,
+                };
+                (command_id, command)
             };
             let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
             tx.execute(
@@ -1249,44 +1457,91 @@ impl HubRepository {
 
     pub(crate) fn restore_hub_update_target(
         &self,
+        update_id: &str,
         update_target: Option<&PathBuf>,
     ) -> HubResult<()> {
         let Some(update_target) = update_target else {
             return Ok(());
         };
-        let backup = update_target.with_extension("previous");
+        let backup = hub_binary_backup_path(update_target, update_id);
+        let missing = hub_binary_missing_marker(update_target, update_id);
         if backup.exists() {
             fs::rename(backup, update_target).map_err(HubError::internal)?;
+        } else if missing.exists() {
+            if update_target.exists() {
+                fs::remove_file(update_target).map_err(HubError::internal)?;
+            }
+            fs::remove_file(missing).map_err(HubError::internal)?;
         }
         Ok(())
     }
 
-    fn request_hub_restart(&self, service_manager: Option<&str>) -> HubResult<()> {
-        match service_manager {
-            Some("systemd-user") => {
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let _ = std::process::Command::new("systemctl")
-                        .args(["--user", "restart", "dirtydash-hub.service"])
-                        .status();
-                });
-                Ok(())
-            }
+    fn request_hub_restart(
+        &self,
+        service_manager: Option<&str>,
+        update_id: &str,
+        update_target: Option<PathBuf>,
+    ) -> HubResult<()> {
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let (program, args): (&str, Vec<String>) = match service_manager {
+            Some("systemd-user") => (
+                "systemctl",
+                vec![
+                    "--user".to_string(),
+                    "restart".to_string(),
+                    "dirtydash-hub.service".to_string(),
+                ],
+            ),
             Some("launchd") => {
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    let domain = format!("gui/{}", unsafe { libc::geteuid() });
-                    let _ = std::process::Command::new("launchctl")
-                        .args(["kickstart", "-k", &format!("{domain}/dev.dirtydash.hub")])
-                        .status();
-                });
-                Ok(())
+                let domain = format!("gui/{}", unsafe { libc::geteuid() });
+                (
+                    "launchctl",
+                    vec![
+                        "kickstart".to_string(),
+                        "-k".to_string(),
+                        format!("{domain}/dev.dirtydash.hub"),
+                    ],
+                )
             }
-            _ => Err(HubError::forbidden(
-                "fleet-runtime-required",
-                "Hub restart requires a configured fixed service manager",
-            )),
+            _ => {
+                return Err(HubError::forbidden(
+                    "fleet-runtime-required",
+                    "Hub restart requires a configured fixed service manager",
+                ))
+            }
+        };
+        let now = now_utc();
+        let retry_cutoff = (Utc::now() - Duration::seconds(30)).to_rfc3339();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        let changed = conn
+            .execute(
+                "UPDATE fleet_update_runs SET hub_restart_requested_at = ?2, attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND status = 'hub-updating' AND (hub_restart_requested_at IS NULL OR hub_restart_requested_at <= ?3)",
+                params![update_id, now, retry_cutoff],
+            )
+            .map_err(HubError::internal)?;
+        drop(conn);
+        drop(_guard);
+        if changed == 0 {
+            return Ok(());
         }
+        let repository = self.clone();
+        std::thread::Builder::new()
+            .name("dirtydash-hub-restart".to_string())
+            .spawn(move || {
+                let succeeded = std::process::Command::new(program)
+                    .args(args)
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !succeeded {
+                    let _ = repository
+                        .fail_hub_update(&update_id, "Hub service manager restart failed");
+                    let _ =
+                        repository.restore_hub_update_target(&update_id, update_target.as_ref());
+                }
+            })
+            .map_err(|_| HubError::internal("could not start Hub restart request"))?;
+        Ok(())
     }
 
     fn fail_hub_update(&self, update_id: &str, reason: &str) -> HubResult<FleetUpdateRun> {
@@ -1443,6 +1698,7 @@ impl HubRepository {
                     |row| row.get(0),
                 )
                 .map_err(HubError::internal)?,
+            expected_state_revision: node_revision + if node_status == "queued" { 1 } else { 0 },
         };
         let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
         if command_json.len() > 4096 {
@@ -1635,10 +1891,11 @@ impl HubRepository {
 
     pub(crate) fn finish_update_if_terminal(&self, update_id: &str) -> HubResult<FleetUpdateRun> {
         let update = self.fleet_update(update_id)?;
-        if update
-            .nodes
-            .iter()
-            .all(|node| matches!(node.status.as_str(), "succeeded" | "rolled-back"))
+        if !update.nodes.is_empty()
+            && update
+                .nodes
+                .iter()
+                .all(|node| matches!(node.status.as_str(), "succeeded" | "rolled-back"))
         {
             let status = if update.nodes.iter().all(|node| node.status == "succeeded") {
                 "completed"
@@ -1678,6 +1935,59 @@ impl HubRepository {
         }
         Ok(())
     }
+}
+
+fn hub_binary_backup_path(target: &Path, update_id: &str) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dirtydash-hub");
+    parent.join(format!(".{name}.previous-{update_id}"))
+}
+
+fn hub_binary_missing_marker(target: &Path, update_id: &str) -> PathBuf {
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dirtydash-hub");
+    parent.join(format!(".{name}.previous-missing-{update_id}"))
+}
+
+fn set_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn set_private_file(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn set_executable_mode(path: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &std::path::Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1881,12 +2191,13 @@ fn update_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetUpdateR
         created_at: row.get(7)?,
         started_at: row.get(8)?,
         hub_snapshot_at: row.get(9)?,
-        hub_updated_at: row.get(10)?,
-        hub_health_at: row.get(11)?,
-        completed_at: row.get(12)?,
-        failure_reason: row.get(13)?,
-        attempts: row.get(14)?,
-        state_revision: row.get(15)?,
+        hub_restart_requested_at: row.get(10)?,
+        hub_updated_at: row.get(11)?,
+        hub_health_at: row.get(12)?,
+        completed_at: row.get(13)?,
+        failure_reason: row.get(14)?,
+        attempts: row.get(15)?,
+        state_revision: row.get(16)?,
         nodes: Vec::new(),
     })
 }

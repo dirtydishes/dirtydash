@@ -1,6 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use zeroize::Zeroizing;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
@@ -255,6 +256,7 @@ pub struct HubRouterConfig {
     trusted_proxy: Option<TrustedProxyConfig>,
     bootstrap_boundary: BootstrapBoundary,
     bootstrap_setup_token: Option<String>,
+    canonical_hub_url: Option<String>,
     publisher_policy: Option<crate::deployment::PublisherTrustPolicy>,
     fleet_update_artifact_dir: Option<PathBuf>,
     fleet_update_target: Option<PathBuf>,
@@ -274,6 +276,7 @@ impl std::fmt::Debug for HubRouterConfig {
                 "bootstrap_setup_token",
                 &self.bootstrap_setup_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("canonical_hub_url", &self.canonical_hub_url)
             .field(
                 "publisher_policy_configured",
                 &self.publisher_policy.is_some(),
@@ -309,6 +312,7 @@ impl HubRouterConfig {
                 | ListenerTrustMode::TrustedProxy => BootstrapBoundary::Disabled,
             },
             bootstrap_setup_token: None,
+            canonical_hub_url: None,
             publisher_policy: None,
             fleet_update_artifact_dir: None,
             fleet_update_target: None,
@@ -424,6 +428,7 @@ impl HubRouterConfig {
         if let Some(setup_token) = &config.bootstrap_setup_token {
             router_config = router_config.with_bootstrap_setup_token(setup_token.clone());
         }
+        router_config.canonical_hub_url = config.canonical_url.clone();
         router_config.publisher_policy = publisher_policy_from_config(config);
         router_config.fleet_update_artifact_dir = config.fleet_update_artifact_dir.clone();
         router_config.fleet_update_target = config.fleet_update_target.clone();
@@ -438,6 +443,7 @@ struct HubState {
     config: HubRouterConfig,
     enrollment_root: PathBuf,
     known_hosts_path: PathBuf,
+    enrollment_execution_guard: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,7 +462,7 @@ pub struct UsageDayBucket {
     pub estimated_cost_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapOwnerRequest {
     pub username: String,
@@ -467,7 +473,7 @@ pub struct BootstrapOwnerRequest {
     pub tailscale_identity: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerLoginRequest {
     pub username: String,
@@ -588,12 +594,18 @@ pub enum OwnerCommand {
         update_id: String,
         version: String,
         sha256: String,
+        /// The durable node revision this update command owns. Collectors
+        /// echo it in their receipt so stale/replayed commands cannot commit.
+        #[serde(default)]
+        expected_state_revision: i64,
     },
     RollbackUpdate {
         command_id: String,
         update_id: String,
         version: String,
         sha256: String,
+        #[serde(default)]
+        expected_state_revision: i64,
     },
 }
 
@@ -661,6 +673,8 @@ pub struct CollectorUpdateReceipt {
     pub runtime_generation: String,
     pub restarted_at: String,
     pub health_checked_at: String,
+    /// Revision binding issued with the durable Collector command.
+    pub state_revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -707,6 +721,7 @@ impl CollectorCommandResult {
                     update_id,
                     version,
                     sha256,
+                    ..
                 },
                 Self::UpdateApplied {
                     command_id: result_command_id,
@@ -721,6 +736,7 @@ impl CollectorCommandResult {
                     update_id,
                     version,
                     sha256,
+                    ..
                 },
                 Self::UpdateRolledBack {
                     command_id: result_command_id,
@@ -870,10 +886,12 @@ fn validate_update_receipt(receipt: &CollectorUpdateReceipt) -> Result<(), HubEr
     validate_digest(&receipt.sha256, "sha256")?;
     validate_safe_receipt_text(&receipt.collector_version, "collector_version")?;
     validate_safe_receipt_text(&receipt.runtime_generation, "runtime_generation")?;
-    if receipt.protocol_version == 0 || receipt.protocol_version > 100 {
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&receipt.protocol_version)
+        || receipt.state_revision <= 0
+    {
         return Err(HubError::unprocessable(
             "invalid-collector-receipt",
-            "Collector protocol version is outside the bounded range",
+            "Collector protocol or state revision is outside the supported receipt contract",
         ));
     }
     Ok(())
@@ -1002,7 +1020,7 @@ pub(crate) struct OwnerSessionRecord {
     trusted_tailscale_user: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct IssuedOwnerSession {
     session_id: String,
     owner_username: String,
@@ -1011,17 +1029,40 @@ pub(crate) struct IssuedOwnerSession {
     trusted_tailscale_user: Option<String>,
 }
 
+impl std::fmt::Debug for IssuedOwnerSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedOwnerSession")
+            .field("session_id", &"[REDACTED]")
+            .field("owner_username", &self.owner_username)
+            .field("time_zone", &self.time_zone)
+            .field("csrf_token", &"[REDACTED]")
+            .field("trusted_tailscale_user", &self.trusted_tailscale_user)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthenticatedCollector {
     machine_id: String,
     credential_id: String,
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct IssuedCollectorCredential {
     machine_id: String,
     credential_id: String,
-    token: String,
+    token: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for IssuedCollectorCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedCollectorCredential")
+            .field("machine_id", &self.machine_id)
+            .field("credential_id", &self.credential_id)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -1361,6 +1361,19 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_collector_credentials_machine
                 ON collector_credentials(machine_id, revoked_at);
 
+            CREATE TABLE IF NOT EXISTS enrollment_credentials (
+                enrollment_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                credential_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                provisioned_at TEXT,
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE RESTRICT,
+                FOREIGN KEY(credential_id) REFERENCES collector_credentials(credential_id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_enrollment_credentials_machine
+                ON enrollment_credentials(machine_id, status);
+
             CREATE TABLE IF NOT EXISTS collector_credential_rotations (
                 rotation_id TEXT PRIMARY KEY,
                 machine_id TEXT NOT NULL,
@@ -1490,6 +1503,7 @@ impl Database {
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 hub_snapshot_at TEXT,
+                hub_restart_requested_at TEXT,
                 hub_updated_at TEXT,
                 hub_health_at TEXT,
                 completed_at TEXT,
@@ -1584,6 +1598,12 @@ impl Database {
             conn,
             "fleet_update_nodes",
             "previous_runtime_generation",
+            "TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "fleet_update_runs",
+            "hub_restart_requested_at",
             "TEXT",
         )?;
         Ok(())

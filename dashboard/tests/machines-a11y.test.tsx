@@ -8,7 +8,7 @@ import { DestructiveModal } from "../src/machines";
 function ModalHarness() {
   const [open, setOpen] = useState(true);
   return (
-    <div>
+    <main>
       <button type="button" autoFocus onClick={() => setOpen(true)}>open confirmation</button>
       <p>Background content</p>
       {open ? (
@@ -18,7 +18,7 @@ function ModalHarness() {
           <button type="button">cancel</button>
         </DestructiveModal>
       ) : null}
-    </div>
+    </main>
   );
 }
 
@@ -46,7 +46,7 @@ describe("destructive confirmation dialog", () => {
     expect(document.activeElement).toBe(trigger);
     expect((trigger as HTMLElement & { inert?: boolean }).inert).toBe(false);
 
-    const result = await axe.run(container, { rules: { "color-contrast": { enabled: false } } });
+    const result = await axe.run(document.body, { rules: { "color-contrast": { enabled: false } } });
     expect(result.violations).toEqual([]);
   });
 

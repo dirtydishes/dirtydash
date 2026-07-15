@@ -160,6 +160,9 @@ impl EnrollmentBackend for ScriptedBackend {
             plan_hash: plan_hash.to_string(),
             release: artifact.manifest().manifest().release.clone(),
             artifact_sha256: artifact.descriptor().sha256.clone(),
+            machine_id: None,
+            collector_credential_id: None,
+            collector_hub_url: None,
             artifact_size: artifact.descriptor().size,
             publisher_key_id: artifact.manifest().key_id().to_string(),
             hub_health_verified: true,
@@ -650,6 +653,9 @@ fn production_ssh_enrollment_auth_probe_failure_and_snapshot_use_real_backend() 
         database_seed: None,
         listener: &listener,
         secrets: &secrets,
+        collector_credential_token: None,
+        collector_machine_id: None,
+        collector_hub_url: None,
     };
     let error = backend.execute(request).unwrap_err().to_string();
     assert!(!error.contains("PASSWORD_SENTINEL"));

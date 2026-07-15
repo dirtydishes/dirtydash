@@ -24,6 +24,10 @@ See also:
 - Incompatible protocol versions fail explicitly; silent downgrade is not an accepted behavior.
 - Hub ingestion writes remain serialized behind the repository seam even when many Collectors are connected.
 - Collectors keep unacknowledged work locally and reconcile on a periodic schedule in addition to best-effort watcher hints.
+- Collector update commands are bound to a durable Machine state revision and exact approved version/digest. The Collector verifies downloaded artifact bytes before an atomic executable replacement.
+- Update receipts are accepted only after the typed command acknowledgement, a new runtime generation, restart/health timestamps after update start, and a current/previous protocol version. Receipt retries are idempotent.
+- A missing receipt after the bounded update window produces a durable rollback command; rollback acknowledgement, not a browser claim, closes the node's rollback state.
+- The Hub's signed artifact download is authenticated, update-order constrained, digest-checked, and size bounded; it never accepts a Collector-provided URL or artifact path.
 
 ## Privacy Invariants
 
@@ -33,6 +37,7 @@ See also:
 - Collector-local manifests may retain machine-local file paths when needed for parsing, but Hub persistence stores only redacted or non-reversible identifiers.
 - Deployment and enrollment secrets live only in process/request memory before they are discarded or transformed into hashed credentials.
 - Hub command and acknowledgement persistence stores no raw Collector token; credential tables contain hashes only.
+- Hosted enrollment secrets are transferred over the authenticated SSH stdin channel into an atomic restrictive secret file. Browser retry state clears controlled credential fields and never retains secret-bearing request objects in retry closures.
 
 ## Trust-Mode Invariants
 
@@ -40,6 +45,7 @@ See also:
 - Public reverse proxies ignore Tailscale identity headers and require fallback administrator authentication.
 - Collector authentication, administrator authentication, and browser session security remain separate concerns.
 - Browser-side administrative actions require normal session protections, including CSRF-aware state changes.
+- Destructive confirmation dialogs render through a body portal, inert the complete application background, trap keyboard focus, and restore the invoking control without relying on viewport width as an authorization boundary.
 
 ## Diagnostic Invariants
 

@@ -39,6 +39,11 @@ pub struct HubConfig {
     /// Non-secret Hub listener policy. Tailscale Serve is the default.
     #[serde(default)]
     pub listener: ListenerPlan,
+    /// Canonical URL reachable by outbound Collectors. Hosted enrollment must
+    /// set this explicitly; a Hub loopback bind is not a reachable Collector
+    /// endpoint for another Machine.
+    #[serde(default, alias = "hub_url", alias = "advertised_url")]
+    pub canonical_url: Option<String>,
     /// Non-secret release publisher allowlist. Deployment requires both
     /// values and checks them against the supplied public key/manifest.
     #[serde(default)]
@@ -91,6 +96,9 @@ impl HubConfig {
         self.listener.validate()?;
         if let Some(proxy) = &self.trusted_proxy {
             proxy.validate()?;
+        }
+        if let Some(url) = &self.canonical_url {
+            validate_canonical_hub_url(url)?;
         }
         if self.allowed_publisher_key_id.is_some() != self.allowed_publisher_fingerprint.is_some()
             || (self.allowed_publisher_public_key.is_some()
@@ -197,6 +205,28 @@ pub struct CollectorConfig {
     pub approved_updates: Vec<ApprovedUpdateConfig>,
 }
 
+fn validate_canonical_hub_url(value: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(value).context("canonical Hub URL is not a valid URL")?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        bail!("canonical Hub URL must be an https URL without a path, query, or fragment");
+    }
+    if parsed.scheme() == "http"
+        && !parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+    {
+        bail!("canonical Hub URL must use TLS unless it targets loopback");
+    }
+    Ok(())
+}
+
 fn default_collector_reconcile_seconds() -> u64 {
     15 * 60
 }
@@ -226,6 +256,7 @@ impl fmt::Debug for HubConfig {
             .field("trusted_proxy", &self.trusted_proxy)
             .field("cookie_transport", &self.cookie_transport)
             .field("listener", &self.listener)
+            .field("canonical_url", &self.canonical_url)
             .field("allowed_publisher_key_id", &self.allowed_publisher_key_id)
             .field(
                 "allowed_publisher_fingerprint",
@@ -523,5 +554,23 @@ mod tests {
             source_cidrs: vec!["127.0.0.1/33".to_string()],
         });
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_hub_url_is_an_origin_and_tls_is_required_off_loopback() {
+        let mut config = Config::default();
+        config.hub.canonical_url = Some("https://hub.example.test/".to_string());
+        config.validate().unwrap();
+        for invalid in [
+            "http://hub.example.test/",
+            "https://user:password@hub.example.test/",
+            "https://hub.example.test/dashboard",
+            "https://hub.example.test/?redirect=1",
+        ] {
+            config.hub.canonical_url = Some(invalid.to_string());
+            assert!(config.validate().is_err(), "accepted invalid URL {invalid}");
+        }
+        config.hub.canonical_url = Some("http://127.0.0.1:4599/".to_string());
+        config.validate().unwrap();
     }
 }

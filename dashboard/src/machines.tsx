@@ -1,4 +1,5 @@
 import React, { FormEvent, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Archive,
   ArrowDownToLine,
@@ -135,6 +136,7 @@ export interface FleetUpdateRun {
   created_at: string;
   started_at?: string | null;
   hub_snapshot_at?: string | null;
+  hub_restart_requested_at?: string | null;
   hub_updated_at?: string | null;
   hub_health_at?: string | null;
   completed_at?: string | null;
@@ -693,13 +695,21 @@ export function DestructiveModal({
     const dialog = dialogRef.current;
     if (!dialog) return;
     const layer = dialog.parentElement;
-    const background = layer?.parentElement;
-    const inertSiblings: HTMLElement[] = [];
-    if (background && layer) {
-      Array.from(background.children).forEach((child) => {
+    const inertElements: Array<{ element: HTMLElement; previous: boolean }> = [];
+    // Render into document.body so the confirmation cannot be clipped by a
+    // pane's overflow context. Inert every application sibling, not only the
+    // detail-pane children, while the destructive decision is open. Marking
+    // descendants too keeps the state observable in browsers/test DOMs that
+    // do not expose inherited `inert` through the property API.
+    if (layer) {
+      Array.from(document.body.children).forEach((child) => {
         if (child !== layer && child instanceof HTMLElement) {
-          (child as HTMLElement & { inert?: boolean }).inert = true;
-          inertSiblings.push(child);
+          const elements = [child, ...Array.from(child.querySelectorAll<HTMLElement>("*"))];
+          elements.forEach((element) => {
+            const inertElement = element as HTMLElement & { inert?: boolean };
+            inertElements.push({ element, previous: inertElement.inert === true });
+            inertElement.inert = true;
+          });
         }
       });
     }
@@ -733,17 +743,22 @@ export function DestructiveModal({
     dialog.addEventListener("keydown", onKeyDown);
     return () => {
       dialog.removeEventListener("keydown", onKeyDown);
-      inertSiblings.forEach((sibling) => { (sibling as HTMLElement & { inert?: boolean }).inert = false; });
+      inertElements.forEach(({ element, previous }) => {
+        (element as HTMLElement & { inert?: boolean }).inert = previous;
+      });
       previouslyFocused?.focus();
     };
   }, []);
-  return <div className="modal-layer" role="presentation">
-    <button type="button" className="modal-backdrop" aria-label="Close confirmation" onClick={onClose} />
-    <section ref={dialogRef} id={id} className={`modal-dialog${danger ? " danger-box" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onKeyDown={(event) => event.stopPropagation()}>
-      <h3 id={titleId}>{title}</h3>
-      {children}
-    </section>
-  </div>;
+  return createPortal(
+    <div className="modal-layer" role="presentation">
+      <button type="button" className="modal-backdrop" aria-label="Close confirmation" onClick={onClose} />
+      <section ref={dialogRef} id={id} className={`modal-dialog${danger ? " danger-box" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onKeyDown={(event) => event.stopPropagation()}>
+        <h3 id={titleId}>{title}</h3>
+        {children}
+      </section>
+    </div>,
+    document.body
+  );
 }
 
 function DiagnosticsSummary({ diagnostics }: { diagnostics: MachineDiagnostics }) {
@@ -793,15 +808,20 @@ function EnrollmentTab({ csrf, desktopAdmin, drafts, onChange }: { csrf: string;
   }
   async function step(path: string, body: unknown) {
     if (!selected) return;
+    const carriesSecret = path === "trust" || path === "cleanup" || path === "execute";
+    // Secret-bearing request objects must not survive a failed fetch in a
+    // retry closure. Clear the controlled fields before the request; a retry
+    // therefore requires fresh operator input instead of replaying credentials.
+    if (carriesSecret) setSecrets({ password: "", key_passphrase: "", sudo_password: "" });
+    if (path === "execute") setArtifact((current) => ({ ...current, seed: "" }));
     setWorking(true); setError(null); setRetry(null);
     try {
       await postJson<unknown>(`/api/v1/admin/enrollment/${encodeURIComponent(selected.id)}/${path}`, body, csrf);
-      setSecrets({ password: "", key_passphrase: "", sudo_password: "" });
       setConfirmFingerprint("");
       onChange();
     } catch (stepError) {
       setError((stepError as Error).message);
-      setRetry(() => () => void step(path, body));
+      setRetry(() => () => void step(path, carriesSecret ? {} : body));
     } finally { setWorking(false); }
   }
   const secretBody = { password: secrets.password || undefined, key_passphrase: secrets.key_passphrase || undefined, sudo_password: secrets.sudo_password || undefined };

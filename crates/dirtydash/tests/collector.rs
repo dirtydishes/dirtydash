@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use dirtydash::collector::{
-    ApprovedUpdate, Collector, CollectorOptions, CollectorTransport, CommandOutcome, RetryClass,
-    RetryPolicy, TransportError, OWNER_COMMAND_LONG_POLL,
+    ApprovedUpdate, AtomicFileUpdater, Collector, CollectorOptions, CollectorTransport,
+    CommandOutcome, RestrictedUpdater, RetryClass, RetryPolicy, TransportError,
+    OWNER_COMMAND_LONG_POLL,
 };
 use dirtydash::config::SourceRoot;
 use dirtydash::db::Database;
@@ -744,6 +745,24 @@ fn restricted_updater_verifies_bytes_and_applies_atomically() {
 }
 
 #[test]
+fn atomic_updater_replay_preserves_the_original_rollback_snapshot() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("installed/dirtydash");
+    let old = b"old-executable";
+    let new = b"new-executable";
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, old).unwrap();
+    let updater = AtomicFileUpdater::new(&target);
+    let digest = hex::encode(Sha256::digest(new));
+
+    updater.apply("0.1.2", &digest, new).unwrap();
+    updater.apply("0.1.2", &digest, new).unwrap();
+    assert_eq!(fs::read(target.with_extension("previous")).unwrap(), old);
+    updater.rollback("0.1.2", &digest).unwrap();
+    assert_eq!(fs::read(target).unwrap(), old);
+}
+
+#[test]
 fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
     let (_dir, mut collector, _roots, _usage_path, _collector_path) = make_collector();
     let now = at("2026-07-15T00:00:00Z");
@@ -795,6 +814,7 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
         update_id: "update-test-1".to_string(),
         version: "0.1.2".to_string(),
         sha256: "a".repeat(64),
+        expected_state_revision: 1,
     });
     assert!(matches!(
         collector.poll_owner_command(&mut transport, now).unwrap(),
@@ -805,6 +825,7 @@ fn watcher_debounce_fallback_commands_and_update_allowlist_are_visible() {
         update_id: "update-test-2".to_string(),
         version: "0.1.2".to_string(),
         sha256: "b".repeat(64),
+        expected_state_revision: 1,
     });
     assert!(matches!(
         collector.poll_owner_command(&mut transport, now).unwrap(),

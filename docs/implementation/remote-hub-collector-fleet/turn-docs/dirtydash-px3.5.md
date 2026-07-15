@@ -59,14 +59,15 @@ The implementation session is sole mutable owner. The coordinator owns Beads, in
 
 ## Implementation And Delegation Evidence
 
-The bound implementation checkout contains the Hub fleet repository/router, additive schema migration, Collector repair command, hosted enrollment endpoints, signed rollout persistence/coordinator, and Machines workspace. The repair pass adds typed bounded command/receipt schemas, deterministic update commands, transactional lifecycle revisions, rollback desired-version/runtime state, server-owned restart reconciliation, cleanup retry, and fail-closed private Tailscale identity handling. The dashboard uses native Tab order, tablist arrow/Home/End navigation, explicit icon-plus-text states, focus-visible styling, reduced-motion support, container-responsive controls, modal focus/inert behavior, mutation/load error separation, and server-owned receipt rendering. Contract and rendered axe/focus tests cover the repaired surface.
+The bound implementation checkout contains the Hub fleet repository/router, additive schema migration, Collector repair command, hosted enrollment endpoints, signed rollout persistence/coordinator, and Machines workspace. This repair pass adds typed bounded command/receipt schemas, deterministic update and rollback commands, transactional lifecycle revisions, rollback desired-version/runtime state, canonical hosted Hub URL rendering, request-scoped credential reservation and atomic restrictive secret transfer, server-owned restart reconciliation, timeout recovery, cleanup retry, private snapshot permissions, and fail-closed private Tailscale identity handling. The dashboard uses native Tab order, tablist arrow/Home/End navigation, explicit icon-plus-text states, focus-visible styling, reduced-motion support, container-responsive controls, a body-portal destructive dialog with complete background inertness, mutation/load error separation, secret-free retry closures, and server-owned receipt rendering. Contract and rendered axe/focus tests cover the repaired surface.
 
 ## Changed Behavior And Files
 
 - Backend: `crates/dirtydash/src/hub/fleet.rs`, `hub/router.rs`, `hub/repository.rs`, `hub/auth.rs`, `hub/mod.rs`, `hub/protocol.rs`, `db.rs`, `config.rs`, `enrollment.rs`, and `collector.rs`.
 - Frontend: `dashboard/src/machines.tsx`, `dashboard/src/main.tsx`, `dashboard/src/styles.css`, `dashboard/tests/machines-contract.test.mjs`, and `dashboard/tests/machines-a11y.test.tsx`.
 - Dashboard tooling: `dashboard/package.json`, `dashboard/package-lock.json`, and `dashboard/vite.config.ts` add strict TypeScript types plus rendered Vitest/jsdom/axe coverage.
-- Documentation: this turn document and the existing phase loop-state handoff. Protected committed `dashboard/dist` artifacts were not regenerated into the repair diff.
+- Generated dashboard artifacts: `dashboard/dist` is regenerated from the repaired portal/inert and secret-state UI; stale hashed assets are removed.
+- Documentation: this turn document, the phase docs, and `/api/v1` invariant notes record canonical URLs, secret transfer, receipt/rollback, lifecycle, and snapshot-permission contracts.
 
 ## Review
 
@@ -82,16 +83,17 @@ Evidence:
 
 - `cargo fmt --all -- --check` passed.
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
-- `cargo test --all-targets --all-features` passed: 115 unit/integration tests plus collector/CLI suites.
-- `npm --prefix dashboard run build` passed.
+- `cargo test --all-targets --all-features` passed: 117 library tests, 9 CLI tests, and 15 Collector integration tests.
+- `npm --prefix dashboard run build` passed with regenerated hashed `dashboard/dist` assets.
 - `npm --prefix dashboard run test` passed: 2 rendered modal focus/inert/axe tests.
 - `npm --prefix dashboard run test:contract` passed: `Machines DOM/a11y contract: passed`.
 - `npm --prefix dashboard exec tsc -- --noEmit` passed with dashboard-local React typings.
+- Production bundle inspection confirmed the generated JavaScript contains the portal/inert modal behavior.
 - `git diff --check` passed.
 
 ## PR And Commits
 
-Base implementation commit `d2ace45` remains the PR #12 base. The bounded repair commit is recorded after local validation; PR #12 continues to target `lavender/remote-hub-collector-fleet-implementation`.
+Base implementation commit `d2ace45` remains the PR #12 base. The bounded repair is kept on `lavender/remote-hub-collector-fleet-5-fleet`; commit and push evidence are recorded only after the final local gates pass. The PR target remains `lavender/remote-hub-collector-fleet-implementation`.
 
 ## Beads Updates And Follow-Ups
 
@@ -107,4 +109,4 @@ Archive and permanent deletion are deliberately separate operations. Hosted sign
 
 ## Closeout
 
-The bounded repair implementation and local validation are complete. `.pi-subagents/` is absent, protected generated dashboard artifacts are unchanged, and the repair commit/push evidence is recorded above. External CI, browser, and real-tailnet checks remain integration-owned.
+The long-running Pi coordinator was stopped at a file-stable boundary after the repair owner continued broadening scope beyond repeated green gates and the compacted parent session no longer exposed its steering tool. The preserved checkout passed the full external checkpoint gates after two repair-caused fixture/module-placement corrections. `.pi-subagents/` is absent, generated dashboard artifacts are refreshed, and external CI, browser, and real-tailnet checks remain integration-owned. Phase 5 stays open and PR #12 stays unmerged for the approved tracer-bullet closure plan.

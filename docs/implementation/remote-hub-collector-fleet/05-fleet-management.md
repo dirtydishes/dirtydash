@@ -30,9 +30,10 @@ Out of scope:
 
 ## Constraints
 
-- Removing a Machine revokes its Collector and archives history; deletion is separate.
-- Hub protocol supports current and previous Collector versions.
-- Failed nodes roll back independently.
+- Removing a Machine revokes its Collector and archives history; deletion is separate. Active updates serialize lifecycle, credential, and owner-command mutations; update and enrollment audit rows prevent destructive deletion when history would be lost.
+- Hub protocol supports current and previous Collector versions. Update receipts bind the exact command, target digest/version, runtime generation, restart/health timestamps, and durable Machine revision.
+- Failed nodes roll back independently. Receipt timeouts transition nodes to a durable rollback command; retries are idempotent across Collector and Hub process restarts.
+- Hub and Collector binaries are replaced through fsynced, executable-safe atomic paths with per-update rollback snapshots. Fleet snapshots and rollback artifacts are private (`0700`/`0600` as applicable).
 
 ## Settled Decisions
 
@@ -51,7 +52,8 @@ None.
 
 - A Machine can be added entirely through the hosted UI using Hub-side SSH.
 - Rotation, revocation, repair, archive, and deletion tests preserve their distinct semantics.
-- Fleet update tests snapshot and update the Hub first, tolerate current/previous protocol versions, and independently roll back failures.
+- Fleet update tests snapshot and update the Hub first, tolerate current/previous protocol versions, bind receipts to revisions, recover timed-out nodes with rollback commands, and independently roll back failures.
+- Dashboard tests cover portal-mounted destructive dialogs, subtree inertness, focus trapping/restoration, secret-bearing enrollment retry cleanup, rendered axe checks, and responsive administrative layout.
 
 ## Quality Gates
 

@@ -43,6 +43,7 @@ pub const DEFAULT_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(15 * 6
 pub const DEFAULT_WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
 pub const OWNER_COMMAND_LONG_POLL: Duration = Duration::from_secs(20);
 pub const DEFAULT_OUTBOX_BATCH_LIMIT: usize = 32;
+const MAX_UPDATE_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconciliationReason {
@@ -183,6 +184,22 @@ pub trait CollectorTransport {
     ) -> std::result::Result<(), TransportError> {
         let _ = (credential_token, machine_id, command_id, result);
         Ok(())
+    }
+
+    /// Fetch the exact signed artifact selected by the Hub update run. The
+    /// request is authenticated and the returned bytes are verified again by
+    /// the Collector before replacement.
+    fn download_update_artifact(
+        &mut self,
+        credential_token: &str,
+        update_id: &str,
+        version: &str,
+        sha256: &str,
+    ) -> std::result::Result<Vec<u8>, TransportError> {
+        let _ = (credential_token, update_id, version, sha256);
+        Err(TransportError::protocol(
+            "Collector update artifact download is unsupported by this transport",
+        ))
     }
 
     fn report_collector_update_receipt(
@@ -371,6 +388,42 @@ impl CollectorTransport for CollectorHttpTransport {
         Ok(())
     }
 
+    fn download_update_artifact(
+        &mut self,
+        credential_token: &str,
+        update_id: &str,
+        version: &str,
+        sha256: &str,
+    ) -> std::result::Result<Vec<u8>, TransportError> {
+        let response = self
+            .client
+            .get(self.endpoint(&format!("/api/v1/collector/updates/{update_id}/artifact")))
+            .query(&[("version", version), ("sha256", sha256)])
+            .bearer_auth(credential_token)
+            .send()
+            .map_err(Self::transport_error)?;
+        if !response.status().is_success() {
+            return Err(Self::response_error(&response));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_UPDATE_ARTIFACT_BYTES as u64)
+        {
+            return Err(TransportError::protocol(
+                "Hub update artifact exceeds the bounded size limit",
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|_| TransportError::protocol("Hub returned an invalid update artifact"))?;
+        if bytes.len() > MAX_UPDATE_ARTIFACT_BYTES {
+            return Err(TransportError::protocol(
+                "Hub update artifact exceeds the bounded size limit",
+            ));
+        }
+        Ok(bytes.to_vec())
+    }
+
     fn report_collector_update_receipt(
         &mut self,
         credential_token: &str,
@@ -456,6 +509,8 @@ pub struct ApprovedUpdate {
 pub trait RestrictedUpdater: Send + Sync {
     fn apply(&self, version: &str, expected_sha256: &str, artifact: &[u8]) -> Result<()>;
 
+    /// Implementations should make rollback safe to replay after a process
+    /// crash between the atomic replacement and its acknowledgement.
     fn rollback(&self, _version: &str, _expected_sha256: &str) -> Result<()> {
         anyhow::bail!("the configured Collector updater does not support rollback")
     }
@@ -472,6 +527,31 @@ impl AtomicFileUpdater {
             target: target.into(),
         }
     }
+}
+
+fn set_executable_mode(path: &std::path::Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o111))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
 }
 
 impl RestrictedUpdater for AtomicFileUpdater {
@@ -491,9 +571,24 @@ impl RestrictedUpdater for AtomicFileUpdater {
         {
             anyhow::bail!("update digest is not a SHA-256 hex digest");
         }
+        if artifact.len() > MAX_UPDATE_ARTIFACT_BYTES {
+            anyhow::bail!("Collector update artifact exceeds the bounded size limit");
+        }
         let actual = hex::encode(Sha256::digest(artifact));
         if actual != expected {
             anyhow::bail!("update artifact digest does not match the approved digest");
+        }
+        // A crash after atomic replacement but before the command receipt can
+        // replay the same update. Do not overwrite the original rollback
+        // snapshot with a copy of the already-installed artifact.
+        if self
+            .target
+            .exists()
+            .then(|| fs::read(&self.target).ok())
+            .flatten()
+            .is_some_and(|current| hex::encode(Sha256::digest(current)) == expected)
+        {
+            return Ok(());
         }
         let parent = self
             .target
@@ -501,6 +596,19 @@ impl RestrictedUpdater for AtomicFileUpdater {
             .context("configured update target has no parent directory")?;
         fs::create_dir_all(parent)?;
         let backup = self.target.with_extension("previous");
+        let existing_mode = if self.target.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                Some(fs::metadata(&self.target)?.permissions().mode() & 0o777)
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        } else {
+            None
+        };
         if self.target.exists() {
             fs::copy(&self.target, &backup).with_context(|| {
                 format!(
@@ -508,6 +616,7 @@ impl RestrictedUpdater for AtomicFileUpdater {
                     self.target.display()
                 )
             })?;
+            set_executable_mode(&backup, existing_mode.unwrap_or(0o755))?;
         }
         let temp = parent.join(format!(
             ".{}.{}.tmp",
@@ -524,6 +633,7 @@ impl RestrictedUpdater for AtomicFileUpdater {
         file.write_all(artifact)?;
         file.sync_all()?;
         drop(file);
+        set_executable_mode(&temp, existing_mode.unwrap_or(0o755))?;
         fs::rename(&temp, &self.target).with_context(|| {
             format!(
                 "atomically applying approved update {} to {}",
@@ -531,6 +641,7 @@ impl RestrictedUpdater for AtomicFileUpdater {
                 self.target.display()
             )
         })?;
+        sync_parent_directory(parent)?;
         Ok(())
     }
 
@@ -540,10 +651,31 @@ impl RestrictedUpdater for AtomicFileUpdater {
         }
         let backup = self.target.with_extension("previous");
         if !backup.exists() {
+            // A process can die after the atomic rename but before the Hub
+            // acknowledgement. Treat an already non-target executable as the
+            // completed rollback rather than moving the node into a permanent
+            // retry loop.
+            if self
+                .target
+                .exists()
+                .then(|| fs::read(&self.target).ok())
+                .flatten()
+                .is_some_and(|current| {
+                    !hex::encode(Sha256::digest(current)).eq_ignore_ascii_case(expected_sha256)
+                })
+            {
+                return Ok(());
+            }
             anyhow::bail!("Collector rollback snapshot is unavailable");
         }
         fs::rename(&backup, &self.target)
             .with_context(|| format!("restoring the Collector rollback snapshot for {version}"))?;
+        set_executable_mode(&self.target, 0o755)?;
+        sync_parent_directory(
+            self.target
+                .parent()
+                .context("Collector rollback target has no parent")?,
+        )?;
         Ok(())
     }
 }
@@ -800,6 +932,12 @@ impl Collector {
             .store
             .collector_state("runtime_started_at")?
             .context("Collector runtime start time is missing")?;
+        let state_revision = self
+            .store
+            .collector_state("pending_update_state_revision")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .context("pending Collector update state revision is missing")?;
         let diagnostics = self.diagnostics()?;
         if diagnostics.watcher.degraded || diagnostics.terminal_outbox > 0 {
             return Err(anyhow::anyhow!("Collector health proof is not ready"));
@@ -814,6 +952,7 @@ impl Collector {
             runtime_generation,
             restarted_at,
             health_checked_at: now.to_rfc3339(),
+            state_revision,
         };
         let candidates = self.credential_candidates()?;
         let mut last_error = None;
@@ -821,6 +960,8 @@ impl Collector {
             match transport.report_collector_update_receipt(&credential, &receipt) {
                 Ok(()) => {
                     self.store.set_collector_state("pending_update_id", "")?;
+                    self.store
+                        .set_collector_state("pending_update_state_revision", "")?;
                     self.store
                         .set_collector_state("restart_requested", "false")?;
                     return Ok(true);
@@ -1541,6 +1682,25 @@ impl Collector {
                 // acknowledgement uses the replacement as the current token.
                 (outcome, replacement_token, false)
             }
+            OwnerCommand::ApprovedUpdate {
+                update_id,
+                command_id,
+                version,
+                sha256,
+                expected_state_revision,
+            } => (
+                self.handle_approved_update_with_transport(
+                    transport,
+                    &credential,
+                    update_id,
+                    command_id,
+                    version,
+                    sha256,
+                    expected_state_revision,
+                )?,
+                credential,
+                used_pending,
+            ),
             command => (
                 self.handle_owner_command(command, now)?,
                 credential,
@@ -1560,19 +1720,27 @@ impl Collector {
         Ok(Some(outcome))
     }
 
-    pub fn apply_approved_update_artifact(
+    fn apply_update_artifact_bytes(
         &self,
         version: &str,
         expected_sha256: &str,
         artifact: &[u8],
+        require_allowlist: bool,
     ) -> Result<()> {
         let digest = expected_sha256.trim().to_ascii_lowercase();
-        let approved =
-            self.options.approved_updates.iter().any(|entry| {
-                entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest)
-            });
-        if !approved || !is_sha256_hex(&digest) {
+        if !is_sha256_hex(&digest)
+            || (require_allowlist
+                && !self.options.approved_updates.iter().any(|entry| {
+                    entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest)
+                }))
+        {
             anyhow::bail!("artifact is not approved by the configured version/digest allowlist");
+        }
+        let actual = hex::encode(Sha256::digest(artifact));
+        if actual != digest {
+            anyhow::bail!(
+                "downloaded Collector artifact digest does not match the approved digest"
+            );
         }
         self.updater.apply(version, &digest, artifact)?;
         self.store
@@ -1580,6 +1748,111 @@ impl Collector {
         self.store
             .set_collector_state("applied_update_sha256", &digest)?;
         Ok(())
+    }
+
+    pub fn apply_approved_update_artifact(
+        &self,
+        version: &str,
+        expected_sha256: &str,
+        artifact: &[u8],
+    ) -> Result<()> {
+        self.apply_update_artifact_bytes(version, expected_sha256, artifact, true)
+    }
+
+    fn stage_approved_update(
+        &self,
+        update_id: String,
+        command_id: String,
+        version: String,
+        digest: String,
+        expected_state_revision: i64,
+    ) -> Result<CommandOutcome> {
+        self.store
+            .set_collector_state("pending_update_id", &update_id)?;
+        self.store
+            .set_collector_state("pending_update_command_id", &command_id)?;
+        self.store
+            .set_collector_state("pending_update_version", &version)?;
+        self.store
+            .set_collector_state("pending_update_sha256", &digest)?;
+        self.store.set_collector_state(
+            "pending_update_state_revision",
+            &expected_state_revision.to_string(),
+        )?;
+        self.store
+            .set_collector_state("restart_requested", "true")?;
+        Ok(CommandOutcome::UpdateApplied {
+            update_id,
+            command_id,
+            version,
+            sha256: digest,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_approved_update_with_transport<T: CollectorTransport>(
+        &self,
+        transport: &mut T,
+        credential: &str,
+        update_id: String,
+        command_id: String,
+        version: String,
+        sha256: String,
+        expected_state_revision: i64,
+    ) -> Result<CommandOutcome> {
+        let digest = sha256.trim().to_ascii_lowercase();
+        if !is_sha256_hex(&digest)
+            || !is_safe_update_version(&version)
+            || expected_state_revision <= 0
+        {
+            return Ok(CommandOutcome::Rejected {
+                reason: "approved update version, digest, or revision is invalid".to_string(),
+            });
+        }
+        if !self
+            .options
+            .approved_updates
+            .iter()
+            .any(|entry| entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest))
+        {
+            return Ok(CommandOutcome::Rejected {
+                reason: "update is not present in the approved version/digest allowlist"
+                    .to_string(),
+            });
+        }
+        if let Some(directory) = &self.options.update_artifact_dir {
+            let artifact = match fs::read(directory.join(format!("{version}.artifact"))) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(CommandOutcome::Rejected {
+                        reason: "approved update artifact is unavailable".to_string(),
+                    })
+                }
+            };
+            self.apply_update_artifact_bytes(&version, &digest, &artifact, true)?;
+        } else {
+            let artifact = match transport
+                .download_update_artifact(credential, &update_id, &version, &digest)
+            {
+                Ok(bytes) => bytes,
+                Err(error)
+                    if matches!(error.class, RetryClass::Permanent | RetryClass::Protocol) =>
+                {
+                    return Ok(CommandOutcome::Rejected {
+                        reason: "approved update artifact is unavailable from the Hub".to_string(),
+                    })
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            };
+            self.apply_update_artifact_bytes(&version, &digest, &artifact, true)?;
+        }
+        self.stage_approved_update(
+            update_id,
+            command_id,
+            version,
+            digest,
+            expected_state_revision,
+        )
     }
 
     fn rollback_approved_update(&self, version: &str, expected_sha256: &str) -> Result<()> {
@@ -1739,6 +2012,7 @@ impl Collector {
                 command_id,
                 version,
                 sha256,
+                expected_state_revision,
             } => {
                 let digest = sha256.trim().to_ascii_lowercase();
                 let Some(approved) = self
@@ -1755,9 +2029,13 @@ impl Collector {
                             .to_string(),
                     });
                 };
-                if !is_sha256_hex(&digest) || !is_safe_update_version(&version) {
+                if !is_sha256_hex(&digest)
+                    || !is_safe_update_version(&version)
+                    || expected_state_revision <= 0
+                {
                     return Ok(CommandOutcome::Rejected {
-                        reason: "approved update version or digest is invalid".to_string(),
+                        reason: "approved update version, digest, or revision is invalid"
+                            .to_string(),
                     });
                 }
                 if let Some(directory) = &self.options.update_artifact_dir {
@@ -1785,6 +2063,10 @@ impl Collector {
                     .set_collector_state("pending_update_version", &version)?;
                 self.store
                     .set_collector_state("pending_update_sha256", &digest)?;
+                self.store.set_collector_state(
+                    "pending_update_state_revision",
+                    &expected_state_revision.to_string(),
+                )?;
                 self.store
                     .set_collector_state("restart_requested", "true")?;
                 Ok(CommandOutcome::UpdateApplied {
@@ -1799,11 +2081,22 @@ impl Collector {
                 command_id,
                 version,
                 sha256,
+                expected_state_revision,
             } => {
+                if expected_state_revision <= 0 {
+                    return Ok(CommandOutcome::Rejected {
+                        reason: "rollback revision is invalid".to_string(),
+                    });
+                }
                 self.rollback_approved_update(&version, &sha256)?;
                 self.store.set_collector_state("pending_update_id", "")?;
                 self.store
-                    .set_collector_state("restart_requested", "false")?;
+                    .set_collector_state("pending_update_state_revision", "")?;
+                // The running process must exit so the service manager starts
+                // the restored executable; changing the on-disk file alone
+                // cannot prove rollback of the current runtime generation.
+                self.store
+                    .set_collector_state("restart_requested", "true")?;
                 Ok(CommandOutcome::UpdateRolledBack {
                     update_id,
                     command_id,
@@ -2145,6 +2438,7 @@ pub fn run_daemon(paths: &crate::app_paths::AppPaths, config: &Config) -> Result
     if let Ok(mut transport) = CollectorHttpTransport::new(hub_url) {
         let _ = runtime.report_pending_update_receipt(&mut transport, Utc::now());
     }
+    let mut next_receipt_retry = Utc::now() + ChronoDuration::seconds(5);
 
     let (watch_tx, watch_rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = match RecommendedWatcher::new(
@@ -2293,6 +2587,12 @@ pub fn run_daemon(paths: &crate::app_paths::AppPaths, config: &Config) -> Result
             }
         }
         let now = Utc::now();
+        if now >= next_receipt_retry {
+            if let Ok(mut transport) = CollectorHttpTransport::new(hub_url) {
+                let _ = runtime.report_pending_update_receipt(&mut transport, now);
+            }
+            next_receipt_retry = now + ChronoDuration::seconds(5);
+        }
         if now >= next_renewal {
             match guard.renew(now, Duration::from_secs(90)) {
                 Ok(true) => next_renewal = now + ChronoDuration::seconds(30),

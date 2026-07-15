@@ -11,7 +11,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::net::SocketAddr;
+use zeroize::Zeroize;
 
 use crate::deployment::SignedArtifactManifest;
 use crate::enrollment::{
@@ -22,6 +24,7 @@ use crate::enrollment::{
 use base64::Engine;
 use std::path::PathBuf;
 
+const MAX_FLEET_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 static DASHBOARD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../dashboard/dist");
 
 /// Backwards-compatible router builder for composition and in-process tests.
@@ -185,6 +188,10 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             post(collector_update_receipt),
         )
         .route(
+            "/api/v1/collector/updates/:update_id/artifact",
+            get(collector_update_artifact),
+        )
+        .route(
             "/api/v1/collector/credentials/rotation/activate",
             post(collector_activate_credential_rotation),
         )
@@ -199,6 +206,7 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             config,
             enrollment_root: root.join("enrollments"),
             known_hosts_path: root.join("known_hosts"),
+            enrollment_execution_guard: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
 }
 
@@ -316,10 +324,11 @@ async fn admin_rotate_collector_credential(
 ) -> Result<Json<RotateCollectorCredentialResponse>, HubError> {
     let _session = require_owner_session(&state, &headers, true)?;
     let issued = state.repo.rotate_collector_credential(request)?;
+    let token = issued.token.to_string();
     Ok(Json(RotateCollectorCredentialResponse {
         machine_id: issued.machine_id,
         credential_id: issued.credential_id,
-        token: issued.token,
+        token,
     }))
 }
 
@@ -543,10 +552,14 @@ async fn admin_reconcile_update(
     AxumPath(update_id): AxumPath<String>,
 ) -> Result<Json<FleetUpdateRun>, HubError> {
     let _session = require_owner_session(&state, &headers, true)?;
-    Ok(Json(state.repo.reconcile_server_fleet_update(
-        &update_id,
-        state.config.fleet_update_target.as_ref(),
-    )?))
+    Ok(Json(
+        state.repo.reconcile_server_fleet_update_with_runtime(
+            &update_id,
+            state.config.fleet_update_artifact_dir.as_ref(),
+            state.config.fleet_update_target.as_ref(),
+            state.config.fleet_update_service_manager.as_deref(),
+        )?,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -579,12 +592,40 @@ struct CreateEnrollmentRequest {
     pub auth: HostedAuth,
 }
 
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 struct HostedSecrets {
     password: Option<String>,
     key_passphrase: Option<String>,
     sudo_password: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for HostedSecrets {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default, deny_unknown_fields)]
+        struct RawHostedSecrets {
+            password: Option<String>,
+            key_passphrase: Option<String>,
+            sudo_password: Option<String>,
+        }
+        let raw = RawHostedSecrets::deserialize(deserializer)?;
+        Ok(Self {
+            password: raw.password,
+            key_passphrase: raw.key_passphrase,
+            sudo_password: raw.sudo_password,
+        })
+    }
+}
+
+impl Drop for HostedSecrets {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.key_passphrase.zeroize();
+        self.sudo_password.zeroize();
+    }
 }
 
 impl HostedSecrets {
@@ -857,35 +898,104 @@ async fn admin_enrollment_execute(
     Json(request): Json<HostedExecuteEnrollmentRequest>,
 ) -> Result<Json<EnrollmentDraft>, HubError> {
     let _session = require_owner_session(&state, &headers, true)?;
+    // One in-process enrollment execution at a time prevents two retries from
+    // rotating the same pending credential while their SSH workflows race.
+    // The durable draft/credential row remains the recovery boundary across a
+    // Hub process restart.
+    let _execution_guard = state
+        .enrollment_execution_guard
+        .lock()
+        .expect("enrollment execution mutex poisoned");
     let draft = enrollment_store(&state)
         .load(&enrollment_id)
         .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
     let plan = draft.plan.clone().ok_or_else(|| {
         HubError::conflict("enrollment-order", "review must complete before execute")
     })?;
+    // A hosted Collector cannot use the Hub's loopback bind. Require the
+    // operator-configured origin before reserving any credential row.
+    let hub_url = state.config.canonical_hub_url.clone().ok_or_else(|| {
+        HubError::forbidden(
+            "canonical-hub-url-required",
+            "hosted enrollment requires an explicitly configured reachable Hub URL",
+        )
+    })?;
+    let machine_id = draft.machine_id.clone().ok_or_else(|| {
+        HubError::conflict(
+            "enrollment-machine-required",
+            "enrollment has no Machine ID",
+        )
+    })?;
+    let display_name = draft.display_name.clone().ok_or_else(|| {
+        HubError::conflict(
+            "enrollment-display-name-required",
+            "enrollment has no display name",
+        )
+    })?;
+    // A completed draft is the idempotent success boundary. Do not mint or
+    // transfer another credential when a client retries after the response.
+    if draft.collector_credential_state.as_deref() == Some("provisioned") && draft.receipt.is_some()
+    {
+        return Ok(Json(draft));
+    }
+    // Validate the signed artifact before reserving the one credential row.
     let (artifact, seed) = verified_enrollment_artifact(&state, &draft, &request.artifact)?;
+    let Some(credential) =
+        state
+            .repo
+            .prepare_enrollment_credential(&enrollment_id, &machine_id, &display_name)?
+    else {
+        // The final draft write can fail after the credential transaction has
+        // committed. A durable receipt plus a provisioned binding is enough
+        // to repair that response boundary without minting or transferring a
+        // second secret.
+        if draft.receipt.is_some() {
+            let mut completed = draft;
+            completed.collector_credential_state = Some("provisioned".to_string());
+            enrollment_store(&state)
+                .save(&completed)
+                .map_err(|error| HubError::internal(error.to_string()))?;
+            return Ok(Json(completed));
+        }
+        return Err(HubError::conflict(
+            "enrollment-receipt-recovery-required",
+            "the credential was provisioned but the enrollment receipt is missing; inspect the remote before retrying",
+        ));
+    };
+    let mut bound_draft = draft;
+    bound_draft.collector_credential_id = Some(credential.credential_id.clone());
+    bound_draft.collector_credential_state = Some("pending".to_string());
+    enrollment_store(&state)
+        .save(&bound_draft)
+        .map_err(|error| HubError::internal(error.to_string()))?;
     let listener = plan.listener().clone();
-    let mut workflow = enrollment_workflow(&state, &draft)?;
+    let mut workflow = enrollment_workflow(&state, &bound_draft)?;
     let secrets = request.secrets.materialize();
     workflow
-        .execute(
+        .execute_with_collector(
             &enrollment_id,
             &plan,
             &artifact,
             seed.as_deref(),
             &listener,
             &secrets,
+            Some(credential.token.as_bytes()),
+            Some(&machine_id),
+            Some(&hub_url),
         )
         .map_err(enrollment_step_error)?;
-    let completed = enrollment_store(&state)
+    let mut completed = enrollment_store(&state)
         .load(&enrollment_id)
         .map_err(|error| HubError::internal(error.to_string()))?;
-    if let (Some(machine_id), Some(display_name)) = (
-        completed.machine_id.as_deref(),
-        completed.display_name.as_deref(),
-    ) {
-        state.repo.ensure_machine(machine_id, display_name)?;
-    }
+    state.repo.complete_enrollment_credential(
+        &enrollment_id,
+        &machine_id,
+        &credential.credential_id,
+    )?;
+    completed.collector_credential_state = Some("provisioned".to_string());
+    enrollment_store(&state)
+        .save(&completed)
+        .map_err(|error| HubError::internal(error.to_string()))?;
     Ok(Json(completed))
 }
 
@@ -940,6 +1050,79 @@ async fn collector_update_receipt(
     Ok(Json(
         state.repo.record_collector_update_receipt(&auth, request)?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollectorUpdateArtifactQuery {
+    version: String,
+    sha256: String,
+}
+
+async fn collector_update_artifact(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(update_id): AxumPath<String>,
+    Query(query): Query<CollectorUpdateArtifactQuery>,
+) -> Result<Response, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    let update = state.repo.fleet_update(&update_id)?;
+    if update.status != "collectors-queued"
+        || update.version != query.version
+        || !update.artifact_sha256.eq_ignore_ascii_case(&query.sha256)
+        || !update
+            .nodes
+            .iter()
+            .any(|node| node.machine_id == auth.machine_id && node.status == "updating")
+    {
+        return Err(HubError::conflict(
+            "collector-update-artifact-order",
+            "the authenticated Machine is not awaiting this exact update artifact",
+        ));
+    }
+    let Some(directory) = state.config.fleet_update_artifact_dir.as_ref() else {
+        return Err(HubError::forbidden(
+            "fleet-runtime-required",
+            "the Hub has no configured signed artifact directory",
+        ));
+    };
+    let path = directory.join(format!("{}.artifact", query.version));
+    let metadata = std::fs::metadata(&path).map_err(|_| {
+        HubError::not_found(
+            "fleet-artifact-unavailable",
+            "the signed update artifact is unavailable",
+        )
+    })?;
+    if metadata.len() > MAX_FLEET_ARTIFACT_BYTES {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-too-large",
+            "the signed update artifact exceeds the bounded size limit",
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|_| {
+        HubError::not_found(
+            "fleet-artifact-unavailable",
+            "the signed update artifact is unavailable",
+        )
+    })?;
+    if bytes.len() as u64 > MAX_FLEET_ARTIFACT_BYTES {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-too-large",
+            "the signed update artifact exceeds the bounded size limit",
+        ));
+    }
+    if hex::encode(sha2::Sha256::digest(&bytes)) != query.sha256.to_ascii_lowercase() {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-mismatch",
+            "the configured artifact does not match the durable update digest",
+        ));
+    }
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
 }
 
 async fn collector_activate_credential_rotation(
@@ -1212,4 +1395,20 @@ fn exact_header_value(headers: &HeaderMap, name: &str) -> Result<Option<String>,
         }
     }
     Ok(Some(first.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_secret_deserialization_is_strict_and_request_scoped() {
+        let secrets: HostedSecrets = serde_json::from_str(
+            r#"{"password":"PASSWORD_SENTINEL","sudo_password":"SUDO_SENTINEL"}"#,
+        )
+        .unwrap();
+        assert_eq!(secrets.password.as_deref(), Some("PASSWORD_SENTINEL"));
+        assert_eq!(secrets.sudo_password.as_deref(), Some("SUDO_SENTINEL"));
+        assert!(serde_json::from_str::<HostedSecrets>(r#"{"token":"unexpected"}"#).is_err());
+    }
 }

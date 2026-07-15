@@ -32,6 +32,9 @@ Out of scope:
 ## Constraints
 
 - SSH and sudo passwords exist only in request memory and never in arguments, environment variables, persisted jobs, logs, or diagnostics.
+- Hosted enrollment requires an explicitly configured canonical Hub origin; a loopback listener address is never advertised to another Machine.
+- The Hub reserves one hashed Collector credential row per enrollment. The plaintext bearer is request-scoped, transferred over the authenticated SSH stdin channel into an atomic `0600` `secrets.json`, and is never included in the durable draft, plan, receipt, or logs.
+- Retries remain bound to the same enrollment and credential row; a completed draft is an idempotent success boundary and missing receipts require explicit recovery rather than minting an untracked credential.
 - Services run as the selected non-root user.
 - First-time Tailscale HTTPS consent may require user action.
 - Failures remain on the current wizard step with actionable output.
@@ -54,6 +57,7 @@ None.
 - Installer tests cover Linux/macOS, x86_64/arm64 selection, alias/manual SSH, password/key authentication, sudo failure, restart, rollback, and cleanup.
 - Security tests cover unknown/changed host keys, secret redaction, and unsigned update rejection.
 - Fresh Hub deployment completes through one CLI flow apart from Tailscale consent.
+- Hosted enrollment tests prove canonical URL validation, request-scoped credential binding, restrictive secret-store installation, and retry/idempotency behavior without secret-bearing persistence.
 
 ## Quality Gates
 

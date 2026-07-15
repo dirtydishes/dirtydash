@@ -175,7 +175,58 @@ impl ListenerPlan {
     /// intentionally omits setup/password/token material; those are handled
     /// by the existing memory/request authentication seams.
     pub fn render_runtime_toml(&self) -> Result<String> {
+        self.render_runtime_toml_with_collector(None, None)
+    }
+
+    /// Render the complete runtime fragment used by a hosted Collector. The
+    /// local-only form remains loopback-bound, while hosted enrollment passes
+    /// the Hub's explicitly configured canonical URL and Machine ID.
+    pub fn render_runtime_toml_with_collector(
+        &self,
+        canonical_hub_url: Option<&str>,
+        machine_id: Option<&str>,
+    ) -> Result<String> {
+        self.render_runtime_toml_with_collector_details(canonical_hub_url, machine_id, None)
+    }
+
+    pub fn render_runtime_toml_with_collector_details(
+        &self,
+        canonical_hub_url: Option<&str>,
+        machine_id: Option<&str>,
+        update_target: Option<&str>,
+    ) -> Result<String> {
         self.validate()?;
+        if let Some(url) = canonical_hub_url {
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|_| anyhow::anyhow!("canonical Hub URL is invalid"))?;
+            if !matches!(parsed.scheme(), "https" | "http")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.path() != "/"
+            {
+                bail!("canonical Hub URL must be an origin URL");
+            }
+            if parsed.scheme() == "http"
+                && !parsed
+                    .host_str()
+                    .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+            {
+                bail!("canonical Hub URL must use TLS unless it targets loopback");
+            }
+        }
+        if let Some(machine_id) = machine_id {
+            if machine_id.trim().is_empty()
+                || !machine_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_' | '.' | ':' | '@')
+                })
+            {
+                bail!("Collector Machine ID is invalid");
+            }
+        }
         let mut output = format!(
             "[hub.listener]\naccess_mode = \"{}\"\ntailscale_state = \"{}\"\nlocal_port = {}\n",
             match self.access_mode {
@@ -189,10 +240,24 @@ impl ListenerPlan {
             },
             self.local_port
         );
-        output.push_str(&format!(
-            "\n[collector]\nhub_url = \"http://127.0.0.1:{}\"\n",
-            self.local_port
-        ));
+        let collector_url = canonical_hub_url
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("http://127.0.0.1:{}", self.local_port));
+        output.push_str("\n[collector]\n");
+        output.push_str(&format!("hub_url = {}\n", toml_string(&collector_url)));
+        if let Some(machine_id) = machine_id {
+            output.push_str(&format!("machine_id = {}\n", toml_string(machine_id)));
+        }
+        if let Some(update_target) = update_target {
+            if update_target.trim().is_empty()
+                || update_target
+                    .chars()
+                    .any(|character| character.is_control())
+            {
+                bail!("Collector update target is invalid");
+            }
+            output.push_str(&format!("update_target = {}\n", toml_string(update_target)));
+        }
         if let Some(public) = &self.public {
             output.push_str("\n[hub.listener.public]\n");
             output.push_str("administrator_auth = \"fallback-admin-session\"\n");

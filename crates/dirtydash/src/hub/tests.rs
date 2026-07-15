@@ -1200,7 +1200,7 @@ fn collector_replays_byte_identical_batch_after_commit_response_loss() {
             path: dir.path().join("claude/projects"),
         }],
         machine_id: Some("machine-response-loss".to_string()),
-        credential_token: Some(issued.token.clone()),
+        credential_token: Some(issued.token.to_string()),
         ..CollectorOptions::default()
     };
     let usage_path = dir.path().join("usage.sqlite3");
@@ -1220,7 +1220,7 @@ fn collector_replays_byte_identical_batch_after_commit_response_loss() {
         .unwrap();
     let mut first_transport = CommitThenResponseLossTransport {
         repo: repo.clone(),
-        token: issued.token.clone(),
+        token: issued.token.to_string(),
         lose_next_response: true,
         request_bytes: Vec::new(),
         replay_flags: Vec::new(),
@@ -1244,7 +1244,7 @@ fn collector_replays_byte_identical_batch_after_commit_response_loss() {
     .unwrap();
     let mut second_transport = CommitThenResponseLossTransport {
         repo,
-        token: issued.token,
+        token: issued.token.to_string(),
         lose_next_response: false,
         request_bytes: Vec::new(),
         replay_flags: Vec::new(),

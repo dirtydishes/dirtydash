@@ -618,6 +618,9 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
             listener,
             database_seed: inputs.seed,
             approved_plan_hash: None,
+            collector_credential_token: None,
+            collector_machine_id: None,
+            collector_hub_url: None,
         };
         let mut runner =
             crate::deployment::DeploymentRunner::new(executor, inputs.publisher.clone())
@@ -656,6 +659,9 @@ fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<
         listener,
         database_seed: inputs.seed,
         approved_plan_hash: args.approved_plan_hash,
+        collector_credential_token: None,
+        collector_machine_id: None,
+        collector_hub_url: None,
     };
     let mut runner = crate::deployment::DeploymentRunner::new(executor, inputs.publisher.clone())
         .with_state_store(DeploymentStateStore::new(state_path));
