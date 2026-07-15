@@ -130,7 +130,7 @@ pub struct RemoteRow {
 /// Durable identity material owned by the local Collector. The project salt is
 /// never sent to the Hub; it only makes the local-to-Hub redacted identifiers
 /// stable across reconciliation and process restarts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollectorIdentityRecord {
     pub machine_id: String,
     pub project_salt: String,
@@ -138,6 +138,25 @@ pub struct CollectorIdentityRecord {
     pub pending_credential_token: Option<String>,
     #[serde(default)]
     pub pending_credential_id: Option<String>,
+}
+
+impl std::fmt::Debug for CollectorIdentityRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CollectorIdentityRecord")
+            .field("machine_id", &self.machine_id)
+            .field("project_salt", &"[REDACTED]")
+            .field(
+                "credential_token",
+                &self.credential_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "pending_credential_token",
+                &self.pending_credential_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("pending_credential_id", &self.pending_credential_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

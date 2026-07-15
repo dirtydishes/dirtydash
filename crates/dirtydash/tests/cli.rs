@@ -4,7 +4,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use dirtydash::deployment::{
+    ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, PublisherTrustPolicy,
+    SignedArtifactManifest, TargetPlatform, MANIFEST_SCHEMA_VERSION,
+};
+use ed25519_dalek::{Signer, SigningKey};
 use predicates::str::contains;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 fn dirtydash_cmd() -> assert_cmd::Command {
@@ -167,6 +173,191 @@ fn collector_reconcile_and_diagnostics_use_separate_state_database() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert!(tables.is_empty());
+}
+
+#[test]
+fn deploy_hub_plan_requires_a_durable_publisher_anchor() {
+    let dir = tempdir().unwrap();
+    let output = dirtydash_cmd()
+        .args([
+            "--db",
+            dir.path().join("dirtydash.sqlite3").to_str().unwrap(),
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+            "deploy",
+            "hub",
+            "ssh-alias",
+            "--plan",
+            "--json",
+            "--publisher-key-id",
+            "attacker-key",
+            "--publisher-fingerprint",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("durable configured publisher"));
+}
+
+#[test]
+fn deploy_hub_shape_plan_is_inspectable_only_with_configured_anchor() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("config.toml"),
+        "[hub]\nallowed_publisher_key_id = \"release-key\"\nallowed_publisher_fingerprint = \"sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n",
+    )
+    .unwrap();
+    let output = dirtydash_cmd()
+        .args([
+            "--db",
+            dir.path().join("dirtydash.sqlite3").to_str().unwrap(),
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+            "deploy",
+            "hub",
+            "ssh-alias",
+            "--plan",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("verify-signed-artifact"));
+    assert!(text.contains("consent-required"));
+    assert!(!text.contains("PASSWORD_SENTINEL"));
+    assert!(!text.contains("SUDO_SENTINEL"));
+}
+
+#[test]
+fn deploy_hub_rejects_replaced_release_evidence_and_cli_trust_flags() {
+    let dir = tempdir().unwrap();
+    let trusted = SigningKey::from_bytes(&[41_u8; 32]);
+    let replacement = SigningKey::from_bytes(&[42_u8; 32]);
+    let (manifest, artifact_dir, public_key) = write_release_fixture(dir.path(), &trusted);
+    let trusted_key_id =
+        PublisherTrustPolicy::fingerprint(&trusted.verifying_key().to_bytes()).unwrap();
+    let trusted_fingerprint = trusted_key_id.clone();
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[hub]\nallowed_publisher_key_id = \"{trusted_key_id}\"\nallowed_publisher_fingerprint = \"{trusted_fingerprint}\"\n"
+        ),
+    )
+    .unwrap();
+
+    // A replacement manifest signed by another key is rejected before any
+    // host-key observation or remote mutation.
+    let (replacement_manifest, _, _) = write_release_fixture(dir.path(), &replacement);
+    let output = dirtydash_cmd()
+        .args([
+            "--db",
+            dir.path().join("dirtydash.sqlite3").to_str().unwrap(),
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+            "deploy",
+            "hub",
+            "unreachable",
+            "--plan",
+            "--manifest",
+            replacement_manifest.to_str().unwrap(),
+            "--artifact-dir",
+            artifact_dir.to_str().unwrap(),
+            "--public-key",
+            public_key.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("key ID"));
+
+    // Replacing only the public-key file cannot replace the durable anchor.
+    fs::write(&public_key, replacement.verifying_key().to_bytes()).unwrap();
+    let output = dirtydash_cmd()
+        .args([
+            "--db",
+            dir.path().join("dirtydash.sqlite3").to_str().unwrap(),
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+            "deploy",
+            "hub",
+            "unreachable",
+            "--plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--artifact-dir",
+            artifact_dir.to_str().unwrap(),
+            "--public-key",
+            public_key.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fingerprint"));
+
+    // A single invocation cannot replace trust with assertion flags.
+    fs::write(&public_key, trusted.verifying_key().to_bytes()).unwrap();
+    let output = dirtydash_cmd()
+        .args([
+            "--db",
+            dir.path().join("dirtydash.sqlite3").to_str().unwrap(),
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+            "deploy",
+            "hub",
+            "unreachable",
+            "--plan",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--artifact-dir",
+            artifact_dir.to_str().unwrap(),
+            "--public-key",
+            public_key.to_str().unwrap(),
+            "--publisher-key-id",
+            "replacement-key",
+            "--publisher-fingerprint",
+            &trusted_fingerprint,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("trust anchor"));
+}
+
+fn write_release_fixture(
+    root: &std::path::Path,
+    key: &SigningKey,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let artifact_dir = root.join(format!("artifacts-{}", key.to_bytes()[0]));
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let bytes = b"signed-cli-artifact";
+    let descriptor = ArtifactDescriptor {
+        platform: TargetPlatform {
+            os: ArtifactOs::Linux,
+            arch: ArtifactArch::X86_64,
+        },
+        file: "dirtydash-linux-x86_64".to_string(),
+        sha256: hex::encode(Sha256::digest(bytes)),
+        size: bytes.len() as u64,
+    };
+    fs::write(artifact_dir.join(&descriptor.file), bytes).unwrap();
+    let mut signed = SignedArtifactManifest {
+        key_id: PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        manifest: ArtifactManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            release: "0.1.1-cli".to_string(),
+            artifacts: vec![descriptor],
+        },
+        signature: String::new(),
+    };
+    signed.signature = hex::encode(key.sign(&signed.signing_bytes().unwrap()).to_bytes());
+    let manifest = root.join(format!("manifest-{}.json", key.to_bytes()[0]));
+    let public_key = root.join(format!("public-{}.key", key.to_bytes()[0]));
+    fs::write(&manifest, serde_json::to_vec(&signed).unwrap()).unwrap();
+    fs::write(&public_key, key.verifying_key().to_bytes()).unwrap();
+    (manifest, artifact_dir, public_key)
 }
 
 #[test]

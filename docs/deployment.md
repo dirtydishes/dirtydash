@@ -1,5 +1,50 @@
 # dirtydash deployment
 
+## Signed Hub deployment (fleet)
+
+The fleet deployment path is separate from the historical Docker/Nginx helper below. Configure the durable publisher trust anchor before running deployment; flags are optional assertions and cannot establish or replace trust:
+
+```toml
+[hub]
+allowed_publisher_key_id = "release-key-2026"
+allowed_publisher_fingerprint = "sha256:<64 lowercase hexadecimal characters>"
+```
+
+If either value is absent, deployment fails closed. The manifest and public-key files are release evidence only; replacing either file, or supplying replacement publisher flags, cannot authorize a different publisher.
+
+Run the concrete read-only probe first. It resolves the target with `ssh -G`, observes the effective host key, verifies the pinned publisher, probes target facts, and persists a secret-free plan/checkpoint:
+
+```bash
+dirtydash deploy hub <ssh-target> --plan --json \
+  --manifest release/manifest.json \
+  --artifact-dir release/artifacts \
+  --public-key release/signing-public-key \
+  --publisher-key-id <allowed-key-id> \
+  --publisher-fingerprint <allowed-fingerprint> \
+  --confirm-host-fingerprint <observed-sha256>
+```
+
+Review the printed `plan_hash`, then apply only that persisted plan:
+
+```bash
+dirtydash deploy hub <ssh-target> --apply \
+  --manifest release/manifest.json \
+  --artifact-dir release/artifacts \
+  --public-key release/signing-public-key \
+  --publisher-key-id <allowed-key-id> \
+  --publisher-fingerprint <allowed-fingerprint> \
+  --approved-plan-hash <reviewed-plan-hash> \
+  --confirm-host-fingerprint <observed-sha256>
+```
+
+The publisher ID/fingerprint flags are optional assertions of the non-secret `[hub]` anchor; they can never replace it. Unknown managed host keys require the exact explicit confirmation; changed keys are blocked. Non-default SSH ports are passed as `-p <port>`, never as `user@host:port`.
+
+Tailscale Serve is the default private listener and the Hub binds loopback-only in that mode. Use `--listener public` only with the explicitly configured fallback administrator/trusted-proxy policy and valid source CIDRs. The command never accepts passwords or private keys as arguments or environment variables; production signing keys, live hosts, system managers, certificates, and tailnet consent remain external release evidence. Password enrollment uses a controlled live PTY only to authenticate and establish a short-lived restricted OpenSSH ControlMaster. Artifact/config/database bytes then use a separate binary-safe pipe over that socket, so NUL/`0xff` bytes never enter a PTY, argv, environment, temp/state files, logs, or transcripts. SQLite seeds are header-validated locally and again remotely with Python/`od` byte comparison, including WAL sidecars, without putting NUL bytes in shell variables.
+
+The installer snapshots actual prior listener/service/current-pointer state, DB/WAL/SHM existence and bytes, and Hub/Collector loaded plus active state before the first remote mutation. It quiesces both user services, validates a SQLite backup including WAL/SHM, activates with a platform-specific atomic rename, independently health-checks Hub and Collector, and restores all captured files plus active/inactive/unloaded states on rollback. Files are removed only when the pre-mutation snapshot recorded them as absent; a rollback or rollback-health failure is an explicit manual-recovery blocker and retains its snapshot. An optional `--db-seed PATH` is transferred through the authenticated binary-safe pipe and its digest/size/backfill intent is bound into the reviewed plan.
+
+Bootstrap and Collector tokens are loaded from the adjacent restrictive `secrets.json` (atomic mode `0600`) and are never serialized into `config.toml`.
+
 dirtydash is deployed on `di` behind Nginx Proxy Manager at:
 
 ```text

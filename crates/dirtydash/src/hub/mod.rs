@@ -1,5 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use tokio::net::TcpListener;
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -20,6 +24,48 @@ mod tests;
 pub use router::{
     build_router, build_router_with_config, build_router_with_config_and_connect_info,
 };
+
+/// Run the authenticated Hub listener on a real socket.  The connect-info
+/// make-service is mandatory here: trusted-proxy identity is accepted only
+/// after the transport-derived peer address passes its configured CIDR policy.
+pub fn serve(
+    db_path: PathBuf,
+    host: String,
+    port: u16,
+    trust_mode: ListenerTrustMode,
+    hub_config: &crate::config::HubConfig,
+) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("starting Hub Tokio runtime")?;
+    runtime.block_on(async move {
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let repository = HubRepository::new(db);
+        hub_config.validate()?;
+        let listener_plan = &hub_config.listener;
+        if trust_mode == ListenerTrustMode::PrivateTailscale {
+            listener_plan.validate_bind_host(&host)?;
+            if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+                anyhow::bail!("private Tailscale Hub mode requires a loopback bind");
+            }
+        }
+        let router_config = HubRouterConfig::from_config(trust_mode, hub_config);
+        let service = build_router_with_config_and_connect_info(repository, router_config);
+        let address: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .with_context(|| format!("parsing Hub listen address {host}:{port}"))?;
+        let listener = TcpListener::bind(address)
+            .await
+            .with_context(|| format!("binding Hub listener to {address}"))?;
+        println!("dirtydash Hub listener: http://{}", listener.local_addr()?);
+        axum::serve(listener, service)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .context("running Hub listener")?;
+        Ok(())
+    })
+}
 
 pub(crate) use errors::{
     hash_password, header_value, normalize_utc_timestamp, now_utc, parse_utc_timestamp,
@@ -126,6 +172,20 @@ impl TrustedProxyConfig {
         self
     }
 
+    pub fn validate(&self) -> Result<()> {
+        if self.identity_header.trim().is_empty()
+            || self.provenance_header.trim().is_empty()
+            || self.provenance_value.trim().is_empty()
+            || self.source_cidrs.is_empty()
+        {
+            anyhow::bail!("trusted proxy configuration must be complete and fail closed");
+        }
+        for cidr in &self.source_cidrs {
+            crate::ssh::validate_cidr(cidr)?;
+        }
+        Ok(())
+    }
+
     fn trusts_peer(&self, peer: SocketAddr) -> bool {
         self.source_cidrs
             .iter()
@@ -174,7 +234,7 @@ fn masked_ip_matches<const N: usize>(peer: [u8; N], network: [u8; N], prefix: u8
     peer[full_bytes] & mask == network[full_bytes] & mask
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HubRouterConfig {
     trust_mode: ListenerTrustMode,
     cookie_transport: CookieTransportSecurity,
@@ -182,6 +242,23 @@ pub struct HubRouterConfig {
     trusted_proxy: Option<TrustedProxyConfig>,
     bootstrap_boundary: BootstrapBoundary,
     bootstrap_setup_token: Option<String>,
+}
+
+impl std::fmt::Debug for HubRouterConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HubRouterConfig")
+            .field("trust_mode", &self.trust_mode)
+            .field("cookie_transport", &self.cookie_transport)
+            .field("tailscale_owner_mappings", &self.tailscale_owner_mappings)
+            .field("trusted_proxy", &self.trusted_proxy)
+            .field("bootstrap_boundary", &self.bootstrap_boundary)
+            .field(
+                "bootstrap_setup_token",
+                &self.bootstrap_setup_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl HubRouterConfig {
@@ -261,14 +338,35 @@ impl HubRouterConfig {
                 )
             })
             .collect();
-        router_config.trusted_proxy = config.trusted_proxy.as_ref().map(|proxy| {
-            TrustedProxyConfig::new(
-                proxy.identity_header.clone(),
-                proxy.provenance_header.clone(),
-                proxy.provenance_value.clone(),
-            )
-            .with_source_cidrs(proxy.source_cidrs.clone())
-        });
+        router_config.trusted_proxy = config
+            .trusted_proxy
+            .as_ref()
+            .map(|proxy| {
+                TrustedProxyConfig::new(
+                    proxy.identity_header.clone(),
+                    proxy.provenance_header.clone(),
+                    proxy.provenance_value.clone(),
+                )
+                .with_source_cidrs(proxy.source_cidrs.clone())
+            })
+            .or_else(|| {
+                config
+                    .listener
+                    .public
+                    .as_ref()
+                    .and_then(|public| public.trusted_proxy.as_ref())
+                    .map(|proxy| {
+                        TrustedProxyConfig::new(
+                            proxy.identity_header.clone(),
+                            proxy.provenance_header.clone(),
+                            proxy.provenance_value.clone(),
+                        )
+                        .with_source_cidrs(proxy.source_cidrs.clone())
+                    })
+            });
+        if router_config.trusted_proxy.is_some() && trust_mode == ListenerTrustMode::Public {
+            router_config.trust_mode = ListenerTrustMode::TrustedProxy;
+        }
         if let Some(setup_token) = &config.bootstrap_setup_token {
             router_config = router_config.with_bootstrap_setup_token(setup_token.clone());
         }

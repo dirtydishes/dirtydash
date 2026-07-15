@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -7,11 +9,19 @@ use crate::app_paths::AppPaths;
 use crate::collector;
 use crate::config::Config;
 use crate::db::Database;
+use crate::deployment::{
+    DeploymentRequest, DeploymentStateStore, PublisherTrustPolicy, RemoteExecutor,
+    SignedArtifactManifest, SshRemoteExecutor,
+};
+use crate::enrollment::{HostKeyObservation, HostKeyStatus, KnownHostStore};
+use crate::hub::ListenerTrustMode;
 use crate::importers::{self, ImportOptions};
+use crate::listener::{ListenerPlan, PublicTrustConfig};
 use crate::loop_upgrade;
 use crate::pricing;
 use crate::remote;
 use crate::server;
+use crate::ssh::{canonical_known_hosts_line, host_key_fingerprint, CanonicalSshTarget};
 
 #[derive(Debug, Parser)]
 #[command(name = "dirtydash")]
@@ -45,6 +55,8 @@ pub enum Command {
     Collector(CollectorCommand),
     /// Configure pull-based SSH remotes.
     Remote(RemoteCommand),
+    /// Deploy a signed Hub and its local Collector over SSH.
+    Deploy(DeployCommand),
     /// Inspect bundled pricing and manage manual overrides.
     Pricing(PricingCommand),
     /// Inspect or maintain dirtyloops loop artifacts.
@@ -76,6 +88,14 @@ pub struct ServeArgs {
 
     #[arg(long)]
     pub open: bool,
+
+    /// Run the authenticated Hub listener rather than loopback local serve.
+    #[arg(long)]
+    pub hub: bool,
+
+    /// Hub listener trust mode. Tailscale is private-by-default.
+    #[arg(long, default_value = "tailscale")]
+    pub listener: String,
 }
 
 #[derive(Debug, Args)]
@@ -166,6 +186,62 @@ pub struct RemoteListArgs {
 #[derive(Debug, Args)]
 pub struct RemoteRemoveArgs {
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DeployCommand {
+    #[command(subcommand)]
+    pub command: DeploySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeploySubcommand {
+    Hub(DeployHubArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DeployHubArgs {
+    /// SSH alias or user@host target. It is passed as one fixed SSH argument.
+    pub ssh_target: String,
+    /// Print the typed plan and do not probe or mutate the remote.
+    #[arg(long)]
+    pub plan: bool,
+    /// Apply only after local signed-artifact verification and remote probing.
+    #[arg(long)]
+    pub apply: bool,
+    /// Render the plan/receipt as machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Signed manifest JSON. Required for --apply.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Directory containing the manifest-selected artifact files.
+    #[arg(long)]
+    pub artifact_dir: Option<PathBuf>,
+    /// Ed25519 public key file (raw 32 bytes or hexadecimal).
+    #[arg(long)]
+    pub public_key: Option<PathBuf>,
+    /// Pinned publisher key ID from the release allowlist.
+    #[arg(long)]
+    pub publisher_key_id: Option<String>,
+    /// Pinned SHA-256 fingerprint for the publisher public key.
+    #[arg(long)]
+    pub publisher_fingerprint: Option<String>,
+    /// Hash printed by the concrete planning probe and explicitly reviewed by the operator.
+    #[arg(long)]
+    pub approved_plan_hash: Option<String>,
+    /// Exact observed managed host-key fingerprint required on first use.
+    #[arg(long)]
+    pub confirm_host_fingerprint: Option<String>,
+    /// Optional local SQLite seed, transferred through SSH stdin.
+    #[arg(long)]
+    pub db_seed: Option<PathBuf>,
+    /// Listener mode. Tailscale Serve is the secure default.
+    #[arg(long, default_value = "tailscale")]
+    pub listener: String,
+    /// Public reverse-proxy CIDR(s); public mode still uses fallback admin auth.
+    #[arg(long)]
+    pub trusted_proxy_cidr: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -264,10 +340,11 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Scan(args)) => scan(&config, args),
         Some(Command::Import(args)) => import(&paths, &config, args),
-        Some(Command::Serve(args)) => serve(&paths, args),
+        Some(Command::Serve(args)) => serve(&paths, args, &config),
         Some(Command::Doctor(args)) => doctor(&paths, &config, args),
         Some(Command::Collector(args)) => collector_command(&paths, &config, args),
         Some(Command::Remote(args)) => remote::run(&paths, &mut config, args),
+        Some(Command::Deploy(args)) => deploy_command(&paths, &config, args),
         Some(Command::Pricing(args)) => pricing_command(&paths, args),
         Some(Command::Loop(args)) => loop_command(args),
         None => first_run(paths, config),
@@ -325,10 +402,35 @@ fn import(paths: &AppPaths, config: &Config, args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-fn serve(paths: &AppPaths, args: ServeArgs) -> Result<()> {
+fn serve(paths: &AppPaths, args: ServeArgs, config: &Config) -> Result<()> {
     let db = Database::open(&paths.db_path)?;
     db.migrate()?;
     pricing::seed_bundled_pricing(&db)?;
+    if args.hub {
+        let trust_mode = match args.listener.trim().to_ascii_lowercase().as_str() {
+            "tailscale" | "tailscale-serve" => ListenerTrustMode::PrivateTailscale,
+            "public" | "public-https"
+                if config
+                    .hub
+                    .listener
+                    .public
+                    .as_ref()
+                    .and_then(|public| public.trusted_proxy.as_ref())
+                    .is_some() =>
+            {
+                ListenerTrustMode::TrustedProxy
+            }
+            "public" | "public-https" => ListenerTrustMode::Public,
+            other => anyhow::bail!("unsupported Hub listener mode {other}"),
+        };
+        return crate::hub::serve(
+            paths.db_path.clone(),
+            args.host,
+            args.port,
+            trust_mode,
+            &config.hub,
+        );
+    }
     server::serve(paths.db_path.clone(), args)
 }
 
@@ -432,6 +534,347 @@ fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) 
     Ok(())
 }
 
+fn deploy_command(paths: &AppPaths, config: &Config, args: DeployCommand) -> Result<()> {
+    match args.command {
+        DeploySubcommand::Hub(args) => deploy_hub(paths, config, args),
+    }
+}
+
+fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<()> {
+    let listener = match args.listener.trim().to_ascii_lowercase().as_str() {
+        "tailscale" | "tailscale-serve" => {
+            ListenerPlan::tailscale_default(crate::deployment::DEFAULT_HUB_PORT)
+        }
+        "public" | "public-https" => ListenerPlan::public_https(
+            crate::deployment::DEFAULT_HUB_PORT,
+            PublicTrustConfig {
+                trusted_proxy: if args.trusted_proxy_cidr.is_empty() {
+                    None
+                } else {
+                    Some(crate::listener::PublicTrustedProxy {
+                        identity_header: "x-dirtydash-identity".to_string(),
+                        provenance_header: "x-dirtydash-proxy-provenance".to_string(),
+                        provenance_value: "proxy-verified".to_string(),
+                        source_cidrs: args.trusted_proxy_cidr.clone(),
+                    })
+                },
+                ..PublicTrustConfig::default()
+            },
+        )?,
+        other => anyhow::bail!("unsupported listener mode {other}; use tailscale or public"),
+    };
+    if args.plan && args.apply {
+        anyhow::bail!("--plan and --apply are mutually exclusive");
+    }
+    let state_path = paths
+        .config_path
+        .parent()
+        .context("config path has no parent")?
+        .join("deployment-checkpoint.json");
+
+    // Keep the old no-input inspection command useful as a local shape
+    // preview. It is intentionally not persisted or eligible for apply;
+    // concrete plans require the signed artifact inputs below.
+    if args.plan
+        && (args.manifest.is_none() || args.artifact_dir.is_none() || args.public_key.is_none())
+    {
+        // Even a shape preview must not make an untrusted publisher look like
+        // an eligible deployment.  The anchor is read from durable config;
+        // flags alone are never sufficient.
+        configured_publisher_anchor(config, &args)?;
+        let plan = crate::deployment::DeploymentPlan::skeleton(
+            args.ssh_target,
+            env!("CARGO_PKG_VERSION"),
+            listener,
+            args.db_seed.is_some(),
+        )?;
+        if args.json {
+            println!("{}", plan.to_json()?);
+        } else {
+            println!("{}", plan.to_json()?);
+            println!("shape preview only: provide signed manifest, artifact directory, and pinned publisher to run the concrete probe");
+        }
+        return Ok(());
+    }
+
+    // Planning is a concrete read-only probe.  Artifact evidence is required
+    // so the persisted plan cannot be approved for an unknown release.
+    if args.plan {
+        verify_publisher_inputs(&args, config)?;
+        let known_hosts = managed_known_hosts(paths)?;
+        let canonical = CanonicalSshTarget::resolve(&args.ssh_target)?;
+        confirm_managed_first_use(
+            &canonical,
+            &known_hosts,
+            args.confirm_host_fingerprint.as_deref(),
+        )?;
+        let mut executor =
+            SshRemoteExecutor::from_canonical_target(canonical, known_hosts.clone())?;
+        let platform = executor.detect()?.platform;
+        let inputs = deployment_inputs(&args, config, false, Some(platform))?;
+        let request = DeploymentRequest {
+            target: args.ssh_target,
+            release: inputs.signed.manifest.release.clone(),
+            listener,
+            database_seed: inputs.seed,
+            approved_plan_hash: None,
+        };
+        let mut runner =
+            crate::deployment::DeploymentRunner::new(executor, inputs.publisher.clone())
+                .with_state_store(DeploymentStateStore::new(state_path));
+        let plan = runner.probe(&request, Some(&inputs.artifact))?;
+        if args.json {
+            println!("{}", plan.to_json()?);
+        } else {
+            println!("{}", plan.to_json()?);
+            println!(
+                "review plan hash {} and pass it with --approved-plan-hash --apply",
+                plan.plan_hash()
+            );
+        }
+        return Ok(());
+    }
+
+    if !args.apply {
+        anyhow::bail!("pass --plan for a concrete probe or --apply with an approved plan hash");
+    }
+
+    verify_publisher_inputs(&args, config)?;
+    let known_hosts = managed_known_hosts(paths)?;
+    let canonical = CanonicalSshTarget::resolve(&args.ssh_target)?;
+    confirm_managed_first_use(
+        &canonical,
+        &known_hosts,
+        args.confirm_host_fingerprint.as_deref(),
+    )?;
+    let mut executor = SshRemoteExecutor::from_canonical_target(canonical, known_hosts.clone())?;
+    let platform = executor.detect()?.platform;
+    let inputs = deployment_inputs(&args, config, true, Some(platform))?;
+    let request = DeploymentRequest {
+        target: args.ssh_target,
+        release: inputs.signed.manifest.release.clone(),
+        listener,
+        database_seed: inputs.seed,
+        approved_plan_hash: args.approved_plan_hash,
+    };
+    let mut runner = crate::deployment::DeploymentRunner::new(executor, inputs.publisher.clone())
+        .with_state_store(DeploymentStateStore::new(state_path));
+    let receipt = runner.apply(&request, &inputs.artifact)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!("deployment {}: {}", receipt.release, receipt.status);
+        if receipt.tailscale_state == crate::listener::TailscaleServeState::ConsentRequired {
+            println!("Tailscale Serve requires explicit consent; rerun --apply after approving it");
+        }
+    }
+    Ok(())
+}
+
+struct DeploymentInputs {
+    signed: SignedArtifactManifest,
+    artifact: crate::deployment::VerifiedArtifact,
+    seed: Option<Vec<u8>>,
+    publisher: PublisherTrustPolicy,
+}
+
+fn configured_publisher_anchor<'a>(
+    config: &'a Config,
+    args: &DeployHubArgs,
+) -> Result<(&'a str, &'a str)> {
+    let key_id = config
+        .hub
+        .allowed_publisher_key_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "deployment requires a durable configured publisher key ID; CLI flags cannot establish trust",
+        )?;
+    let fingerprint = config
+        .hub
+        .allowed_publisher_fingerprint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "deployment requires a durable configured publisher fingerprint; CLI flags cannot establish trust",
+        )?;
+    if let Some(value) = args.publisher_key_id.as_deref() {
+        if value != key_id {
+            anyhow::bail!(
+                "--publisher-key-id does not match the configured publisher trust anchor"
+            );
+        }
+    }
+    if let Some(value) = args.publisher_fingerprint.as_deref() {
+        if !value.eq_ignore_ascii_case(fingerprint) {
+            anyhow::bail!(
+                "--publisher-fingerprint does not match the configured publisher trust anchor"
+            );
+        }
+    }
+    Ok((key_id, fingerprint))
+}
+
+fn verify_publisher_inputs(args: &DeployHubArgs, config: &Config) -> Result<()> {
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("--manifest is required for deployment planning/apply")?;
+    let artifact_dir = args
+        .artifact_dir
+        .as_deref()
+        .context("--artifact-dir is required for deployment planning/apply")?;
+    let public_key_path = args
+        .public_key
+        .as_deref()
+        .context("--public-key is required for deployment planning/apply")?;
+    let (key_id, fingerprint) = configured_publisher_anchor(config, args)?;
+    let signed: SignedArtifactManifest = serde_json::from_slice(
+        &fs::read(manifest_path)
+            .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
+    )
+    .context("parsing signed artifact manifest")?;
+    let public_key = read_public_key(public_key_path)?;
+    let publisher = PublisherTrustPolicy::new(key_id, fingerprint, &public_key)?;
+    let verified_manifest = publisher.verify(&signed)?;
+    for descriptor in &verified_manifest.manifest().artifacts {
+        let bytes = fs::read(artifact_dir.join(&descriptor.file)).with_context(|| {
+            format!(
+                "reading signed artifact {}",
+                artifact_dir.join(&descriptor.file).display()
+            )
+        })?;
+        verified_manifest.verify_artifact(descriptor.platform, bytes)?;
+    }
+    Ok(())
+}
+
+fn deployment_inputs(
+    args: &DeployHubArgs,
+    config: &Config,
+    applying: bool,
+    platform: Option<crate::deployment::TargetPlatform>,
+) -> Result<DeploymentInputs> {
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("--manifest is required for deployment planning/apply")?;
+    let artifact_dir = args
+        .artifact_dir
+        .as_deref()
+        .context("--artifact-dir is required for deployment planning/apply")?;
+    let public_key_path = args
+        .public_key
+        .as_deref()
+        .context("--public-key is required for deployment planning/apply")?;
+
+    let (key_id, fingerprint) = configured_publisher_anchor(config, args)?;
+    let signed: SignedArtifactManifest = serde_json::from_slice(
+        &fs::read(manifest_path)
+            .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
+    )
+    .context("parsing signed artifact manifest")?;
+    let public_key = read_public_key(public_key_path)?;
+    let publisher = PublisherTrustPolicy::new(key_id, fingerprint, &public_key)?;
+    let verified_manifest = publisher.verify(&signed)?;
+    // Selection is completed after the remote probe by the runner.  Local
+    // artifact verification still uses every declared digest/size invariant.
+    let descriptor = match platform {
+        Some(platform) => verified_manifest.select(platform)?,
+        None if verified_manifest.manifest().artifacts.len() == 1 => {
+            &verified_manifest.manifest().artifacts[0]
+        }
+        None => anyhow::bail!("a concrete target platform is required to select an artifact"),
+    };
+    let artifact_path = artifact_dir.join(&descriptor.file);
+    let bytes = fs::read(&artifact_path)
+        .with_context(|| format!("reading signed artifact {}", artifact_path.display()))?;
+    let platform = descriptor.platform;
+    let artifact = verified_manifest.verify_artifact(platform, bytes)?;
+    let seed = args
+        .db_seed
+        .as_deref()
+        .map(|path| -> Result<Vec<u8>> {
+            let bytes = fs::read(path)
+                .with_context(|| format!("reading SQLite seed {}", path.display()))?;
+            crate::deployment::validate_sqlite_header(&bytes)
+                .with_context(|| format!("validating SQLite seed {}", path.display()))?;
+            Ok(bytes)
+        })
+        .transpose()?;
+    if applying && args.approved_plan_hash.is_none() {
+        anyhow::bail!("--approved-plan-hash is required for --apply");
+    }
+    Ok(DeploymentInputs {
+        signed,
+        artifact,
+        seed,
+        publisher,
+    })
+}
+
+fn managed_known_hosts(paths: &AppPaths) -> Result<PathBuf> {
+    Ok(paths
+        .config_path
+        .parent()
+        .context("config path has no parent")?
+        .join("deployment-known_hosts"))
+}
+
+fn confirm_managed_first_use(
+    target: &CanonicalSshTarget,
+    known_hosts_path: &Path,
+    confirmation: Option<&str>,
+) -> Result<()> {
+    let output = ProcessCommand::new("ssh-keyscan")
+        .args(target.keyscan_args())
+        .output()
+        .context("observing remote SSH host key")?;
+    if !output.status.success() || output.stdout.is_empty() {
+        anyhow::bail!("SSH host-key observation failed");
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let known_hosts_line = canonical_known_hosts_line(target, &line)?;
+    let observation =
+        HostKeyObservation::new(host_key_fingerprint(&known_hosts_line)?, known_hosts_line)?;
+    let store = KnownHostStore::new(known_hosts_path);
+    match store.status(&target.host_key_name(), &observation.fingerprint)? {
+        HostKeyStatus::Matching => Ok(()),
+        HostKeyStatus::Changed => anyhow::bail!(
+            "managed host key changed; refusing deployment without destructive trust reset"
+        ),
+        HostKeyStatus::Unknown => {
+            if confirmation != Some(observation.fingerprint.as_str()) {
+                anyhow::bail!(
+                    "first use requires --confirm-host-fingerprint {}",
+                    observation.fingerprint
+                );
+            }
+            store.confirm_unknown(&target.host_key_name(), &observation)
+        }
+    }
+}
+
+fn read_public_key(path: &std::path::Path) -> Result<Vec<u8>> {
+    let bytes =
+        fs::read(path).with_context(|| format!("reading Ed25519 public key {}", path.display()))?;
+    if bytes.len() == 32 {
+        return Ok(bytes);
+    }
+    let text =
+        String::from_utf8(bytes).context("public key is neither raw bytes nor hexadecimal")?;
+    let text = text.trim();
+    if text.len() != 64 || !text.chars().all(|character| character.is_ascii_hexdigit()) {
+        anyhow::bail!("public key must contain exactly 32 raw bytes or 64 hexadecimal characters");
+    }
+    Ok(hex::decode(text)?)
+}
+
 fn pricing_command(paths: &AppPaths, args: PricingCommand) -> Result<()> {
     let db = Database::open(&paths.db_path)?;
     db.migrate()?;
@@ -519,6 +962,8 @@ fn first_run(paths: AppPaths, config: Config) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 4599,
         open: false,
+        hub: false,
+        listener: "tailscale".to_string(),
     };
     server::serve(paths.db_path, args)
 }

@@ -31,6 +31,7 @@ pub fn build_router_with_config_and_connect_info(
 
 pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/api/v1/admin/bootstrap", post(admin_bootstrap))
         .route("/api/v1/admin/session", get(admin_session))
         .route("/api/v1/admin/session/login", post(admin_login))
@@ -264,6 +265,10 @@ async fn collector_ingest_batch(
     Ok(Json(response))
 }
 
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok", "service": "dirtydash-hub"}))
+}
+
 fn bootstrap_allowed(
     boundary: BootstrapBoundary,
     peer: Option<SocketAddr>,
@@ -390,6 +395,13 @@ fn trusted_tailscale_identity(
     match config.trust_mode {
         ListenerTrustMode::Public | ListenerTrustMode::LoopbackHttp => Ok(None),
         ListenerTrustMode::PrivateTailscale => {
+            // Production Hub sockets are loopback-only in private mode; the
+            // Tailscale Serve process is the transport-authenticated peer.
+            // Keep a missing peer usable for the in-process router seam, but
+            // never accept a forged header from a concrete non-loopback peer.
+            if peer.is_some_and(|peer| !peer.ip().is_loopback()) {
+                return Ok(None);
+            }
             let Some(login) = exact_header_value(headers, TAILSCALE_USER_LOGIN)? else {
                 return Ok(None);
             };
