@@ -98,7 +98,9 @@ Evidence:
 
 ## PR And Commits
 
-- Commit: `b071bac` — `Add hub protocol and auth foundation`
+- Commits:
+  - `b071bac` — `Add hub protocol and auth foundation`
+  - `3655174` — `Record phase 2 implementation evidence`
 - PR: #9 — `Phase 2: add hub protocol and auth foundation`
 - Branch: `lavender/remote-hub-collector-fleet-2-foundation`
 - Target: `lavender/remote-hub-collector-fleet-implementation`
