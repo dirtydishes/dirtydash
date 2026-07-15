@@ -24,14 +24,45 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::listener::{ListenerAccessMode, ListenerPlan, TailscaleServeState};
 use crate::service::{ServicePlatform, ServiceSpec};
+use crate::ssh::{validate_target_input, CanonicalSshTarget};
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_HUB_PORT: u16 = 4599;
 pub const DEFAULT_REMOTE_BASE: &str = ".local/share/dirtydash";
 pub const DEFAULT_CONFIG_BASE: &str = ".config/dirtydash";
+
+/// Focused public seams over the deployment implementation. The concrete
+/// adapters remain private to the runner; callers can reason about artifact
+/// verification, plan review, and typed execution independently.
+pub mod artifact {
+    pub use super::{
+        ArtifactArch, ArtifactDescriptor, ArtifactEvidence, ArtifactManifest, ArtifactOs,
+        PublisherKey, SignedArtifactManifest, TargetPlatform, VerifiedArtifact,
+        VerifiedArtifactManifest,
+    };
+}
+
+pub mod plan {
+    pub use super::{
+        BackfillIntent, DeploymentPaths, DeploymentPlan, DeploymentStep, DeploymentStepKind,
+        ListenerExposure, RemoteFacts, RollbackData, SeedIntent,
+    };
+}
+
+pub mod executor {
+    pub use super::{RemoteAction, RemoteExecutor, RemoteResult, RemoteStatus, SshRemoteExecutor};
+}
+
+pub mod runner {
+    pub use super::{
+        DeploymentCheckpoint, DeploymentReceipt, DeploymentRequest, DeploymentRunner,
+        DeploymentStateStore,
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -128,17 +159,120 @@ pub struct SignedArtifactManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublisherKey {
+    key_id: String,
+    fingerprint: String,
+    public_key: [u8; 32],
+}
+
+impl PublisherKey {
+    pub fn new(
+        key_id: impl Into<String>,
+        fingerprint: impl Into<String>,
+        public_key: &[u8],
+    ) -> Result<Self> {
+        let key_id = key_id.into();
+        let fingerprint = fingerprint.into().to_ascii_lowercase();
+        validate_key_id(&key_id)?;
+        let public_key: [u8; 32] = public_key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Ed25519 public key must contain 32 bytes"))?;
+        let actual = publisher_fingerprint(&public_key);
+        if actual != fingerprint {
+            bail!("publisher key fingerprint does not match the supplied public key");
+        }
+        Ok(Self {
+            key_id,
+            fingerprint,
+            public_key,
+        })
+    }
+
+    pub fn fingerprint(public_key: &[u8]) -> Result<String> {
+        let public_key: [u8; 32] = public_key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Ed25519 public key must contain 32 bytes"))?;
+        Ok(publisher_fingerprint(&public_key))
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn fingerprint_value(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedArtifactManifest {
-    pub key_id: String,
-    pub manifest: ArtifactManifest,
-    pub manifest_sha256: String,
+    pub(crate) key_id: String,
+    pub(crate) publisher_fingerprint: String,
+    pub(crate) manifest: ArtifactManifest,
+    pub(crate) manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactEvidence {
+    digest: String,
+    size: u64,
+    key_id: String,
+    publisher_fingerprint: String,
+    manifest_sha256: String,
+}
+
+impl ArtifactEvidence {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn publisher_fingerprint(&self) -> &str {
+        &self.publisher_fingerprint
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedArtifact {
-    pub descriptor: ArtifactDescriptor,
-    pub bytes: Vec<u8>,
-    pub manifest: VerifiedArtifactManifest,
+    descriptor: ArtifactDescriptor,
+    bytes: Vec<u8>,
+    manifest: VerifiedArtifactManifest,
+}
+
+impl VerifiedArtifact {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn descriptor(&self) -> &ArtifactDescriptor {
+        &self.descriptor
+    }
+
+    pub fn manifest(&self) -> &VerifiedArtifactManifest {
+        &self.manifest
+    }
+
+    pub fn evidence(&self) -> ArtifactEvidence {
+        ArtifactEvidence {
+            digest: self.descriptor.sha256.clone(),
+            size: self.descriptor.size,
+            key_id: self.manifest.key_id.clone(),
+            publisher_fingerprint: self.manifest.publisher_fingerprint.clone(),
+            manifest_sha256: self.manifest.manifest_sha256.clone(),
+        }
+    }
 }
 
 impl SignedArtifactManifest {
@@ -155,7 +289,38 @@ impl SignedArtifactManifest {
         .context("serializing artifact manifest signing payload")
     }
 
+    /// Verify using the explicitly pinned publisher key.  The key ID and
+    /// fingerprint are both checked before the signature so replacing a
+    /// manifest and a public-key file together cannot silently authorize a
+    /// different publisher.
+    pub fn verify_with_publisher(
+        &self,
+        publisher: &PublisherKey,
+    ) -> Result<VerifiedArtifactManifest> {
+        if self.key_id != publisher.key_id {
+            bail!("signed artifact key ID is not on the allowed publisher list");
+        }
+        let actual_fingerprint = publisher_fingerprint(&publisher.public_key);
+        if actual_fingerprint != publisher.fingerprint {
+            bail!("allowed publisher fingerprint is invalid");
+        }
+        self.verify_signature(&publisher.public_key)
+    }
+
+    /// The default verifier accepts only the canonical key-fingerprint ID.
+    /// Callers with a release-specific key ID must use
+    /// [`Self::verify_with_publisher`] and persist that allowlist outside the
+    /// ordinary deployment plan.
     pub fn verify(&self, public_key: &[u8]) -> Result<VerifiedArtifactManifest> {
+        let fingerprint = PublisherKey::fingerprint(public_key)?;
+        if self.key_id != fingerprint {
+            bail!("signed artifact key ID must equal the pinned public-key fingerprint");
+        }
+        let publisher = PublisherKey::new(self.key_id.clone(), fingerprint, public_key)?;
+        self.verify_with_publisher(&publisher)
+    }
+
+    fn verify_signature(&self, public_key: &[u8]) -> Result<VerifiedArtifactManifest> {
         if self.manifest.schema_version != MANIFEST_SCHEMA_VERSION {
             bail!("unsupported artifact manifest schema version");
         }
@@ -167,9 +332,7 @@ impl SignedArtifactManifest {
                 bail!("signed release contains duplicate platform artifacts");
             }
         }
-        if self.key_id.trim().is_empty() || self.key_id.len() > 128 {
-            bail!("artifact signing key ID is invalid");
-        }
+        validate_key_id(&self.key_id)?;
         let key_bytes: [u8; 32] = public_key
             .try_into()
             .map_err(|_| anyhow::anyhow!("Ed25519 public key must contain 32 bytes"))?;
@@ -185,6 +348,7 @@ impl SignedArtifactManifest {
         let manifest_sha256 = hex::encode(Sha256::digest(&payload));
         Ok(VerifiedArtifactManifest {
             key_id: self.key_id.clone(),
+            publisher_fingerprint: publisher_fingerprint(&key_bytes),
             manifest: self.manifest.clone(),
             manifest_sha256,
         })
@@ -192,6 +356,22 @@ impl SignedArtifactManifest {
 }
 
 impl VerifiedArtifactManifest {
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
+
+    pub fn publisher_fingerprint(&self) -> &str {
+        &self.publisher_fingerprint
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
     pub fn select(&self, platform: TargetPlatform) -> Result<&ArtifactDescriptor> {
         let mut matches = self
             .manifest
@@ -263,6 +443,25 @@ fn validate_filename(file: &str) -> Result<()> {
         bail!("artifact filename must be a single safe path component");
     }
     Ok(())
+}
+
+fn validate_key_id(value: &str) -> Result<()> {
+    if value.trim().is_empty()
+        || value.len() > 128
+        || value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || !character.is_ascii()
+                || matches!(character, '\'' | '"' | '`' | ';' | '&' | '|' | '$')
+        })
+    {
+        bail!("artifact signing key ID is invalid");
+    }
+    Ok(())
+}
+
+fn publisher_fingerprint(public_key: &[u8; 32]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(public_key)))
 }
 
 fn decode_hex(value: &str, expected_bytes: usize) -> Result<Vec<u8>> {
@@ -344,20 +543,7 @@ impl RemoteFacts {
 }
 
 fn validate_ssh_target(value: &str) -> Result<()> {
-    if value.trim().is_empty()
-        || value.len() > 255
-        || value.chars().any(|character| {
-            character.is_control()
-                || character.is_whitespace()
-                || matches!(
-                    character,
-                    '\'' | '"' | '`' | ';' | '&' | '|' | '$' | '<' | '>'
-                )
-        })
-    {
-        bail!("SSH target is not a safe alias or user@host target");
-    }
-    Ok(())
+    validate_target_input(value)
 }
 
 fn validate_remote_text(value: &str, field: &str) -> Result<()> {
@@ -431,6 +617,8 @@ pub enum DeploymentStepKind {
     VerifySignedArtifact,
     PrepareUserOwnedPaths,
     UploadHubCollectorArtifact,
+    SnapshotRollbackState,
+    QuiesceServices,
     OptionalDatabaseSeed,
     InstallDatabaseSeed,
     InstallRuntimeConfig,
@@ -453,16 +641,95 @@ pub struct DeploymentStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentPlan {
+    /// Human-readable input retained for receipts.  `ssh_target` is the
+    /// canonical execution target and is the value used by every SSH seam.
     pub target: String,
+    pub ssh_target: Option<CanonicalSshTarget>,
     pub release: String,
     pub platform: Option<TargetPlatform>,
+    pub target_facts: Option<RemoteFacts>,
+    pub artifact: Option<ArtifactEvidence>,
     pub listener: ListenerPlan,
+    pub exposure: ListenerExposure,
+    pub seed_intent: SeedIntent,
+    pub backfill_intent: BackfillIntent,
     pub database_seed: bool,
     pub paths: Option<DeploymentPaths>,
+    pub rollback: RollbackData,
     pub steps: Vec<DeploymentStep>,
     pub rollback_steps: Vec<DeploymentStep>,
     pub plan_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerExposure {
+    PrivateTailscale,
+    PublicHttps,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedIntent {
+    pub requested: bool,
+    pub digest: Option<String>,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackfillIntent {
+    pub requested: bool,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackData {
+    pub previous_release: Option<String>,
+    pub database_path: Option<String>,
+    pub database_backup: Option<String>,
+    pub database_wal_backup: Option<String>,
+    pub database_shm_backup: Option<String>,
+    pub previous_config: Option<String>,
+    pub previous_services: Vec<String>,
+    pub previous_listener_state: TailscaleServeState,
+    pub rollback_snapshot_dir: Option<String>,
+    pub activation_platform: Option<ServicePlatform>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DeploymentPlanDetails {
+    pub(crate) artifact: Option<ArtifactEvidence>,
+    pub(crate) database_seed: bool,
+    pub(crate) seed_bytes: Option<Vec<u8>>,
+    pub(crate) ssh_target: Option<CanonicalSshTarget>,
+}
+
+impl RollbackData {
+    fn for_paths(
+        paths: Option<&DeploymentPaths>,
+        facts: Option<&RemoteFacts>,
+        listener: &ListenerPlan,
+    ) -> Self {
+        Self {
+            previous_release: facts.and_then(|facts| facts.current_release.clone()),
+            database_path: paths.map(|paths| paths.hub_db.clone()),
+            database_backup: paths.map(|paths| paths.hub_db_backup.clone()),
+            database_wal_backup: paths.map(|paths| format!("{}-wal.previous", paths.hub_db_backup)),
+            database_shm_backup: paths.map(|paths| format!("{}-shm.previous", paths.hub_db_backup)),
+            previous_config: paths.map(|paths| paths.config_file.clone()),
+            previous_services: paths
+                .map(|paths| vec![paths.service_dir.clone()])
+                .unwrap_or_default(),
+            previous_listener_state: listener.tailscale_state,
+            rollback_snapshot_dir: paths
+                .map(|paths| format!("{}/deployment-rollback", paths.state_dir)),
+            activation_platform: facts.map(|facts| facts.platform.service_platform()),
+        }
+    }
 }
 
 impl DeploymentPlan {
@@ -477,13 +744,32 @@ impl DeploymentPlan {
         validate_ssh_target(&target)?;
         validate_release(&release)?;
         listener.validate()?;
+        let exposure = match listener.access_mode {
+            ListenerAccessMode::TailscaleServe => ListenerExposure::PrivateTailscale,
+            ListenerAccessMode::PublicHttps => ListenerExposure::PublicHttps,
+        };
+        let rollback = RollbackData::for_paths(None, None, &listener);
         let mut plan = Self {
             target,
+            ssh_target: None,
             release,
             platform: None,
+            target_facts: None,
+            artifact: None,
             listener,
+            exposure,
+            seed_intent: SeedIntent {
+                requested: database_seed,
+                digest: None,
+                size: None,
+            },
+            backfill_intent: BackfillIntent {
+                requested: database_seed,
+                source: database_seed.then(|| "sqlite-seed".to_string()),
+            },
             database_seed,
             paths: None,
+            rollback,
             steps: generic_steps(database_seed),
             rollback_steps: rollback_steps(),
             plan_hash: String::new(),
@@ -499,10 +785,50 @@ impl DeploymentPlan {
         listener: ListenerPlan,
         database_seed: bool,
     ) -> Result<Self> {
-        let mut plan = Self::skeleton(target, release, listener, database_seed)?;
+        Self::for_facts_with_details(
+            target,
+            release,
+            facts,
+            listener,
+            DeploymentPlanDetails {
+                artifact: None,
+                database_seed,
+                seed_bytes: None,
+                ssh_target: None,
+            },
+        )
+    }
+
+    pub(crate) fn for_facts_with_details(
+        target: impl Into<String>,
+        release: impl Into<String>,
+        facts: &RemoteFacts,
+        listener: ListenerPlan,
+        details: DeploymentPlanDetails,
+    ) -> Result<Self> {
+        let mut plan = Self::skeleton(target, release, listener, details.database_seed)?;
         plan.platform = Some(facts.platform);
+        plan.target_facts = Some(facts.clone());
+        plan.ssh_target = details.ssh_target;
+        plan.artifact = details.artifact;
         plan.paths = Some(DeploymentPaths::for_facts(facts, &plan.release)?);
-        plan.steps = concrete_steps(database_seed, facts.platform.service_platform());
+        plan.seed_intent = SeedIntent {
+            requested: details.database_seed,
+            digest: details
+                .seed_bytes
+                .as_deref()
+                .map(|bytes| hex::encode(Sha256::digest(bytes))),
+            size: details
+                .seed_bytes
+                .as_deref()
+                .map(|bytes| bytes.len() as u64),
+        };
+        plan.backfill_intent = BackfillIntent {
+            requested: details.database_seed,
+            source: details.database_seed.then(|| "sqlite-seed".to_string()),
+        };
+        plan.rollback = RollbackData::for_paths(plan.paths.as_ref(), Some(facts), &plan.listener);
+        plan.steps = concrete_steps(details.database_seed, facts.platform.service_platform());
         plan.refresh_hash()?;
         Ok(plan)
     }
@@ -558,6 +884,18 @@ fn generic_steps(database_seed: bool) -> Vec<DeploymentStep> {
             "upload",
             DeploymentStepKind::UploadHubCollectorArtifact,
             "Upload one verified Hub/Collector artifact over SSH stdin",
+            true,
+        ),
+        step(
+            "snapshot-rollback",
+            DeploymentStepKind::SnapshotRollbackState,
+            "Snapshot current release, runtime config, service definitions, database, and listener state",
+            true,
+        ),
+        step(
+            "quiesce",
+            DeploymentStepKind::QuiesceServices,
+            "Quiesce Hub and Collector before SQLite or release replacement",
             true,
         ),
     ];
@@ -695,14 +1033,26 @@ pub enum RemoteAction {
     PreparePaths {
         paths: DeploymentPaths,
     },
+    SnapshotRollbackState {
+        paths: DeploymentPaths,
+        platform: ServicePlatform,
+        listener: ListenerPlan,
+    },
+    /// Stop both user services before touching SQLite or the current release.
+    QuiesceServices {
+        platform: ServicePlatform,
+    },
     AtomicallyActivate {
         current: String,
         release: String,
+        platform: ServicePlatform,
     },
     InstallDatabaseSeed {
         seed_path: String,
         database_path: String,
         backup_path: String,
+        wal_backup_path: String,
+        shm_backup_path: String,
     },
     InstallRuntimeConfig {
         config_path: String,
@@ -718,6 +1068,7 @@ pub enum RemoteAction {
     },
     HealthCheck {
         port: u16,
+        platform: ServicePlatform,
     },
     ConfigureTailscale {
         port: u16,
@@ -725,18 +1076,27 @@ pub enum RemoteAction {
     VerifyReceipt {
         release: String,
         port: u16,
+        platform: ServicePlatform,
     },
     Rollback {
         current: String,
         previous: Option<String>,
         database_path: Option<String>,
         database_backup: Option<String>,
+        database_wal_backup: Option<String>,
+        database_shm_backup: Option<String>,
+        platform: ServicePlatform,
+        listener: Option<ListenerPlan>,
+        snapshot_dir: Option<String>,
     },
     Cleanup {
         release: String,
         remove_release: bool,
         database_backup: Option<String>,
+        database_wal_backup: Option<String>,
+        database_shm_backup: Option<String>,
         temporary_seed: Option<String>,
+        rollback_snapshot: Option<String>,
     },
 }
 
@@ -746,6 +1106,13 @@ pub trait RemoteExecutor {
     fn detect(&mut self) -> Result<RemoteFacts>;
     fn run(&mut self, action: RemoteAction) -> Result<RemoteResult>;
     fn upload(&mut self, destination: &str, bytes: &[u8], mode: u32) -> Result<RemoteResult>;
+
+    /// Production adapters expose the one canonical target used for all
+    /// operations.  Test adapters may omit it because their typed actions do
+    /// not spawn SSH.
+    fn canonical_target(&self) -> Option<&CanonicalSshTarget> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +1121,9 @@ pub struct DeploymentReceipt {
     pub release: String,
     pub platform: TargetPlatform,
     pub plan_hash: String,
+    pub artifact_sha256: String,
+    pub artifact_size: u64,
+    pub publisher_key_id: String,
     pub hub_health_verified: bool,
     pub collector_service_verified: bool,
     pub database_seeded: bool,
@@ -801,22 +1171,86 @@ impl DeploymentStateStore {
         atomic_write(&self.path, &bytes, 0o600)
     }
 
-    pub fn clear(&self) -> Result<()> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+    pub fn save_plan(&self, plan: &DeploymentPlan) -> Result<()> {
+        plan.verify_hash()?;
+        let path = self.plan_path();
+        let bytes = serde_json::to_vec_pretty(plan)?;
+        atomic_write(&path, &bytes, 0o600)
+    }
+
+    pub fn load_plan(&self) -> Result<Option<DeploymentPlan>> {
+        let path = self.plan_path();
+        if !path.exists() {
+            return Ok(None);
         }
+        let bytes = fs::read(&path)
+            .with_context(|| format!("reading deployment plan {}", path.display()))?;
+        let plan: DeploymentPlan =
+            serde_json::from_slice(&bytes).context("parsing persisted deployment plan")?;
+        plan.verify_hash()?;
+        Ok(Some(plan))
+    }
+
+    pub fn mark_reviewed(&self, plan: &DeploymentPlan) -> Result<()> {
+        self.save_plan(plan)?;
+        self.save(&DeploymentCheckpoint {
+            target: plan.target.clone(),
+            release: plan.release.clone(),
+            plan_hash: plan.plan_hash.clone(),
+            status: "reviewed".to_string(),
+            tailscale_state: plan.listener.tailscale_state,
+            receipt: None,
+        })
+    }
+
+    fn plan_path(&self) -> PathBuf {
+        self.path.with_file_name(format!(
+            "{}.plan.json",
+            self.path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or("deployment-checkpoint")
+        ))
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        for path in [&self.path, &self.plan_path()] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeploymentRequest {
     pub target: String,
     pub release: String,
     pub listener: ListenerPlan,
     pub database_seed: Option<Vec<u8>>,
     pub approved_plan_hash: Option<String>,
+}
+
+impl std::fmt::Debug for DeploymentRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeploymentRequest")
+            .field("target", &self.target)
+            .field("release", &self.release)
+            .field("listener", &self.listener)
+            .field(
+                "database_seed",
+                &self
+                    .database_seed
+                    .as_ref()
+                    .map(|seed| ("[REDACTED]", seed.len())),
+            )
+            .field("approved_plan_hash", &self.approved_plan_hash)
+            .finish()
+    }
 }
 
 impl DeploymentRequest {
@@ -838,6 +1272,7 @@ impl DeploymentRequest {
 pub struct DeploymentRunner<E> {
     executor: E,
     state_store: Option<DeploymentStateStore>,
+    reviewed_plan: Option<DeploymentPlan>,
 }
 
 impl<E> DeploymentRunner<E> {
@@ -845,11 +1280,20 @@ impl<E> DeploymentRunner<E> {
         Self {
             executor,
             state_store: None,
+            reviewed_plan: None,
         }
     }
 
     pub fn with_state_store(mut self, store: DeploymentStateStore) -> Self {
         self.state_store = Some(store);
+        self
+    }
+
+    /// Bind a plan already durably reviewed by another workflow seam (the
+    /// enrollment draft).  The plan is still hash-verified and recomputed
+    /// against fresh facts before mutation.
+    pub fn with_reviewed_plan(mut self, plan: DeploymentPlan) -> Self {
+        self.reviewed_plan = Some(plan);
         self
     }
 
@@ -863,42 +1307,109 @@ impl<E> DeploymentRunner<E> {
 }
 
 impl<E: RemoteExecutor> DeploymentRunner<E> {
+    /// Run the concrete, read-only remote probe and persist the resulting
+    /// secret-free plan.  Planning never uploads, installs, activates, or
+    /// changes managed host-key trust.
+    pub fn probe(
+        &mut self,
+        request: &DeploymentRequest,
+        artifact: Option<&VerifiedArtifact>,
+    ) -> Result<DeploymentPlan> {
+        request.listener.validate()?;
+        if let Some(artifact) = artifact {
+            if artifact.manifest().manifest.release != request.release {
+                bail!("verified artifact release does not match the deployment request");
+            }
+        }
+        let facts = self
+            .executor
+            .detect()
+            .context("remote platform detection failed")?;
+        if let Some(artifact) = artifact {
+            if artifact.descriptor().platform != facts.platform {
+                bail!("verified artifact target does not match the detected remote platform");
+            }
+        }
+        let plan = DeploymentPlan::for_facts_with_details(
+            request.target.clone(),
+            request.release.clone(),
+            &facts,
+            request.listener.clone(),
+            DeploymentPlanDetails {
+                artifact: artifact.map(VerifiedArtifact::evidence),
+                database_seed: request.database_seed.is_some(),
+                seed_bytes: request.database_seed.clone(),
+                ssh_target: self.executor.canonical_target().cloned(),
+            },
+        )?;
+        if let Some(store) = &self.state_store {
+            store.save_plan(&plan)?;
+            store.save(&DeploymentCheckpoint {
+                target: plan.target.clone(),
+                release: plan.release.clone(),
+                plan_hash: plan.plan_hash.clone(),
+                status: "probed".to_string(),
+                tailscale_state: plan.listener.tailscale_state,
+                receipt: None,
+            })?;
+        }
+        Ok(plan)
+    }
+
+    /// Apply only a persisted plan whose hash was explicitly approved by the
+    /// operator.  The facts and all derived contents are recomputed immediately
+    /// before the first remote mutation; stale plans never reach `run`/`upload`.
     pub fn apply(
         &mut self,
         request: &DeploymentRequest,
         artifact: &VerifiedArtifact,
     ) -> Result<DeploymentReceipt> {
-        request.listener.validate()?;
-        if artifact.manifest.manifest.release != request.release {
+        let approved = request
+            .approved_plan_hash
+            .as_deref()
+            .filter(|hash| !hash.is_empty())
+            .context("an approved persisted plan hash is required before apply")?;
+        let reviewed = if let Some(store) = &self.state_store {
+            store.load_plan()?.context(
+                "no persisted deployment plan is available; run the planning probe first",
+            )?
+        } else {
+            self.reviewed_plan
+                .clone()
+                .context("deployment apply requires a persisted reviewed plan")?
+        };
+        if reviewed.plan_hash != approved {
+            bail!("approved plan hash does not match the persisted deployment plan");
+        }
+        reviewed.verify_hash()?;
+        if artifact.manifest().manifest.release != request.release {
             bail!("verified artifact release does not match the deployment request");
         }
         let facts = self
             .executor
             .detect()
             .context("remote platform detection failed")?;
-        if artifact.descriptor.platform != facts.platform {
+        if artifact.descriptor().platform != facts.platform {
             bail!("verified artifact target does not match the detected remote platform");
         }
-        let plan = DeploymentPlan::for_facts(
+        let plan = DeploymentPlan::for_facts_with_details(
             request.target.clone(),
             request.release.clone(),
             &facts,
             request.listener.clone(),
-            request.database_seed.is_some(),
+            DeploymentPlanDetails {
+                artifact: Some(artifact.evidence()),
+                database_seed: request.database_seed.is_some(),
+                seed_bytes: request.database_seed.clone(),
+                ssh_target: self.executor.canonical_target().cloned(),
+            },
         )?;
-        if let Some(approved) = &request.approved_plan_hash {
-            if approved != &plan.plan_hash {
-                bail!("deployment plan changed after review; refusing to execute stale approval");
-            }
+        if plan.plan_hash != reviewed.plan_hash || plan.plan_hash != approved {
+            bail!("deployment facts or artifact changed after review; refusing to execute stale approval");
         }
-        self.save_checkpoint(&DeploymentCheckpoint {
-            target: plan.target.clone(),
-            release: plan.release.clone(),
-            plan_hash: plan.plan_hash.clone(),
-            status: "reviewed".to_string(),
-            tailscale_state: plan.listener.tailscale_state,
-            receipt: None,
-        })?;
+        if let Some(store) = &self.state_store {
+            store.mark_reviewed(&plan)?;
+        }
 
         let paths = plan
             .paths
@@ -906,7 +1417,7 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
             .context("deployment plan has no remote paths")?;
         let service_spec = service_spec(&facts, &paths, &plan.listener)?;
         let rendered_services = service_spec.render()?;
-        let mut activated = false;
+        let mut mutated = false;
         let result = (|| -> Result<DeploymentReceipt> {
             require_success(
                 self.executor.run(RemoteAction::PreparePaths {
@@ -917,10 +1428,25 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
             require_success(
                 self.executor.upload(
                     &format!("{}/dirtydash", paths.release_dir),
-                    &artifact.bytes,
+                    artifact.bytes(),
                     0o755,
                 ),
                 "upload verified artifact",
+            )?;
+            require_success(
+                self.executor.run(RemoteAction::SnapshotRollbackState {
+                    paths: paths.clone(),
+                    platform: facts.platform.service_platform(),
+                    listener: plan.listener.clone(),
+                }),
+                "snapshot remote rollback state",
+            )?;
+            mutated = true;
+            require_success(
+                self.executor.run(RemoteAction::QuiesceServices {
+                    platform: facts.platform.service_platform(),
+                }),
+                "quiesce services before replacement",
             )?;
             if let Some(seed) = &request.database_seed {
                 let seed_path = format!("{}/dirtydash.sqlite3.seed", paths.data_dir);
@@ -933,6 +1459,8 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                         seed_path,
                         database_path: paths.hub_db.clone(),
                         backup_path: paths.hub_db_backup.clone(),
+                        wal_backup_path: format!("{}-wal.previous", paths.hub_db_backup),
+                        shm_backup_path: format!("{}-shm.previous", paths.hub_db_backup),
                     }),
                     "install database seed",
                 )?;
@@ -959,10 +1487,10 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                 self.executor.run(RemoteAction::AtomicallyActivate {
                     current: paths.current.clone(),
                     release: paths.release_dir.clone(),
+                    platform: facts.platform.service_platform(),
                 }),
                 "activate release",
             )?;
-            activated = true;
             require_success(
                 self.executor.run(RemoteAction::RestartServices {
                     platform: facts.platform.service_platform(),
@@ -972,6 +1500,7 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
             let health = require_success(
                 self.executor.run(RemoteAction::HealthCheck {
                     port: plan.listener.local_port,
+                    platform: facts.platform.service_platform(),
                 }),
                 "Hub health check",
             )?;
@@ -1007,6 +1536,7 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                 self.executor.run(RemoteAction::VerifyReceipt {
                     release: plan.release.clone(),
                     port: plan.listener.local_port,
+                    platform: facts.platform.service_platform(),
                 }),
                 "verify deployment receipt",
             )?;
@@ -1018,10 +1548,19 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                         .database_seed
                         .as_ref()
                         .map(|_| paths.hub_db_backup.clone()),
+                    database_wal_backup: request
+                        .database_seed
+                        .as_ref()
+                        .map(|_| format!("{}-wal.previous", paths.hub_db_backup)),
+                    database_shm_backup: request
+                        .database_seed
+                        .as_ref()
+                        .map(|_| format!("{}-shm.previous", paths.hub_db_backup)),
                     temporary_seed: request
                         .database_seed
                         .as_ref()
                         .map(|_| format!("{}/dirtydash.sqlite3.seed", paths.data_dir)),
+                    rollback_snapshot: plan.rollback.rollback_snapshot_dir.clone(),
                 }),
                 "cleanup deployment temporary files",
             )?;
@@ -1030,6 +1569,9 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
                 release: plan.release.clone(),
                 platform: facts.platform,
                 plan_hash: plan.plan_hash.clone(),
+                artifact_sha256: artifact.descriptor().sha256.clone(),
+                artifact_size: artifact.descriptor().size,
+                publisher_key_id: artifact.manifest().key_id().to_string(),
                 hub_health_verified: true,
                 collector_service_verified: true,
                 database_seeded: request.database_seed.is_some(),
@@ -1056,28 +1598,47 @@ impl<E: RemoteExecutor> DeploymentRunner<E> {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
                 let mut cleanup_error = None;
-                if activated {
+                let mut rollback_succeeded = !mutated;
+                if mutated {
                     if let Err(rollback) = self.executor.run(RemoteAction::Rollback {
                         current: paths.current.clone(),
-                        previous: facts.current_release.clone(),
+                        previous: plan.rollback.previous_release.clone(),
                         database_path: request.database_seed.as_ref().map(|_| paths.hub_db.clone()),
                         database_backup: request
                             .database_seed
                             .as_ref()
                             .map(|_| paths.hub_db_backup.clone()),
+                        database_wal_backup: request
+                            .database_seed
+                            .as_ref()
+                            .map(|_| format!("{}-wal.previous", paths.hub_db_backup)),
+                        database_shm_backup: request
+                            .database_seed
+                            .as_ref()
+                            .map(|_| format!("{}-shm.previous", paths.hub_db_backup)),
+                        platform: facts.platform.service_platform(),
+                        listener: Some(previous_listener_state(&plan)),
+                        snapshot_dir: plan.rollback.rollback_snapshot_dir.clone(),
                     }) {
                         let _ = rollback;
                         cleanup_error = Some("rollback operation failed".to_string());
+                    } else {
+                        rollback_succeeded = true;
                     }
                 }
                 if let Err(cleanup) = self.executor.run(RemoteAction::Cleanup {
                     release: paths.release_dir,
                     remove_release: true,
                     database_backup: None,
+                    database_wal_backup: None,
+                    database_shm_backup: None,
                     temporary_seed: request
                         .database_seed
                         .as_ref()
                         .map(|_| format!("{}/dirtydash.sqlite3.seed", paths.data_dir)),
+                    rollback_snapshot: rollback_succeeded
+                        .then(|| plan.rollback.rollback_snapshot_dir.clone())
+                        .flatten(),
                 }) {
                     let _ = cleanup;
                     cleanup_error = Some("cleanup operation failed".to_string());
@@ -1142,8 +1703,12 @@ fn service_spec(
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().context("atomic file has no parent")?;
     fs::create_dir_all(parent)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
     let temp = parent.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{nonce}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("dirtydash"),
@@ -1194,21 +1759,39 @@ fn redact_error(value: &str, secrets: &[&str]) -> String {
 /// environment variable, temporary local file, or diagnostic.
 #[derive(Debug, Clone)]
 pub struct SshRemoteExecutor {
-    target: String,
+    target: CanonicalSshTarget,
     known_hosts: PathBuf,
     key_path: Option<PathBuf>,
 }
 
 impl SshRemoteExecutor {
     pub fn new(target: impl Into<String>, known_hosts: impl Into<PathBuf>) -> Result<Self> {
-        let target = target.into();
+        let target = CanonicalSshTarget::resolve(target.into())?;
+        Self::from_canonical_target(target, known_hosts)
+    }
+
+    pub fn from_canonical_target(
+        target: CanonicalSshTarget,
+        known_hosts: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let known_hosts = known_hosts.into();
-        validate_ssh_target(&target)?;
         if let Some(parent) = known_hosts.parent() {
             fs::create_dir_all(parent)?;
         }
         if !known_hosts.exists() {
             atomic_write(&known_hosts, b"", 0o600)?;
+        }
+        let index_path = known_hosts.with_extension("fingerprints.json");
+        let trusted = if index_path.exists() {
+            let bytes = fs::read(&index_path)?;
+            let records: std::collections::BTreeMap<String, serde_json::Value> =
+                serde_json::from_slice(&bytes).context("parsing managed SSH host-key index")?;
+            records.contains_key(&target.host_key_name())
+        } else {
+            false
+        };
+        if !trusted {
+            bail!("SSH target is not explicitly confirmed in the managed known-host store");
         }
         Ok(Self {
             target,
@@ -1232,26 +1815,8 @@ impl SshRemoteExecutor {
     }
 
     fn base_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "-o".to_string(),
-            "BatchMode=yes".to_string(),
-            "-o".to_string(),
-            "StrictHostKeyChecking=yes".to_string(),
-            "-o".to_string(),
-            format!("UserKnownHostsFile={}", self.known_hosts.display()),
-            "-o".to_string(),
-            "ConnectTimeout=10".to_string(),
-        ];
-        if let Some(key_path) = &self.key_path {
-            args.extend([
-                "-i".to_string(),
-                key_path.display().to_string(),
-                "-o".to_string(),
-                "IdentitiesOnly=yes".to_string(),
-            ]);
-        }
-        args.push(self.target.clone());
-        args
+        self.target
+            .ssh_args(&self.known_hosts, self.key_path.as_deref(), true)
     }
 
     fn invocation(&self, command: &str) -> Result<std::process::Output> {
@@ -1264,6 +1829,10 @@ impl SshRemoteExecutor {
 }
 
 impl RemoteExecutor for SshRemoteExecutor {
+    fn canonical_target(&self) -> Option<&CanonicalSshTarget> {
+        Some(&self.target)
+    }
+
     fn detect(&mut self) -> Result<RemoteFacts> {
         let output = self.invocation(
             "set -eu; printf 'os=%s\\n' \"$(uname -s)\"; printf 'arch=%s\\n' \"$(uname -m)\"; printf 'user=%s\\n' \"$(id -un)\"; printf 'uid=%s\\n' \"$(id -u)\"; printf 'home=%s\\n' \"$HOME\"; if [ -L \"$HOME/.local/share/dirtydash/current\" ]; then printf 'current=%s\\n' \"$(readlink \"$HOME/.local/share/dirtydash/current\")\"; fi",
@@ -1283,6 +1852,8 @@ impl RemoteExecutor for SshRemoteExecutor {
                 seed_path: _,
                 database_path: _,
                 backup_path: _,
+                wal_backup_path: _,
+                shm_backup_path: _,
             } => {
                 let command = action_command(&action)?;
                 let output = self.invocation(&command)?;
@@ -1403,23 +1974,56 @@ fn action_command(action: &RemoteAction) -> Result<String> {
             shell_quote(&paths.service_dir),
             shell_quote(&paths.home),
         )),
-        RemoteAction::AtomicallyActivate { current, release } => {
+        RemoteAction::SnapshotRollbackState { paths, platform: _, listener: _ } => Ok(format!(
+            "set -eu; umask 077; snapshot={}; mkdir -p {}; if [ -f {} ]; then cp -p {} {}/config.toml; else : > {}/.missing-config; fi; for service in {}/dirtydash-hub.service {}/dirtydash-collector.service {}/dev.dirtydash.hub.plist {}/dev.dirtydash.collector.plist; do if [ -f \"$service\" ]; then cp -p \"$service\" \"$snapshot/$(basename \"$service\")\"; else : > \"$snapshot/.missing-$(basename \"$service\")\"; fi; done",
+
+            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
+            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
+            shell_quote(&paths.config_file),
+            shell_quote(&paths.config_file),
+            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
+            shell_quote(&format!("{}/deployment-rollback", paths.state_dir)),
+            shell_quote(&paths.service_dir),
+            shell_quote(&paths.service_dir),
+            shell_quote(&paths.service_dir),
+            shell_quote(&paths.service_dir),
+        )),
+        RemoteAction::QuiesceServices { platform } => Ok(match platform {
+            ServicePlatform::Systemd => "set -eu; systemctl --user stop dirtydash-hub.service; systemctl --user stop dirtydash-collector.service".to_string(),
+            ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); launchctl kill TERM \"$domain/dev.dirtydash.hub\" 2>/dev/null || true; launchctl kill TERM \"$domain/dev.dirtydash.collector\" 2>/dev/null || true".to_string(),
+        }),
+        RemoteAction::AtomicallyActivate { current, release, platform } => {
             let temp = format!("{current}.next-{}", std::process::id());
+            let move_command = match platform {
+                ServicePlatform::Systemd => format!("mv -Tf {} {}", shell_quote(&temp), shell_quote(current)),
+                ServicePlatform::Launchd => format!("mv -f {} {}", shell_quote(&temp), shell_quote(current)),
+            };
             Ok(format!(
-                "set -eu; rm -f {}; ln -s {} {}; mv -Tf {} {}",
-                shell_quote(&temp),
+                "set -eu; ln -s {} {}; {}; test -L {}",
                 shell_quote(release),
                 shell_quote(&temp),
-                shell_quote(&temp),
+                move_command,
                 shell_quote(current),
             ))
         }
-        RemoteAction::InstallDatabaseSeed { seed_path, database_path, backup_path } => {
+        RemoteAction::InstallDatabaseSeed {
+            seed_path,
+            database_path,
+            backup_path,
+            wal_backup_path,
+            shm_backup_path,
+        } => {
+            // The old database is never removed without a validated backup.
+            // SQLite's sidecars are copied as part of the same quiesced
+            // transaction so a WAL-backed database cannot be restored into an
+            // inconsistent main file.
             Ok(format!(
-                "set -eu; if [ -f {db} ]; then cp -p {db} {backup}; else rm -f {backup}; fi; mv -f {seed} {db}",
+                "set -eu; test -s {seed}; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 {seed} 'PRAGMA integrity_check' | grep -qx ok; else test \"$(dd if={seed} bs=1 count=16 2>/dev/null)\" = \"SQLite format 3\\000\"; fi; if [ -e {db} ]; then cp -p {db} {backup}; test -s {backup}; if command -v sqlite3 >/dev/null 2>&1; then sqlite3 {backup} 'PRAGMA integrity_check' | grep -qx ok; fi; if [ -e {db}-wal ]; then cp -p {db}-wal {wal}; else rm -f {wal}; fi; if [ -e {db}-shm ]; then cp -p {db}-shm {shm}; else rm -f {shm}; fi; else test ! -e {backup}; test ! -e {wal}; test ! -e {shm}; fi; rm -f {db}-wal {db}-shm; mv -f {seed} {db}",
+                seed = shell_quote(seed_path),
                 db = shell_quote(database_path),
                 backup = shell_quote(backup_path),
-                seed = shell_quote(seed_path),
+                wal = shell_quote(wal_backup_path),
+                shm = shell_quote(shm_backup_path),
             ))
         }
         RemoteAction::InstallRuntimeConfig { config_path, .. } => {
@@ -1432,44 +2036,100 @@ fn action_command(action: &RemoteAction) -> Result<String> {
             Ok(format!("set -eu; test -f {}", shell_quote(path)))
         }
         RemoteAction::RestartServices { platform } => Ok(match platform {
-            ServicePlatform::Systemd => "set -eu; systemctl --user daemon-reload; systemctl --user enable --now dirtydash-hub.service dirtydash-collector.service; systemctl --user restart dirtydash-hub.service dirtydash-collector.service".to_string(),
-            ServicePlatform::Launchd => "set -eu; launchctl bootstrap gui/$(id -u) \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\" 2>/dev/null || true; launchctl bootstrap gui/$(id -u) \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\" 2>/dev/null || true; launchctl kickstart -k gui/$(id -u)/dev.dirtydash.hub; launchctl kickstart -k gui/$(id -u)/dev.dirtydash.collector".to_string(),
+            ServicePlatform::Systemd => "set -eu; systemctl --user daemon-reload; systemctl --user enable dirtydash-hub.service dirtydash-collector.service; systemctl --user restart dirtydash-hub.service; systemctl --user restart dirtydash-collector.service; systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service".to_string(),
+            ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null; launchctl print \"$collector\" >/dev/null".to_string(),
         }),
-        RemoteAction::HealthCheck { port } => Ok(format!(
-            "set -eu; command -v curl >/dev/null; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null",
+        RemoteAction::HealthCheck { port, platform } => Ok(format!(
+            "set -eu; command -v curl >/dev/null; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null; {}",
+            service_health_command(*platform),
         )),
         RemoteAction::ConfigureTailscale { port } => Ok(format!(
             "set -eu; command -v tailscale >/dev/null; tailscale serve --https=443 http://127.0.0.1:{port}",
         )),
-        RemoteAction::VerifyReceipt { release, port } => Ok(format!(
-            "set -eu; test -x {}/dirtydash; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null",
+        RemoteAction::VerifyReceipt { release, port, platform } => Ok(format!(
+            "set -eu; test -x {}/dirtydash; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null; {}",
             shell_quote(release),
+            service_health_command(*platform),
         )),
-        RemoteAction::Rollback { current, previous, database_path, database_backup } => {
+        RemoteAction::Rollback {
+            current,
+            previous,
+            database_path,
+            database_backup,
+            database_wal_backup,
+            database_shm_backup,
+            platform,
+            listener,
+            snapshot_dir,
+        } => {
             let database_restore = match (database_path, database_backup) {
-                (Some(database), Some(backup)) => format!(
-                    "if [ -f {backup} ]; then mv -f {backup} {database}; else rm -f {database}; fi; ",
-                    database = shell_quote(database),
-                    backup = shell_quote(backup),
-                ),
+                (Some(database), Some(backup)) => {
+                    let wal_restore = database_wal_backup
+                        .as_ref()
+                        .zip(database_shm_backup.as_ref())
+                        .map(|(wal, shm)| format!("if [ -e {wal} ]; then mv -f {wal} {database}-wal; fi; if [ -e {shm} ]; then mv -f {shm} {database}-shm; fi; ", wal = shell_quote(wal), shm = shell_quote(shm), database = shell_quote(database)))
+                        .unwrap_or_default();
+                    format!(
+                        "test -f {backup}; mv -f {backup} {database}; {wal_restore}",
+                        database = shell_quote(database),
+                        backup = shell_quote(backup),
+                        wal_restore = wal_restore,
+                    )
+                }
+                (Some(_), None) => bail!("rollback refuses to delete a database without a validated backup"),
                 _ => String::new(),
             };
+            let listener_restore = listener
+                .as_ref()
+                .map(listener_restore_command)
+                .unwrap_or_default();
+            let snapshot_restore = snapshot_dir
+                .as_ref()
+                .map(|snapshot| format!("if [ -f {snapshot}/config.toml ]; then mv -f {snapshot}/config.toml \"$HOME/.config/dirtydash/config.toml\"; elif [ -f {snapshot}/.missing-config ]; then rm -f \"$HOME/.config/dirtydash/config.toml\"; fi; for service in dirtydash-hub.service dirtydash-collector.service; do if [ -f {snapshot}/$service ]; then mv -f {snapshot}/$service \"$HOME/.config/dirtydash/systemd/user/$service\"; elif [ -f {snapshot}/.missing-$service ]; then rm -f \"$HOME/.config/dirtydash/systemd/user/$service\"; fi; done; for service in dev.dirtydash.hub.plist dev.dirtydash.collector.plist; do if [ -f {snapshot}/$service ]; then mv -f {snapshot}/$service \"$HOME/Library/LaunchAgents/$service\"; elif [ -f {snapshot}/.missing-$service ]; then rm -f \"$HOME/Library/LaunchAgents/$service\"; fi; done; ", snapshot = shell_quote(snapshot)))
+                .unwrap_or_default();
             let Some(previous) = previous else {
-                return Ok(format!("set -eu; {database_restore}rm -f {}", shell_quote(current), database_restore = database_restore));
+                let quiesce = service_quiesce_command(*platform);
+                return Ok(format!(
+                    "set -eu; {database_restore}{quiesce}; rm -f {current}; {snapshot_restore}{listener_restore}{restart}",
+                    database_restore = database_restore,
+                    quiesce = quiesce,
+                    current = shell_quote(current),
+                    snapshot_restore = snapshot_restore,
+                    listener_restore = listener_restore,
+                    restart = service_restart_command(*platform),
+                ));
             };
             let temp = format!("{current}.rollback-{}", std::process::id());
             Ok(format!(
-                "set -eu; {database_restore}rm -f {}; ln -s {} {}; mv -Tf {} {}",
-                shell_quote(&temp),
+                "set -eu; {database_restore}{quiesce}; ln -s {} {}; {}; {snapshot_restore}{listener_restore}{restart}",
                 shell_quote(previous),
                 shell_quote(&temp),
-                shell_quote(&temp),
-                shell_quote(current),
+                activation_move_command(&temp, current, *platform),
                 database_restore = database_restore,
+                quiesce = service_quiesce_command(*platform),
+                snapshot_restore = snapshot_restore,
+                listener_restore = listener_restore,
+                restart = service_restart_command(*platform),
             ))
         }
-        RemoteAction::Cleanup { release, remove_release, database_backup, temporary_seed } => {
+        RemoteAction::Cleanup {
+            release,
+            remove_release,
+            database_backup,
+            database_wal_backup,
+            database_shm_backup,
+            temporary_seed,
+            rollback_snapshot,
+        } => {
             let backup_cleanup = database_backup
+                .as_ref()
+                .map(|backup| format!("rm -f {}; ", shell_quote(backup)))
+                .unwrap_or_default();
+            let wal_cleanup = database_wal_backup
+                .as_ref()
+                .map(|backup| format!("rm -f {}; ", shell_quote(backup)))
+                .unwrap_or_default();
+            let shm_cleanup = database_shm_backup
                 .as_ref()
                 .map(|backup| format!("rm -f {}; ", shell_quote(backup)))
                 .unwrap_or_default();
@@ -1477,12 +2137,68 @@ fn action_command(action: &RemoteAction) -> Result<String> {
                 .as_ref()
                 .map(|seed| format!("rm -f {}; ", shell_quote(seed)))
                 .unwrap_or_default();
+            let snapshot_cleanup = rollback_snapshot
+                .as_ref()
+                .map(|snapshot| format!("rm -rf -- {}; ", shell_quote(snapshot)))
+                .unwrap_or_default();
             if *remove_release {
-                Ok(format!("set -eu; {backup_cleanup}{seed_cleanup}rm -rf -- {}", shell_quote(release), backup_cleanup = backup_cleanup, seed_cleanup = seed_cleanup))
+                Ok(format!("set -eu; {backup_cleanup}{wal_cleanup}{shm_cleanup}{seed_cleanup}{snapshot_cleanup}rm -rf -- {}", shell_quote(release), backup_cleanup = backup_cleanup, wal_cleanup = wal_cleanup, shm_cleanup = shm_cleanup, seed_cleanup = seed_cleanup, snapshot_cleanup = snapshot_cleanup))
             } else {
-                Ok(format!("set -eu; {backup_cleanup}{seed_cleanup}true", backup_cleanup = backup_cleanup, seed_cleanup = seed_cleanup))
+                Ok(format!("set -eu; {backup_cleanup}{wal_cleanup}{shm_cleanup}{seed_cleanup}{snapshot_cleanup}true", backup_cleanup = backup_cleanup, wal_cleanup = wal_cleanup, shm_cleanup = shm_cleanup, seed_cleanup = seed_cleanup, snapshot_cleanup = snapshot_cleanup))
             }
         }
+    }
+}
+
+fn previous_listener_state(plan: &DeploymentPlan) -> ListenerPlan {
+    let mut listener = plan.listener.clone();
+    listener.tailscale_state = plan.rollback.previous_listener_state;
+    listener
+}
+
+fn listener_restore_command(plan: &ListenerPlan) -> String {
+    if plan.access_mode != ListenerAccessMode::TailscaleServe {
+        return String::new();
+    }
+    match plan.tailscale_state {
+        TailscaleServeState::NotConfigured => {
+            "command -v tailscale >/dev/null && tailscale serve reset; ".to_string()
+        }
+        TailscaleServeState::Enabled => format!(
+            "command -v tailscale >/dev/null && tailscale serve --https=443 http://127.0.0.1:{}; ",
+            plan.local_port
+        ),
+        TailscaleServeState::ConsentRequired => String::new(),
+    }
+}
+
+fn service_health_command(platform: ServicePlatform) -> &'static str {
+    match platform {
+        ServicePlatform::Systemd => "systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service",
+        ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.hub\" >/dev/null; launchctl print \"$domain/dev.dirtydash.collector\" >/dev/null",
+    }
+}
+
+fn service_quiesce_command(platform: ServicePlatform) -> &'static str {
+    match platform {
+        ServicePlatform::Systemd => "systemctl --user stop dirtydash-hub.service; systemctl --user stop dirtydash-collector.service",
+        ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl kill TERM \"$domain/dev.dirtydash.hub\" 2>/dev/null || true; launchctl kill TERM \"$domain/dev.dirtydash.collector\" 2>/dev/null || true",
+    }
+}
+
+fn service_restart_command(platform: ServicePlatform) -> &'static str {
+    match platform {
+        ServicePlatform::Systemd => "systemctl --user daemon-reload; systemctl --user restart dirtydash-hub.service; systemctl --user restart dirtydash-collector.service; systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service",
+        ServicePlatform::Launchd => "domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null; launchctl print \"$collector\" >/dev/null",
+    }
+}
+
+fn activation_move_command(temp: &str, current: &str, platform: ServicePlatform) -> String {
+    match platform {
+        ServicePlatform::Systemd => {
+            format!("mv -Tf {} {}", shell_quote(temp), shell_quote(current))
+        }
+        ServicePlatform::Launchd => format!("mv -f {} {}", shell_quote(temp), shell_quote(current)),
     }
 }
 
@@ -1491,257 +2207,5 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-    use std::collections::VecDeque;
-    use tempfile::tempdir;
-
-    fn signed_fixture() -> (SignedArtifactManifest, Vec<u8>, [u8; 32]) {
-        let key = SigningKey::from_bytes(&[7_u8; 32]);
-        let bytes = b"dirtydash-linux-artifact".to_vec();
-        let manifest = ArtifactManifest {
-            schema_version: MANIFEST_SCHEMA_VERSION,
-            release: "0.1.2-test".to_string(),
-            artifacts: vec![ArtifactDescriptor {
-                platform: TargetPlatform {
-                    os: ArtifactOs::Linux,
-                    arch: ArtifactArch::X86_64,
-                },
-                file: "dirtydash-linux-x86_64".to_string(),
-                sha256: hex::encode(Sha256::digest(&bytes)),
-                size: bytes.len() as u64,
-            }],
-        };
-        let mut unsigned = SignedArtifactManifest {
-            key_id: "fixture-key".to_string(),
-            manifest,
-            signature: String::new(),
-        };
-        let payload = unsigned.signing_bytes().unwrap();
-        unsigned.signature = hex::encode(key.sign(&payload).to_bytes());
-        (unsigned, bytes, key.verifying_key().to_bytes())
-    }
-
-    #[test]
-    fn platform_aliases_select_linux_and_macos_arm64_deterministically() {
-        assert_eq!(
-            TargetPlatform::from_uname("Linux", "x86_64").unwrap(),
-            TargetPlatform {
-                os: ArtifactOs::Linux,
-                arch: ArtifactArch::X86_64
-            }
-        );
-        assert_eq!(
-            TargetPlatform::from_uname("Darwin", "arm64").unwrap(),
-            TargetPlatform {
-                os: ArtifactOs::Macos,
-                arch: ArtifactArch::Arm64
-            }
-        );
-        assert!(TargetPlatform::from_uname("FreeBSD", "amd64").is_err());
-    }
-
-    #[test]
-    fn all_linux_macos_x86_and_arm_targets_select_without_ambiguity() {
-        let bytes = b"same-fixture".to_vec();
-        let digest = hex::encode(Sha256::digest(&bytes));
-        let platforms = [
-            TargetPlatform {
-                os: ArtifactOs::Linux,
-                arch: ArtifactArch::X86_64,
-            },
-            TargetPlatform {
-                os: ArtifactOs::Linux,
-                arch: ArtifactArch::Arm64,
-            },
-            TargetPlatform {
-                os: ArtifactOs::Macos,
-                arch: ArtifactArch::X86_64,
-            },
-            TargetPlatform {
-                os: ArtifactOs::Macos,
-                arch: ArtifactArch::Arm64,
-            },
-        ];
-        let verified = VerifiedArtifactManifest {
-            key_id: "fixture".to_string(),
-            manifest: ArtifactManifest {
-                schema_version: MANIFEST_SCHEMA_VERSION,
-                release: "0.1.2".to_string(),
-                artifacts: platforms
-                    .iter()
-                    .enumerate()
-                    .map(|(index, platform)| ArtifactDescriptor {
-                        platform: *platform,
-                        file: format!("dirtydash-{index}"),
-                        sha256: digest.clone(),
-                        size: bytes.len() as u64,
-                    })
-                    .collect(),
-            },
-            manifest_sha256: "fixture".to_string(),
-        };
-        for platform in platforms {
-            assert!(verified.verify_artifact(platform, bytes.clone()).is_ok());
-        }
-    }
-
-    #[test]
-    fn signature_and_checksum_are_both_required() {
-        let (signed, bytes, public_key) = signed_fixture();
-        let verified = signed.verify(&public_key).unwrap();
-        let artifact = verified
-            .verify_artifact(
-                TargetPlatform {
-                    os: ArtifactOs::Linux,
-                    arch: ArtifactArch::X86_64,
-                },
-                bytes.clone(),
-            )
-            .unwrap();
-        assert_eq!(artifact.bytes, bytes);
-        let mut changed = bytes;
-        changed.push(0);
-        assert!(verified
-            .verify_artifact(artifact.descriptor.platform, changed)
-            .is_err());
-        let mut unsigned = signed;
-        unsigned.signature = "00".repeat(64);
-        assert!(unsigned.verify(&public_key).is_err());
-    }
-
-    #[derive(Default)]
-    struct FakeExecutor {
-        facts: Option<RemoteFacts>,
-        actions: Vec<RemoteAction>,
-        uploads: Vec<(String, Vec<u8>, u32)>,
-        results: VecDeque<Result<RemoteResult>>,
-    }
-
-    impl RemoteExecutor for FakeExecutor {
-        fn detect(&mut self) -> Result<RemoteFacts> {
-            self.facts.clone().context("missing fake facts")
-        }
-
-        fn run(&mut self, action: RemoteAction) -> Result<RemoteResult> {
-            let is_tailscale = matches!(action, RemoteAction::ConfigureTailscale { .. });
-            self.actions.push(action);
-            if is_tailscale {
-                return Ok(RemoteResult::consent_required("consent required"));
-            }
-            self.results
-                .pop_front()
-                .unwrap_or_else(|| Ok(RemoteResult::success("ok")))
-        }
-
-        fn upload(&mut self, destination: &str, bytes: &[u8], mode: u32) -> Result<RemoteResult> {
-            self.uploads
-                .push((destination.to_string(), bytes.to_vec(), mode));
-            Ok(RemoteResult::success("uploaded"))
-        }
-    }
-
-    fn facts() -> RemoteFacts {
-        RemoteFacts {
-            platform: TargetPlatform {
-                os: ArtifactOs::Linux,
-                arch: ArtifactArch::X86_64,
-            },
-            user: "delta".to_string(),
-            uid: 1000,
-            home: "/home/delta".to_string(),
-            current_release: Some("/home/delta/.local/share/dirtydash/releases/old".to_string()),
-        }
-    }
-
-    #[test]
-    fn plan_is_inspectable_and_contains_no_secret_fields() {
-        let plan = DeploymentPlan::skeleton("di", "0.1.2", ListenerPlan::default(), true).unwrap();
-        let json = plan.to_json().unwrap();
-        assert!(json.contains("verify-signed-artifact"));
-        assert!(json.contains("optional-database-seed"));
-        assert!(!json.contains("password"));
-        assert!(!json.contains("token"));
-        assert!(!json.contains("PASSWORD_SENTINEL"));
-    }
-
-    #[test]
-    fn runner_rolls_back_and_cleans_up_after_restart_failure() {
-        let (signed, bytes, public_key) = signed_fixture();
-        let artifact = signed
-            .verify(&public_key)
-            .unwrap()
-            .verify_artifact(facts().platform, bytes)
-            .unwrap();
-        let dir = tempdir().unwrap();
-        let fake = FakeExecutor {
-            facts: Some(facts()),
-            results: VecDeque::from([
-                Ok(RemoteResult::success("ok")),
-                Err(anyhow::anyhow!("hostile stderr SECRET_SENTINEL")),
-            ]),
-            ..FakeExecutor::default()
-        };
-        let mut runner = DeploymentRunner::new(fake);
-        let request = DeploymentRequest::new("alias", "0.1.2-test", ListenerPlan::default());
-        let error = runner.apply(&request, &artifact).unwrap_err().to_string();
-        assert!(!error.contains("SECRET_SENTINEL"));
-        let executor = runner.executor();
-        assert!(executor
-            .actions
-            .iter()
-            .any(|action| matches!(action, RemoteAction::Cleanup { .. })));
-        let _ = dir;
-    }
-
-    #[test]
-    fn consent_is_a_durable_resumable_receipt_not_a_secret_failure() {
-        let (signed, bytes, public_key) = signed_fixture();
-        let artifact = signed
-            .verify(&public_key)
-            .unwrap()
-            .verify_artifact(facts().platform, bytes)
-            .unwrap();
-        let dir = tempdir().unwrap();
-        let checkpoint = DeploymentStateStore::new(dir.path().join("deployment.json"));
-        let fake = FakeExecutor {
-            facts: Some(facts()),
-            results: VecDeque::from([Ok(RemoteResult::success("ok"))]),
-            ..FakeExecutor::default()
-        };
-        let mut runner = DeploymentRunner::new(fake).with_state_store(checkpoint.clone());
-        let receipt = runner
-            .apply(
-                &DeploymentRequest::new("manual", "0.1.2-test", ListenerPlan::default()),
-                &artifact,
-            )
-            .unwrap();
-        assert_eq!(receipt.status, "consent-required");
-        assert_eq!(
-            checkpoint.load().unwrap().unwrap().status,
-            "consent-required"
-        );
-    }
-
-    #[test]
-    fn remote_probe_rejects_root_and_parses_platform() {
-        let facts = RemoteFacts::parse_probe(
-            "os=Darwin\narch=arm64\nuser=alice\nuid=501\nhome=/Users/alice\n",
-        )
-        .unwrap();
-        assert_eq!(facts.platform.service_platform(), ServicePlatform::Launchd);
-        assert!(
-            RemoteFacts::parse_probe("os=Linux\narch=x86_64\nuser=root\nuid=0\nhome=/root\n")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn ssh_actions_use_fixed_options_and_no_secret_arguments() {
-        let command = action_command(&RemoteAction::HealthCheck { port: 4599 }).unwrap();
-        assert!(command.contains("127.0.0.1:4599"));
-        assert!(!command.contains("password"));
-        assert!(!command.contains("secret"));
-    }
-}
+#[path = "deployment_tests.rs"]
+mod tests;

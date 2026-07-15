@@ -40,6 +40,14 @@ pub fn serve(
         let db = Database::open(&db_path)?;
         db.migrate()?;
         let repository = HubRepository::new(db);
+        hub_config.validate()?;
+        let listener_plan = &hub_config.listener;
+        if trust_mode == ListenerTrustMode::PrivateTailscale {
+            listener_plan.validate_bind_host(&host)?;
+            if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+                anyhow::bail!("private Tailscale Hub mode requires a loopback bind");
+            }
+        }
         let router_config = HubRouterConfig::from_config(trust_mode, hub_config);
         let service = build_router_with_config_and_connect_info(repository, router_config);
         let address: SocketAddr = format!("{host}:{port}")
@@ -164,6 +172,20 @@ impl TrustedProxyConfig {
         self
     }
 
+    pub fn validate(&self) -> Result<()> {
+        if self.identity_header.trim().is_empty()
+            || self.provenance_header.trim().is_empty()
+            || self.provenance_value.trim().is_empty()
+            || self.source_cidrs.is_empty()
+        {
+            anyhow::bail!("trusted proxy configuration must be complete and fail closed");
+        }
+        for cidr in &self.source_cidrs {
+            crate::ssh::validate_cidr(cidr)?;
+        }
+        Ok(())
+    }
+
     fn trusts_peer(&self, peer: SocketAddr) -> bool {
         self.source_cidrs
             .iter()
@@ -212,7 +234,7 @@ fn masked_ip_matches<const N: usize>(peer: [u8; N], network: [u8; N], prefix: u8
     peer[full_bytes] & mask == network[full_bytes] & mask
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HubRouterConfig {
     trust_mode: ListenerTrustMode,
     cookie_transport: CookieTransportSecurity,
@@ -220,6 +242,23 @@ pub struct HubRouterConfig {
     trusted_proxy: Option<TrustedProxyConfig>,
     bootstrap_boundary: BootstrapBoundary,
     bootstrap_setup_token: Option<String>,
+}
+
+impl std::fmt::Debug for HubRouterConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HubRouterConfig")
+            .field("trust_mode", &self.trust_mode)
+            .field("cookie_transport", &self.cookie_transport)
+            .field("tailscale_owner_mappings", &self.tailscale_owner_mappings)
+            .field("trusted_proxy", &self.trusted_proxy)
+            .field("bootstrap_boundary", &self.bootstrap_boundary)
+            .field(
+                "bootstrap_setup_token",
+                &self.bootstrap_setup_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl HubRouterConfig {

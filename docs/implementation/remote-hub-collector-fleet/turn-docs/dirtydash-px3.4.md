@@ -62,17 +62,25 @@ The implementation owner incorporated both parent-mediated read-only Sol-low sco
 
 ## Changed Behavior And Files
 
-- `crates/dirtydash/src/deployment.rs`: signed manifest verifier, four-target platform selection, typed inspectable deployment plan, remote probe/executor, atomic user-owned release activation, optional SQLite seed backup/restore, non-root service installation, restart/health/receipt checks, Tailscale consent checkpoint, rollback, and cleanup.
-- `crates/dirtydash/src/enrollment.rs`: durable five-state SSH enrollment workflow, alias/manual target validation, managed known-host fingerprint confirmation/change blocking, memory-only zeroized secret inputs, fixed SSH operations, sanitized durable drafts, retry/cleanup, receipt/backfill handling, and legacy remote-to-un-enrolled draft conversion.
+- `crates/dirtydash/src/deployment.rs`, `deployment_tests.rs`, and `ssh.rs`: pinned signed-manifest verification, four-target selection, persisted concrete plans, canonical SSH resolution, typed executor/runner actions, transactional SQLite/WAL seed replacement, service/listener rollback, and deterministic failure evidence.
+- `crates/dirtydash/src/enrollment.rs` and `enrollment_tests.rs`: durable model/workflow/store/SSH seams, canonical target/managed host-key confirmation, zeroized memory-only authentication, persisted reviewed artifact/seed intent, execution substates with cleanup/retry, receipt handling, and legacy remote-to-un-enrolled draft conversion.
 - `crates/dirtydash/src/service.rs`: deterministic non-root systemd user and launchd service rendering for Hub plus local Collector.
 - `crates/dirtydash/src/listener.rs`: Tailscale/private default, explicit consent state, public fallback trust configuration, runtime TOML, and listener command/state mapping.
-- `crates/dirtydash/src/cli.rs`, `config.rs`, `lib.rs`: `deploy hub <ssh-target>` plan/apply CLI, Hub listener flags, and listener configuration.
+- `crates/dirtydash/src/cli.rs`, `config.rs`, `lib.rs`: concrete `deploy hub <ssh-target>` plan/apply CLI, publisher allowlist, atomic restrictive secret store, Hub listener flags, and listener configuration.
 - `crates/dirtydash/src/hub/{mod.rs,router.rs}`: runnable authenticated Hub listener using the connect-info trust seam and `/healthz`.
 - `crates/dirtydash/tests/cli.rs`, module tests, and `docs/deployment.md`: isolated plan/signature/platform/service/listener/enrollment/secret-redaction coverage and fleet deployment guidance. The legacy Docker/NPM script remains untouched.
 
+## Thermo-Nuclear Repair Pass
+
+The independent review blockers were repaired on the phase branch. Planning now performs a concrete remote probe, persists the full artifact/facts/exposure/seed/backfill/rollback plan, and apply requires the reviewed persisted hash while recomputing facts before mutation. Publisher verification pins both key ID and SHA-256 fingerprint; `VerifiedArtifact` can only be produced by verification.
+
+SSH uses one `ssh -G`-resolved typed target (HostName/Port/User/HostKeyAlias/ProxyJump) for keyscan, managed known-host lookup, and execution. First use requires an exact confirmation and changed keys remain hard failures. Bootstrap/Collector credentials moved to atomic `0600` secret storage and are absent from TOML snapshots/debug output. Seed replacement now snapshots and validates SQLite plus WAL/SHM, quiesces services, uses platform-specific activation, independently verifies Hub/Collector health, and restores release/config/services/database/listener state on rollback.
+
+Enrollment stores the reviewed plan and artifact/seed intent, has durable execution substates, and permits restart/retry only after cleanup with the same hash. Password-authenticated installs are explicitly refused rather than using an unsafe unattended fallback; trust/auth uses inherited PTY or an in-memory inherited pipe only. User systemd/launchd units no longer switch users, and already-loaded launchd jobs are handled explicitly. Private Tailscale binds loopback-only, while trusted-proxy CIDRs are validated at config time and transport peer/header trust is fail-closed. Focused SSH, secret-store, plan, rollback, listener, service, redaction, and restart tests were added.
+
 ## Review
 
-Pending independent fresh review. The implementation owner has not self-closed review findings; coordinator review and any bounded repairs remain outstanding.
+Pending independent fresh review of this repair pass. Live signing keys, real SSH hosts/managers, public certificates, and tailnet consent remain unavailable external gates; no evidence is fabricated.
 
 ## CI And Gates
 
@@ -84,7 +92,8 @@ Evidence:
 
 - `cargo fmt --all`: passed.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
-- `cargo test --all-targets`: passed (76 unit tests, 7 CLI tests, 14 Collector integration tests).
+- Thermo-nuclear repair validation covers persisted reviewed plans, publisher pinning, canonical SSH/host-key trust, secret snapshots/permissions, transactional SQLite/WAL rollback, service-manager state, listener CIDRs/peer trust, execution restart, and redaction.
+- `cargo test --all-targets --all-features`: passed (90 unit tests, 7 CLI tests, 14 Collector integration tests).
 - Local Hub smoke: `serve --hub --listener public --port 0` started a real connect-info router and `/healthz` returned `{"service":"dirtydash-hub","status":"ok"}`.
 - Live production signing, SSH alias/manual host enrollment, changed-key behavior against real hosts, systemd/launchd manager operations, Tailscale consent, public TLS certificates, and real release artifact deployment were not available in this isolated environment.
 

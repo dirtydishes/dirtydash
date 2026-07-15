@@ -2360,3 +2360,40 @@ async fn loopback_server_contract_stays_unchanged() {
     let body = json_response(response).await;
     assert_eq!(body.get("authenticated").unwrap(), false);
 }
+
+#[test]
+fn trusted_proxy_cidr_matching_handles_ipv4_ipv6_and_malformed_values() {
+    let peer_v4: SocketAddr = "127.0.0.8:4599".parse().unwrap();
+    let peer_v6: SocketAddr = "[fd7a:115c:a1e0::8]:4599".parse().unwrap();
+    let config = TrustedProxyConfig::new("x-id", "x-proof", "ok")
+        .with_source_cidrs(["127.0.0.0/8", "fd7a:115c:a1e0::/48"]);
+    assert!(config.trusts_peer(peer_v4));
+    assert!(config.trusts_peer(peer_v6));
+    assert!(!config.trusts_peer("192.0.2.1:4599".parse().unwrap()));
+    assert!(!ip_matches_cidr(peer_v4.ip(), "127.0.0.0/33"));
+    assert!(!ip_matches_cidr(peer_v6.ip(), "not-a-cidr"));
+}
+
+#[tokio::test]
+async fn duplicate_trusted_headers_are_rejected_not_merged() {
+    let repo = test_repo();
+    let config = HubRouterConfig::for_listener(ListenerTrustMode::TrustedProxy).with_trusted_proxy(
+        TrustedProxyConfig::new("x-id", "x-proof", "ok").with_source_cidr("127.0.0.0/8"),
+    );
+    let app = test_app_with_config(repo, config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/session")
+                .header("x-id", "owner@example.com")
+                .header("x-id", "attacker@example.com")
+                .header("x-proof", "ok")
+                .extension(ConnectInfo("127.0.0.1:4599".parse::<SocketAddr>().unwrap()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

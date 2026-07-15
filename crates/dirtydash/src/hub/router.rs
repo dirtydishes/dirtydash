@@ -395,6 +395,13 @@ fn trusted_tailscale_identity(
     match config.trust_mode {
         ListenerTrustMode::Public | ListenerTrustMode::LoopbackHttp => Ok(None),
         ListenerTrustMode::PrivateTailscale => {
+            // Production Hub sockets are loopback-only in private mode; the
+            // Tailscale Serve process is the transport-authenticated peer.
+            // Keep a missing peer usable for the in-process router seam, but
+            // never accept a forged header from a concrete non-loopback peer.
+            if peer.is_some_and(|peer| !peer.ip().is_loopback()) {
+                return Ok(None);
+            }
             let Some(login) = exact_header_value(headers, TAILSCALE_USER_LOGIN)? else {
                 return Ok(None);
             };

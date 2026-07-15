@@ -63,6 +63,22 @@ pub struct PublicTrustedProxy {
     pub source_cidrs: Vec<String>,
 }
 
+impl PublicTrustedProxy {
+    pub fn validate(&self) -> Result<()> {
+        if self.identity_header.trim().is_empty()
+            || self.provenance_header.trim().is_empty()
+            || self.provenance_value.trim().is_empty()
+            || self.source_cidrs.is_empty()
+        {
+            bail!("trusted public proxy configuration must be complete and fail closed");
+        }
+        for cidr in &self.source_cidrs {
+            crate::ssh::validate_cidr(cidr)?;
+        }
+        Ok(())
+    }
+}
+
 impl PublicTrustConfig {
     pub fn validate(&self) -> Result<()> {
         if self.administrator_auth != "fallback-admin-session" {
@@ -72,13 +88,7 @@ impl PublicTrustConfig {
             bail!("public listeners require secure cookies");
         }
         if let Some(proxy) = &self.trusted_proxy {
-            if proxy.identity_header.trim().is_empty()
-                || proxy.provenance_header.trim().is_empty()
-                || proxy.provenance_value.trim().is_empty()
-                || proxy.source_cidrs.is_empty()
-            {
-                bail!("trusted public proxy configuration must be complete and fail closed");
-            }
+            proxy.validate()?;
         }
         Ok(())
     }
@@ -137,6 +147,26 @@ impl ListenerPlan {
                     .context("public HTTPS mode requires fallback trust configuration")?
                     .validate()?;
             }
+        }
+        Ok(())
+    }
+
+    /// Validate the bind address for a concrete process.  Private Tailscale
+    /// mode is safe on loopback because Tailscale Serve supplies the external
+    /// transport/trust boundary; a non-loopback bind requires an explicit
+    /// trusted-proxy/public mode instead.
+    pub fn validate_bind_host(&self, host: &str) -> Result<()> {
+        if host.trim().is_empty()
+            || host
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+        {
+            bail!("Hub bind host is invalid");
+        }
+        if self.access_mode == ListenerAccessMode::TailscaleServe
+            && !matches!(host, "127.0.0.1" | "localhost" | "::1")
+        {
+            bail!("private Tailscale Serve mode must bind loopback-only");
         }
         Ok(())
     }
@@ -242,6 +272,36 @@ mod tests {
             plan.apply_tailscale_output("Serve is running"),
             TailscaleServeState::Enabled
         );
+    }
+
+    #[test]
+    fn private_tailscale_is_loopback_only_and_cidr_validation_is_fail_closed() {
+        let plan = ListenerPlan::default();
+        assert!(plan.validate_bind_host("127.0.0.1").is_ok());
+        assert!(plan.validate_bind_host("0.0.0.0").is_err());
+        let invalid = PublicTrustConfig {
+            trusted_proxy: Some(PublicTrustedProxy {
+                identity_header: "x-user".to_string(),
+                provenance_header: "x-provenance".to_string(),
+                provenance_value: "verified".to_string(),
+                source_cidrs: vec!["2001:db8::/129".to_string()],
+            }),
+            ..PublicTrustConfig::default()
+        };
+        assert!(invalid.validate().is_err());
+        let mixed = PublicTrustConfig {
+            trusted_proxy: Some(PublicTrustedProxy {
+                identity_header: "x-user".to_string(),
+                provenance_header: "x-provenance".to_string(),
+                provenance_value: "verified".to_string(),
+                source_cidrs: vec![
+                    "127.0.0.1/32".to_string(),
+                    "fd7a:115c:a1e0::/48".to_string(),
+                ],
+            }),
+            ..PublicTrustConfig::default()
+        };
+        assert!(mixed.validate().is_ok());
     }
 
     #[test]

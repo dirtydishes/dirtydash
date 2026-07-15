@@ -27,6 +27,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 use crate::deployment::{
@@ -34,8 +35,32 @@ use crate::deployment::{
     SshRemoteExecutor, TargetPlatform, VerifiedArtifact,
 };
 use crate::listener::ListenerPlan;
+use crate::ssh::{canonical_known_hosts_line, host_key_fingerprint, CanonicalSshTarget};
 
 pub const ENROLLMENT_STATE_VERSION: u32 = 1;
+
+/// Focused enrollment seams: sanitized model, durable store, workflow, and
+/// production SSH adapter. Re-exports keep each seam discoverable without
+/// exposing secret-bearing constructors or arbitrary shell execution.
+pub mod model {
+    pub use super::{
+        AuthMethod, ConnectionSpec, EnrollmentBlocker, EnrollmentDraft,
+        EnrollmentExecutionSubstate, EnrollmentReceipt, EnrollmentState, HostKeyObservation,
+        HostKeyStatus, PersistedAuthMethod, SanitizedFacts,
+    };
+}
+
+pub mod store {
+    pub use super::{EnrollmentStore, KnownHostStore};
+}
+
+pub mod workflow {
+    pub use super::{EnrollmentBackend, EnrollmentExecution, EnrollmentWorkflow, HostTrustOutcome};
+}
+
+pub mod ssh_backend {
+    pub use super::SshEnrollmentBackend;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -57,6 +82,23 @@ pub enum EnrollmentBlocker {
     SudoFailed,
     PlanInvalidated,
     CleanupRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnrollmentExecutionSubstate {
+    #[default]
+    NotStarted,
+    Preparing,
+    Quiescing,
+    Installing,
+    Activating,
+    Restarting,
+    HealthChecking,
+    ConfiguringListener,
+    VerifyingReceipt,
+    CleanupRequired,
+    Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +135,23 @@ impl ConnectionSpec {
     pub fn display_target(&self) -> String {
         match self {
             Self::SshAlias { alias } => alias.clone(),
+            Self::Manual { user, host, .. } => format!("{user}@{host}"),
+        }
+    }
+
+    pub fn display_endpoint(&self) -> String {
+        match self {
+            Self::SshAlias { alias } => alias.clone(),
             Self::Manual { user, host, port } => format!("{user}@{host}:{port}"),
+        }
+    }
+
+    pub fn canonical_target(&self) -> Result<CanonicalSshTarget> {
+        match self {
+            Self::SshAlias { alias } => CanonicalSshTarget::resolve(alias.clone()),
+            Self::Manual { user, host, port } => {
+                CanonicalSshTarget::resolve(format!("{user}@{host}:{port}"))
+            }
         }
     }
 
@@ -399,6 +457,8 @@ pub struct EnrollmentReceipt {
     pub plan_hash: String,
     pub release: String,
     pub artifact_sha256: String,
+    pub artifact_size: u64,
+    pub publisher_key_id: String,
     pub hub_health_verified: bool,
     pub collector_health_verified: bool,
     pub backfill_queued: bool,
@@ -410,7 +470,9 @@ impl From<DeploymentReceipt> for EnrollmentReceipt {
         Self {
             plan_hash: receipt.plan_hash,
             release: receipt.release,
-            artifact_sha256: String::new(),
+            artifact_sha256: receipt.artifact_sha256,
+            artifact_size: receipt.artifact_size,
+            publisher_key_id: receipt.publisher_key_id,
             hub_health_verified: receipt.hub_health_verified,
             collector_health_verified: receipt.collector_service_verified,
             backfill_queued: receipt.database_seeded,
@@ -431,6 +493,10 @@ pub struct EnrollmentDraft {
     pub facts: Option<SanitizedFacts>,
     pub plan_hash: Option<String>,
     pub reviewed_plan_hash: Option<String>,
+    #[serde(default)]
+    pub plan: Option<DeploymentPlan>,
+    #[serde(default)]
+    pub execution_substate: EnrollmentExecutionSubstate,
     pub receipt: Option<EnrollmentReceipt>,
     pub last_error: Option<String>,
     pub attempts: u32,
@@ -457,6 +523,8 @@ impl EnrollmentDraft {
             facts: None,
             plan_hash: None,
             reviewed_plan_hash: None,
+            plan: None,
+            execution_substate: EnrollmentExecutionSubstate::NotStarted,
             receipt: None,
             last_error: None,
             attempts: 0,
@@ -552,6 +620,13 @@ pub struct EnrollmentExecution<'a> {
 }
 
 pub trait EnrollmentBackend {
+    /// Return the managed known-host key name for the canonical target.  The
+    /// default keeps deterministic in-memory backends independent of ssh -G;
+    /// the production backend overrides it with HostKeyAlias/port facts.
+    fn host_key_name(&self, connection: &ConnectionSpec) -> Result<String> {
+        Ok(connection.host_key_name())
+    }
+
     fn observe_host_key(
         &mut self,
         connection: &ConnectionSpec,
@@ -656,7 +731,7 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
                     secrets,
                 )
             })?;
-        let host = draft.connection.host_key_name();
+        let host = self.backend.host_key_name(&draft.connection)?;
         let status = self
             .known_hosts
             .status(&host, &observation.fingerprint)
@@ -729,11 +804,21 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         auth_method: &AuthMethod,
         secrets: &EnrollmentSecrets,
     ) -> Result<DeploymentPlan> {
+        self.probe_and_plan_with_seed(id, auth_method, secrets, None)
+    }
+
+    pub fn probe_and_plan_with_seed(
+        &mut self,
+        id: &str,
+        auth_method: &AuthMethod,
+        secrets: &EnrollmentSecrets,
+        database_seed: Option<&[u8]>,
+    ) -> Result<DeploymentPlan> {
         let mut draft = self.store.load(id)?;
         if draft.state != EnrollmentState::HostTrustAuth {
             bail!("enrollment draft is not at the probe/plan step");
         }
-        let (facts, plan) = self
+        let (facts, mut plan) = self
             .backend
             .probe_and_plan(&draft.connection, auth_method, &self.known_hosts, secrets)
             .map_err(|error| {
@@ -744,8 +829,21 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
                     secrets,
                 )
             })?;
+        if let Some(seed) = database_seed {
+            plan.seed_intent.requested = true;
+            plan.seed_intent.digest = Some(hex::encode(Sha256::digest(seed)));
+            plan.seed_intent.size = Some(seed.len() as u64);
+            plan.backfill_intent.requested = true;
+            plan.backfill_intent.source = Some("sqlite-seed".to_string());
+            plan.database_seed = true;
+            plan.refresh_hash()?;
+        }
+        plan.verify_hash()?;
         draft.facts = Some(SanitizedFacts::from(&facts));
+        draft.plan = Some(plan.clone());
         draft.plan_hash = Some(plan.plan_hash.clone());
+        draft.reviewed_plan_hash = None;
+        draft.execution_substate = EnrollmentExecutionSubstate::NotStarted;
         draft.state = EnrollmentState::ProbeAndPlan;
         draft.blocker = EnrollmentBlocker::None;
         draft.last_error = None;
@@ -760,6 +858,7 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             bail!("enrollment draft is not at immutable-plan review");
         }
         if immutable_plan.verify_hash().is_err()
+            || draft.plan.as_ref() != Some(immutable_plan)
             || draft.plan_hash.as_deref() != Some(immutable_plan.plan_hash.as_str())
         {
             draft.blocker = EnrollmentBlocker::PlanInvalidated;
@@ -769,12 +868,104 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             self.store.save(&draft)?;
             bail!("deployment plan changed after probe")
         }
+        if immutable_plan.artifact.is_none() {
+            bail!("artifact evidence is required; use review_with_artifact");
+        }
         draft.reviewed_plan_hash = Some(immutable_plan.plan_hash.clone());
+        draft.plan = Some(immutable_plan.clone());
+        draft.execution_substate = EnrollmentExecutionSubstate::NotStarted;
         draft.state = EnrollmentState::ImmutablePlanReview;
         draft.blocker = EnrollmentBlocker::None;
         draft.last_error = None;
         draft.updated_at = Utc::now().to_rfc3339();
         self.store.save(&draft)
+    }
+
+    /// Finalize review with the exact verified artifact and optional seed
+    /// bytes. Their digest/size/key ID and intent become part of the reviewed
+    /// plan hash before execution is allowed.
+    pub fn review_with_artifact(
+        &mut self,
+        id: &str,
+        immutable_plan: &DeploymentPlan,
+        artifact: &VerifiedArtifact,
+        database_seed: Option<&[u8]>,
+    ) -> Result<DeploymentPlan> {
+        let mut draft = self.store.load(id)?;
+        if draft.state != EnrollmentState::ProbeAndPlan
+            || immutable_plan.verify_hash().is_err()
+            || draft.plan.as_ref() != Some(immutable_plan)
+            || draft.plan_hash.as_deref() != Some(immutable_plan.plan_hash.as_str())
+        {
+            draft.blocker = EnrollmentBlocker::PlanInvalidated;
+            draft.last_error = Some("deployment plan changed before artifact review".to_string());
+            draft.updated_at = Utc::now().to_rfc3339();
+            self.store.save(&draft)?;
+            bail!("deployment plan changed before artifact review");
+        }
+        let mut reviewed = immutable_plan.clone();
+        reviewed.artifact = Some(artifact.evidence());
+        reviewed.release = artifact.manifest().manifest().release.clone();
+        if reviewed.release != immutable_plan.release {
+            if let Some(facts) = reviewed.target_facts.as_ref() {
+                reviewed.paths = Some(crate::deployment::DeploymentPaths::for_facts(
+                    facts,
+                    &reviewed.release,
+                )?);
+                reviewed.rollback = crate::deployment::RollbackData {
+                    previous_release: facts.current_release.clone(),
+                    database_path: reviewed.paths.as_ref().map(|paths| paths.hub_db.clone()),
+                    database_backup: reviewed
+                        .paths
+                        .as_ref()
+                        .map(|paths| paths.hub_db_backup.clone()),
+                    database_wal_backup: reviewed
+                        .paths
+                        .as_ref()
+                        .map(|paths| format!("{}-wal.previous", paths.hub_db_backup)),
+                    database_shm_backup: reviewed
+                        .paths
+                        .as_ref()
+                        .map(|paths| format!("{}-shm.previous", paths.hub_db_backup)),
+                    previous_config: reviewed
+                        .paths
+                        .as_ref()
+                        .map(|paths| paths.config_file.clone()),
+                    previous_services: reviewed
+                        .paths
+                        .as_ref()
+                        .map(|paths| vec![paths.service_dir.clone()])
+                        .unwrap_or_default(),
+                    previous_listener_state: reviewed.listener.tailscale_state,
+                    rollback_snapshot_dir: reviewed
+                        .paths
+                        .as_ref()
+                        .map(|paths| format!("{}/deployment-rollback", paths.state_dir)),
+                    activation_platform: Some(facts.platform.service_platform()),
+                };
+            }
+        }
+        reviewed.seed_intent = crate::deployment::SeedIntent {
+            requested: database_seed.is_some(),
+            digest: database_seed.map(|seed| hex::encode(Sha256::digest(seed))),
+            size: database_seed.map(|seed| seed.len() as u64),
+        };
+        reviewed.backfill_intent = crate::deployment::BackfillIntent {
+            requested: database_seed.is_some(),
+            source: database_seed.map(|_| "sqlite-seed".to_string()),
+        };
+        reviewed.database_seed = database_seed.is_some();
+        reviewed.refresh_hash()?;
+        draft.plan = Some(reviewed.clone());
+        draft.plan_hash = Some(reviewed.plan_hash.clone());
+        draft.reviewed_plan_hash = Some(reviewed.plan_hash.clone());
+        draft.state = EnrollmentState::ImmutablePlanReview;
+        draft.blocker = EnrollmentBlocker::None;
+        draft.execution_substate = EnrollmentExecutionSubstate::NotStarted;
+        draft.last_error = None;
+        draft.updated_at = Utc::now().to_rfc3339();
+        self.store.save(&draft)?;
+        Ok(reviewed)
     }
 
     pub fn execute(
@@ -787,10 +978,17 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         secrets: &EnrollmentSecrets,
     ) -> Result<EnrollmentReceipt> {
         let mut draft = self.store.load(id)?;
-        if draft.state != EnrollmentState::ImmutablePlanReview {
-            bail!("enrollment draft is not ready for execution");
+        if !matches!(
+            draft.state,
+            EnrollmentState::ImmutablePlanReview | EnrollmentState::ExecuteVerifyReceipt
+        ) || (draft.state == EnrollmentState::ExecuteVerifyReceipt && !draft.cleanup_complete)
+        {
+            bail!(
+                "enrollment draft is not ready for execution; cleanup must complete before retry"
+            );
         }
         if immutable_plan.verify_hash().is_err()
+            || draft.plan.as_ref() != Some(immutable_plan)
             || draft.reviewed_plan_hash.as_deref() != Some(immutable_plan.plan_hash.as_str())
             || draft.plan_hash.as_deref() != Some(immutable_plan.plan_hash.as_str())
         {
@@ -801,9 +999,21 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             self.store.save(&draft)?;
             bail!("reviewed deployment plan is stale")
         }
+        if let Err(error) = validate_execution_intent(immutable_plan, artifact, database_seed) {
+            let message = redact_error(&error.to_string(), secrets);
+            draft.blocker = EnrollmentBlocker::PlanInvalidated;
+            draft.state = EnrollmentState::ImmutablePlanReview;
+            draft.execution_substate = EnrollmentExecutionSubstate::NotStarted;
+            draft.cleanup_complete = true;
+            draft.last_error = Some(message.clone());
+            draft.updated_at = Utc::now().to_rfc3339();
+            self.store.save(&draft)?;
+            return Err(anyhow::anyhow!(message));
+        }
         draft.attempts = draft.attempts.saturating_add(1);
         draft.state = EnrollmentState::ExecuteVerifyReceipt;
         draft.blocker = EnrollmentBlocker::None;
+        draft.execution_substate = EnrollmentExecutionSubstate::Preparing;
         draft.cleanup_complete = false;
         draft.updated_at = Utc::now().to_rfc3339();
         self.store.save(&draft)?;
@@ -828,6 +1038,7 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
                 draft.receipt = Some(receipt.clone());
                 draft.last_error = None;
                 draft.blocker = EnrollmentBlocker::None;
+                draft.execution_substate = EnrollmentExecutionSubstate::Completed;
                 draft.cleanup_complete = true;
                 draft.updated_at = Utc::now().to_rfc3339();
                 self.store.save(&draft)?;
@@ -856,6 +1067,7 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
             EnrollmentBlocker::CleanupRequired
         };
         draft.cleanup_complete = cleanup_result.is_ok();
+        draft.execution_substate = EnrollmentExecutionSubstate::CleanupRequired;
         draft.last_error = Some(redact_error(message, secrets));
         draft.updated_at = Utc::now().to_rfc3339();
         self.store.save(draft)?;
@@ -875,6 +1087,8 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         })?;
         draft.cleanup_complete = true;
         draft.blocker = EnrollmentBlocker::None;
+        draft.execution_substate = EnrollmentExecutionSubstate::NotStarted;
+        draft.state = EnrollmentState::ImmutablePlanReview;
         draft.last_error = None;
         draft.updated_at = Utc::now().to_rfc3339();
         self.store.save(&draft)
@@ -894,6 +1108,36 @@ impl<B: EnrollmentBackend> EnrollmentWorkflow<B> {
         let _ = self.store.save(draft);
         anyhow::anyhow!(message)
     }
+}
+
+fn validate_execution_intent(
+    plan: &DeploymentPlan,
+    artifact: &VerifiedArtifact,
+    database_seed: Option<&[u8]>,
+) -> Result<()> {
+    let seed_requested = database_seed.is_some();
+    if plan.seed_intent.requested != seed_requested
+        || plan.backfill_intent.requested != seed_requested
+    {
+        bail!("seed/backfill intent does not match the reviewed deployment plan");
+    }
+    if let Some(seed) = database_seed {
+        let digest = hex::encode(Sha256::digest(seed));
+        if plan.seed_intent.digest.as_deref() != Some(digest.as_str())
+            || plan.seed_intent.size != Some(seed.len() as u64)
+        {
+            bail!("database seed changed after plan review");
+        }
+    }
+    let evidence = plan
+        .artifact
+        .as_ref()
+        .context("reviewed plan has no verified artifact evidence")?;
+    let actual = artifact.evidence();
+    if evidence != &actual {
+        bail!("artifact evidence changed after plan review");
+    }
+    Ok(())
 }
 
 fn redact_error(value: &str, secrets: &EnrollmentSecrets) -> String {
@@ -938,8 +1182,12 @@ fn redact_error(value: &str, secrets: &EnrollmentSecrets) -> String {
 fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let parent = path.parent().context("managed file has no parent")?;
     fs::create_dir_all(parent)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
     let temp = parent.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{nonce}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("dirtydash"),
@@ -967,7 +1215,7 @@ fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 /// terminal, never to `sshpass`, an environment variable, or a temp file.
 #[derive(Debug, Clone)]
 pub struct SshEnrollmentBackend {
-    target: String,
+    target: CanonicalSshTarget,
     known_hosts_path: PathBuf,
 }
 
@@ -990,47 +1238,26 @@ impl SshOperation {
 
 impl SshEnrollmentBackend {
     pub fn new(target: impl Into<String>, known_hosts_path: impl Into<PathBuf>) -> Result<Self> {
-        let target = target.into();
-        validate_connection_part(&target, "SSH target")?;
         Ok(Self {
-            target,
+            target: CanonicalSshTarget::resolve(target.into())?,
             known_hosts_path: known_hosts_path.into(),
         })
     }
 
     fn ssh_args(
         &self,
-        connection: &ConnectionSpec,
+        _connection: &ConnectionSpec,
         auth_method: &AuthMethod,
         interactive: bool,
     ) -> Result<Vec<String>> {
-        validate_connection_part(&self.target, "SSH target")?;
-        let mut args = vec![
-            "-o".to_string(),
-            "StrictHostKeyChecking=yes".to_string(),
-            "-o".to_string(),
-            format!("UserKnownHostsFile={}", self.known_hosts_path.display()),
-            "-o".to_string(),
-            "ConnectTimeout=10".to_string(),
-        ];
-        if !interactive {
-            args.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
-        }
-        if let AuthMethod::KeyPath { path } = auth_method {
-            args.extend([
-                "-i".to_string(),
-                path.display().to_string(),
-                "-o".to_string(),
-                "IdentitiesOnly=yes".to_string(),
-            ]);
-        }
-        match connection {
-            ConnectionSpec::SshAlias { alias } => args.push(alias.clone()),
-            ConnectionSpec::Manual { user, host, port } => {
-                args.extend(["-p".to_string(), port.to_string(), format!("{user}@{host}")]);
-            }
-        }
-        Ok(args)
+        Ok(self.target.ssh_args(
+            &self.known_hosts_path,
+            match auth_method {
+                AuthMethod::KeyPath { path } => Some(path.as_path()),
+                AuthMethod::Password => None,
+            },
+            !interactive,
+        ))
     }
 
     fn run_operation(
@@ -1084,24 +1311,21 @@ impl SshEnrollmentBackend {
 }
 
 impl EnrollmentBackend for SshEnrollmentBackend {
+    fn host_key_name(&self, _connection: &ConnectionSpec) -> Result<String> {
+        Ok(self.target.host_key_name())
+    }
+
     fn observe_host_key(
         &mut self,
-        connection: &ConnectionSpec,
+        _connection: &ConnectionSpec,
         _auth_method: &AuthMethod,
         _known_hosts: &KnownHostStore,
         _secrets: &EnrollmentSecrets,
     ) -> Result<HostKeyObservation> {
         // `ssh-keyscan` is intentionally only an observation.  It does not
         // alter known-hosts and the workflow requires a separate confirmation.
-        let mut keyscan_args = Vec::new();
-        match connection {
-            ConnectionSpec::SshAlias { alias } => keyscan_args.push(alias.clone()),
-            ConnectionSpec::Manual { host, port, .. } => {
-                keyscan_args.extend(["-p".to_string(), port.to_string(), host.clone()]);
-            }
-        }
         let output = Command::new("ssh-keyscan")
-            .args(&keyscan_args)
+            .args(self.target.keyscan_args())
             .output()
             .context("observing remote SSH host key")?;
         if !output.status.success() || output.stdout.is_empty() {
@@ -1116,7 +1340,8 @@ impl EnrollmentBackend for SshEnrollmentBackend {
         if line.is_empty() {
             bail!("SSH host-key observation returned no key");
         }
-        let fingerprint = format!("sha256:{}", hex::encode(Sha256::digest(line.as_bytes())));
+        let line = canonical_known_hosts_line(&self.target, &line)?;
+        let fingerprint = host_key_fingerprint(&line)?;
         HostKeyObservation::new(fingerprint, line)
     }
 
@@ -1149,12 +1374,17 @@ impl EnrollmentBackend for SshEnrollmentBackend {
             self.run_operation(connection, auth_method, SshOperation::Probe, secrets, false)?;
         let facts = RemoteFacts::parse_probe(&output)?;
         let listener = ListenerPlan::default();
-        let plan = DeploymentPlan::for_facts(
-            connection.display_target(),
+        let plan = DeploymentPlan::for_facts_with_details(
+            self.target.destination(),
             env!("CARGO_PKG_VERSION"),
             &facts,
             listener,
-            false,
+            crate::deployment::DeploymentPlanDetails {
+                artifact: None,
+                database_seed: false,
+                seed_bytes: None,
+                ssh_target: Some(self.target.clone()),
+            },
         )?;
         let _ = known_hosts;
         Ok((facts, plan))
@@ -1182,22 +1412,22 @@ impl EnrollmentBackend for SshEnrollmentBackend {
         if plan.plan_hash != plan_hash {
             bail!("enrollment plan hash changed before execution");
         }
-        let executor = SshRemoteExecutor::new(
-            draft.connection.display_target(),
+        let executor = SshRemoteExecutor::from_canonical_target(
+            self.target.clone(),
             self.known_hosts_path.clone(),
         )?
         .with_key_path(key_path)?;
         let request = DeploymentRequest {
-            target: draft.connection.display_target(),
-            release: artifact.manifest.manifest.release.clone(),
+            target: self.target.destination(),
+            release: plan.release.clone(),
             listener: listener.clone(),
             database_seed: database_seed.map(ToOwned::to_owned),
             approved_plan_hash: Some(plan_hash.to_string()),
         };
-        let mut runner = DeploymentRunner::new(executor);
+        let mut runner = DeploymentRunner::new(executor).with_reviewed_plan(plan.clone());
         let receipt = runner.apply(&request, artifact)?;
         let mut enrollment_receipt = EnrollmentReceipt::from(receipt);
-        enrollment_receipt.artifact_sha256 = artifact.descriptor.sha256.clone();
+        enrollment_receipt.artifact_sha256 = artifact.descriptor().sha256.clone();
         Ok(enrollment_receipt)
     }
 
@@ -1284,449 +1514,5 @@ pub fn persist_legacy_remote_drafts(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{RemoteConfig, SourceRoot};
-    use crate::deployment::{
-        ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, MANIFEST_SCHEMA_VERSION,
-    };
-    use ed25519_dalek::{Signer, SigningKey};
-    use tempfile::tempdir;
-
-    #[derive(Default)]
-    struct ScriptedBackend {
-        observation: Option<HostKeyObservation>,
-        auth_error: Option<String>,
-        facts: Option<RemoteFacts>,
-        plan: Option<DeploymentPlan>,
-        execute_error: Option<String>,
-        cleanup_error: Option<String>,
-        seen_secrets: Vec<String>,
-        execute_calls: usize,
-        cleanup_calls: usize,
-    }
-
-    impl EnrollmentBackend for ScriptedBackend {
-        fn observe_host_key(
-            &mut self,
-            _connection: &ConnectionSpec,
-            _auth_method: &AuthMethod,
-            _known_hosts: &KnownHostStore,
-            secrets: &EnrollmentSecrets,
-        ) -> Result<HostKeyObservation> {
-            self.capture(secrets);
-            self.observation
-                .clone()
-                .context("missing scripted host key")
-        }
-
-        fn authenticate(
-            &mut self,
-            _connection: &ConnectionSpec,
-            _auth_method: &AuthMethod,
-            _known_hosts: &KnownHostStore,
-            secrets: &EnrollmentSecrets,
-        ) -> Result<()> {
-            self.capture(secrets);
-            if let Some(error) = &self.auth_error {
-                bail!(
-                    "hostile stderr password={} {error}",
-                    secrets
-                        .password
-                        .as_ref()
-                        .map(|value| value.expose())
-                        .unwrap_or("")
-                );
-            }
-            Ok(())
-        }
-
-        fn probe_and_plan(
-            &mut self,
-            _connection: &ConnectionSpec,
-            _auth_method: &AuthMethod,
-            _known_hosts: &KnownHostStore,
-            secrets: &EnrollmentSecrets,
-        ) -> Result<(RemoteFacts, DeploymentPlan)> {
-            self.capture(secrets);
-            Ok((
-                self.facts.clone().context("missing facts")?,
-                self.plan.clone().context("missing plan")?,
-            ))
-        }
-
-        fn execute(&mut self, request: EnrollmentExecution<'_>) -> Result<EnrollmentReceipt> {
-            let EnrollmentExecution {
-                plan_hash,
-                artifact,
-                database_seed,
-                secrets,
-                ..
-            } = request;
-            self.capture(secrets);
-            self.execute_calls += 1;
-            if let Some(error) = &self.execute_error {
-                bail!(
-                    "hostile installer stderr password={} {error}",
-                    secrets
-                        .password
-                        .as_ref()
-                        .map(|value| value.expose())
-                        .unwrap_or("")
-                );
-            }
-            Ok(EnrollmentReceipt {
-                plan_hash: plan_hash.to_string(),
-                release: artifact.manifest.manifest.release.clone(),
-                artifact_sha256: artifact.descriptor.sha256.clone(),
-                hub_health_verified: true,
-                collector_health_verified: true,
-                backfill_queued: database_seed.is_some(),
-                status: "complete".to_string(),
-            })
-        }
-
-        fn cleanup(&mut self, _draft: &EnrollmentDraft, secrets: &EnrollmentSecrets) -> Result<()> {
-            self.capture(secrets);
-            self.cleanup_calls += 1;
-            if let Some(error) = &self.cleanup_error {
-                bail!(
-                    "cleanup stderr password={} {error}",
-                    secrets
-                        .password
-                        .as_ref()
-                        .map(|value| value.expose())
-                        .unwrap_or("")
-                );
-            }
-            Ok(())
-        }
-    }
-
-    impl ScriptedBackend {
-        fn capture(&mut self, secrets: &EnrollmentSecrets) {
-            if let Some(password) = &secrets.password {
-                self.seen_secrets.push(password.expose().to_string());
-            }
-            if let Some(sudo) = &secrets.sudo_password {
-                self.seen_secrets.push(sudo.expose().to_string());
-            }
-        }
-    }
-
-    fn fixture_artifact() -> VerifiedArtifact {
-        let key = SigningKey::from_bytes(&[8_u8; 32]);
-        let bytes = b"fixture".to_vec();
-        let manifest = ArtifactManifest {
-            schema_version: MANIFEST_SCHEMA_VERSION,
-            release: "0.1.1".to_string(),
-            artifacts: vec![ArtifactDescriptor {
-                platform: TargetPlatform {
-                    os: ArtifactOs::Linux,
-                    arch: ArtifactArch::X86_64,
-                },
-                file: "dirtydash".to_string(),
-                sha256: hex::encode(Sha256::digest(&bytes)),
-                size: bytes.len() as u64,
-            }],
-        };
-        let mut signed = crate::deployment::SignedArtifactManifest {
-            key_id: "test".to_string(),
-            manifest,
-            signature: String::new(),
-        };
-        signed.signature = hex::encode(key.sign(&signed.signing_bytes().unwrap()).to_bytes());
-        signed
-            .verify(&key.verifying_key().to_bytes())
-            .unwrap()
-            .verify_artifact(
-                TargetPlatform {
-                    os: ArtifactOs::Linux,
-                    arch: ArtifactArch::X86_64,
-                },
-                bytes,
-            )
-            .unwrap()
-    }
-
-    fn workflow() -> (
-        EnrollmentWorkflow<ScriptedBackend>,
-        EnrollmentDraft,
-        DeploymentPlan,
-        tempfile::TempDir,
-    ) {
-        let dir = tempdir().unwrap();
-        let connection = ConnectionSpec::alias("prod-alias").unwrap();
-        let auth = AuthMethod::password();
-        let facts = RemoteFacts {
-            platform: TargetPlatform {
-                os: ArtifactOs::Linux,
-                arch: ArtifactArch::X86_64,
-            },
-            user: "delta".to_string(),
-            uid: 1000,
-            home: "/home/delta".to_string(),
-            current_release: None,
-        };
-        let plan = DeploymentPlan::for_facts(
-            "prod-alias",
-            "0.1.1",
-            &facts,
-            ListenerPlan::default(),
-            false,
-        )
-        .unwrap();
-        let draft = EnrollmentDraft::new("machine-1", connection, auth).unwrap();
-        let backend = ScriptedBackend {
-            observation: Some(
-                HostKeyObservation::new("sha256:known", "prod-alias ssh-ed25519 AAAA").unwrap(),
-            ),
-            facts: Some(facts.clone()),
-            plan: Some(plan.clone()),
-            ..ScriptedBackend::default()
-        };
-        let store = EnrollmentStore::new(dir.path().join("enrollments"));
-        let known = KnownHostStore::new(dir.path().join("known_hosts"));
-        let workflow = EnrollmentWorkflow::new(store, known, backend);
-        (workflow, draft, plan, dir)
-    }
-
-    #[test]
-    fn alias_and_manual_connections_are_fixed_and_never_shell_fragments() {
-        assert_eq!(
-            ConnectionSpec::alias("prod").unwrap().display_target(),
-            "prod"
-        );
-        assert_eq!(
-            ConnectionSpec::manual("alice", "host.example", 2222)
-                .unwrap()
-                .display_target(),
-            "alice@host.example:2222"
-        );
-        assert!(ConnectionSpec::alias("prod; touch pwned").is_err());
-        let key = AuthMethod::key_path("/home/alice/.ssh/id_ed25519").unwrap();
-        assert!(matches!(key, AuthMethod::KeyPath { .. }));
-    }
-
-    #[test]
-    fn unknown_key_requires_confirmation_then_matching_key_is_accepted() {
-        let (mut workflow, draft, plan, _dir) = workflow();
-        workflow.start(draft).unwrap();
-        let secrets =
-            EnrollmentSecrets::password("PASSWORD_SENTINEL").with_sudo_password("SUDO_SENTINEL");
-        let first = workflow
-            .trust_and_auth("machine-1", &AuthMethod::Password, &secrets, None)
-            .unwrap();
-        assert_eq!(first.status, HostKeyStatus::Unknown);
-        assert!(!first.confirmed);
-        let second = workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:known"),
-            )
-            .unwrap();
-        assert!(second.confirmed);
-        assert_eq!(
-            workflow.store.load("machine-1").unwrap().state,
-            EnrollmentState::HostTrustAuth
-        );
-        let planned = workflow
-            .probe_and_plan("machine-1", &AuthMethod::Password, &secrets)
-            .unwrap();
-        assert_eq!(planned.plan_hash, plan.plan_hash);
-    }
-
-    #[test]
-    fn changed_key_is_blocked_without_overwriting_known_hosts() {
-        let (mut workflow, draft, _plan, _dir) = workflow();
-        workflow.start(draft).unwrap();
-        let secrets = EnrollmentSecrets::none();
-        workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:known"),
-            )
-            .unwrap();
-        workflow.backend_mut().observation =
-            Some(HostKeyObservation::new("sha256:changed", "prod-alias ssh-ed25519 BBBB").unwrap());
-        assert!(workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:changed")
-            )
-            .is_err());
-        assert_eq!(
-            workflow.store.load("machine-1").unwrap().blocker,
-            EnrollmentBlocker::ChangedHostKey
-        );
-        assert_eq!(
-            workflow
-                .known_hosts
-                .status("prod-alias", "sha256:known")
-                .unwrap(),
-            HostKeyStatus::Matching
-        );
-    }
-
-    #[test]
-    fn five_states_survive_restart_and_execute_records_receipt_backfill() {
-        let (mut workflow, draft, plan, dir) = workflow();
-        workflow.start(draft).unwrap();
-        let secrets = EnrollmentSecrets::password("PASSWORD_SENTINEL");
-        workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:known"),
-            )
-            .unwrap();
-        workflow
-            .probe_and_plan("machine-1", &AuthMethod::Password, &secrets)
-            .unwrap();
-        workflow.review("machine-1", &plan).unwrap();
-        let store = workflow.store.clone();
-        let known = workflow.known_hosts.clone();
-        let backend = std::mem::take(&mut workflow.backend);
-        let mut restarted = EnrollmentWorkflow::new(store, known, backend);
-        let receipt = restarted
-            .execute(
-                "machine-1",
-                &plan,
-                &fixture_artifact(),
-                Some(b"seed"),
-                &ListenerPlan::default(),
-                &secrets,
-            )
-            .unwrap();
-        assert!(receipt.backfill_queued);
-        assert_eq!(
-            restarted.store.load("machine-1").unwrap().state,
-            EnrollmentState::ExecuteVerifyReceipt
-        );
-        let raw = fs::read_dir(dir.path().join("enrollments"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let json = fs::read_to_string(raw).unwrap();
-        assert!(!json.contains("PASSWORD_SENTINEL"));
-        assert!(!json.contains("SUDO_SENTINEL"));
-    }
-
-    #[test]
-    fn failed_install_redacts_hostile_stderr_and_retry_cleanup_is_explicit() {
-        let (mut workflow, draft, plan, _dir) = workflow();
-        workflow.start(draft).unwrap();
-        let secrets = EnrollmentSecrets::password("PASSWORD_SENTINEL");
-        workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:known"),
-            )
-            .unwrap();
-        workflow
-            .probe_and_plan("machine-1", &AuthMethod::Password, &secrets)
-            .unwrap();
-        workflow.review("machine-1", &plan).unwrap();
-        workflow.backend_mut().execute_error = Some("PASSWORD_SENTINEL".to_string());
-        assert!(workflow
-            .execute(
-                "machine-1",
-                &plan,
-                &fixture_artifact(),
-                None,
-                &ListenerPlan::default(),
-                &secrets
-            )
-            .is_err());
-        let draft = workflow.store.load("machine-1").unwrap();
-        assert_eq!(draft.blocker, EnrollmentBlocker::CleanupRequired);
-        assert!(!draft.last_error.unwrap().contains("PASSWORD_SENTINEL"));
-        workflow.retry_cleanup("machine-1", &secrets).unwrap();
-        assert!(workflow.store.load("machine-1").unwrap().cleanup_complete);
-    }
-
-    #[test]
-    fn sudo_failure_stays_on_auth_step_and_redacts_password() {
-        let (mut workflow, draft, _plan, _dir) = workflow();
-        workflow.start(draft).unwrap();
-        workflow.backend_mut().auth_error = Some("sudo failure".to_string());
-        let secrets =
-            EnrollmentSecrets::password("PASSWORD_SENTINEL").with_sudo_password("SUDO_SENTINEL");
-        assert!(workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:known")
-            )
-            .is_err());
-        let draft = workflow.store.load("machine-1").unwrap();
-        assert_eq!(draft.blocker, EnrollmentBlocker::SudoFailed);
-        assert!(!draft.last_error.unwrap().contains("PASSWORD_SENTINEL"));
-        assert!(!workflow.backend().seen_secrets.is_empty());
-    }
-
-    #[test]
-    fn stale_plan_is_rejected() {
-        let (mut workflow, draft, plan, _dir) = workflow();
-        workflow.start(draft).unwrap();
-        let secrets = EnrollmentSecrets::none();
-        workflow
-            .trust_and_auth(
-                "machine-1",
-                &AuthMethod::Password,
-                &secrets,
-                Some("sha256:known"),
-            )
-            .unwrap();
-        workflow
-            .probe_and_plan("machine-1", &AuthMethod::Password, &secrets)
-            .unwrap();
-        let mut changed = plan.clone();
-        changed.release = "changed".to_string();
-        changed.refresh_hash().unwrap();
-        assert!(workflow.review("machine-1", &changed).is_err());
-    }
-
-    #[test]
-    fn legacy_conversion_never_enrolls_or_calls_ssh() {
-        let remotes = vec![RemoteConfig {
-            name: "old-box".to_string(),
-            ssh_target: "alice@example.com".to_string(),
-            source_roots: vec![SourceRoot {
-                kind: "codex".to_string(),
-                path: PathBuf::from("~/.codex"),
-            }],
-        }];
-        let drafts = convert_legacy_remote_drafts(&remotes).unwrap();
-        assert_eq!(drafts.len(), 1);
-        assert!(!drafts[0].enrolled);
-        assert!(drafts[0].conversion_note.contains("explicit"));
-    }
-
-    #[test]
-    fn secret_types_have_redacted_debug_and_json_never_contains_sentinels() {
-        let secrets =
-            EnrollmentSecrets::password("PASSWORD_SENTINEL").with_sudo_password("SUDO_SENTINEL");
-        assert!(!format!("{secrets:?}").contains("SENTINEL"));
-        let draft = EnrollmentDraft::new(
-            "safe",
-            ConnectionSpec::alias("alias").unwrap(),
-            AuthMethod::Password,
-        )
-        .unwrap();
-        let json = serde_json::to_string(&draft).unwrap();
-        assert!(!json.contains("SENTINEL"));
-    }
-}
+#[path = "enrollment_tests.rs"]
+mod tests;

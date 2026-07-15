@@ -13,3 +13,4 @@ pub mod pricing;
 pub mod remote;
 pub mod server;
 pub mod service;
+pub mod ssh;

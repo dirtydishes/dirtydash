@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -9,9 +10,10 @@ use crate::collector;
 use crate::config::Config;
 use crate::db::Database;
 use crate::deployment::{
-    DeploymentPlan, DeploymentRequest, DeploymentStateStore, RemoteExecutor,
-    SignedArtifactManifest, SshRemoteExecutor,
+    DeploymentRequest, DeploymentStateStore, PublisherKey, RemoteExecutor, SignedArtifactManifest,
+    SshRemoteExecutor,
 };
+use crate::enrollment::{HostKeyObservation, HostKeyStatus, KnownHostStore};
 use crate::hub::ListenerTrustMode;
 use crate::importers::{self, ImportOptions};
 use crate::listener::{ListenerPlan, PublicTrustConfig};
@@ -19,6 +21,7 @@ use crate::loop_upgrade;
 use crate::pricing;
 use crate::remote;
 use crate::server;
+use crate::ssh::{canonical_known_hosts_line, host_key_fingerprint, CanonicalSshTarget};
 
 #[derive(Debug, Parser)]
 #[command(name = "dirtydash")]
@@ -218,6 +221,18 @@ pub struct DeployHubArgs {
     /// Ed25519 public key file (raw 32 bytes or hexadecimal).
     #[arg(long)]
     pub public_key: Option<PathBuf>,
+    /// Pinned publisher key ID from the release allowlist.
+    #[arg(long)]
+    pub publisher_key_id: Option<String>,
+    /// Pinned SHA-256 fingerprint for the publisher public key.
+    #[arg(long)]
+    pub publisher_fingerprint: Option<String>,
+    /// Hash printed by the concrete planning probe and explicitly reviewed by the operator.
+    #[arg(long)]
+    pub approved_plan_hash: Option<String>,
+    /// Exact observed managed host-key fingerprint required on first use.
+    #[arg(long)]
+    pub confirm_host_fingerprint: Option<String>,
     /// Optional local SQLite seed, transferred through SSH stdin.
     #[arg(long)]
     pub db_seed: Option<PathBuf>,
@@ -519,13 +534,13 @@ fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) 
     Ok(())
 }
 
-fn deploy_command(paths: &AppPaths, _config: &Config, args: DeployCommand) -> Result<()> {
+fn deploy_command(paths: &AppPaths, config: &Config, args: DeployCommand) -> Result<()> {
     match args.command {
-        DeploySubcommand::Hub(args) => deploy_hub(paths, args),
+        DeploySubcommand::Hub(args) => deploy_hub(paths, config, args),
     }
 }
 
-fn deploy_hub(paths: &AppPaths, args: DeployHubArgs) -> Result<()> {
+fn deploy_hub(paths: &AppPaths, config: &Config, args: DeployHubArgs) -> Result<()> {
     let listener = match args.listener.trim().to_ascii_lowercase().as_str() {
         "tailscale" | "tailscale-serve" => {
             ListenerPlan::tailscale_default(crate::deployment::DEFAULT_HUB_PORT)
@@ -548,86 +563,96 @@ fn deploy_hub(paths: &AppPaths, args: DeployHubArgs) -> Result<()> {
         )?,
         other => anyhow::bail!("unsupported listener mode {other}; use tailscale or public"),
     };
-    let release = args
-        .manifest
-        .as_deref()
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<SignedArtifactManifest>(&bytes).ok())
-        .map(|manifest| manifest.manifest.release)
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-    let plan = DeploymentPlan::skeleton(
-        args.ssh_target.clone(),
-        release,
-        listener.clone(),
-        args.db_seed.is_some(),
-    )?;
-    if !args.apply {
-        if args.json {
-            println!("{}", plan.to_json()?);
-        } else {
-            println!("{}", plan.to_json()?);
-            println!("plan only: pass --apply after reviewing this plan");
-        }
-        return Ok(());
-    }
-    if args.plan {
+    if args.plan && args.apply {
         anyhow::bail!("--plan and --apply are mutually exclusive");
     }
-    let manifest_path = args
-        .manifest
-        .as_deref()
-        .context("--manifest is required for --apply")?;
-    let artifact_dir = args
-        .artifact_dir
-        .as_deref()
-        .context("--artifact-dir is required for --apply")?;
-    let public_key_path = args
-        .public_key
-        .as_deref()
-        .context("--public-key is required for --apply")?;
-    let signed: SignedArtifactManifest = serde_json::from_slice(
-        &fs::read(manifest_path)
-            .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
-    )
-    .context("parsing signed artifact manifest")?;
-    let public_key = read_public_key(public_key_path)?;
-    let verified_manifest = signed.verify(&public_key)?;
-    let known_hosts = paths
-        .config_path
-        .parent()
-        .context("config path has no parent")?
-        .join("deployment-known_hosts");
-    let mut executor = SshRemoteExecutor::new(&args.ssh_target, known_hosts)?;
-    let facts = executor.detect()?;
-    let descriptor = verified_manifest.select(facts.platform)?;
-    let artifact_path = artifact_dir.join(&descriptor.file);
-    let artifact = verified_manifest.verify_artifact(
-        facts.platform,
-        fs::read(&artifact_path)
-            .with_context(|| format!("reading signed artifact {}", artifact_path.display()))?,
-    )?;
-    let seed = args
-        .db_seed
-        .as_deref()
-        .map(|path| {
-            fs::read(path).with_context(|| format!("reading SQLite seed {}", path.display()))
-        })
-        .transpose()?;
-    let request = DeploymentRequest {
-        target: args.ssh_target,
-        release: signed.manifest.release,
-        listener,
-        database_seed: seed,
-        approved_plan_hash: None,
-    };
     let state_path = paths
         .config_path
         .parent()
         .context("config path has no parent")?
         .join("deployment-checkpoint.json");
+
+    // Keep the old no-input inspection command useful as a local shape
+    // preview. It is intentionally not persisted or eligible for apply;
+    // concrete plans require the signed artifact inputs below.
+    if args.plan
+        && (args.manifest.is_none() || args.artifact_dir.is_none() || args.public_key.is_none())
+    {
+        let plan = crate::deployment::DeploymentPlan::skeleton(
+            args.ssh_target,
+            env!("CARGO_PKG_VERSION"),
+            listener,
+            args.db_seed.is_some(),
+        )?;
+        if args.json {
+            println!("{}", plan.to_json()?);
+        } else {
+            println!("{}", plan.to_json()?);
+            println!("shape preview only: provide signed manifest, artifact directory, and pinned publisher to run the concrete probe");
+        }
+        return Ok(());
+    }
+
+    // Planning is a concrete read-only probe.  Artifact evidence is required
+    // so the persisted plan cannot be approved for an unknown release.
+    if args.plan {
+        let known_hosts = managed_known_hosts(paths)?;
+        let canonical = CanonicalSshTarget::resolve(&args.ssh_target)?;
+        confirm_managed_first_use(
+            &canonical,
+            &known_hosts,
+            args.confirm_host_fingerprint.as_deref(),
+        )?;
+        let mut executor =
+            SshRemoteExecutor::from_canonical_target(canonical, known_hosts.clone())?;
+        let platform = executor.detect()?.platform;
+        let inputs = deployment_inputs(&args, config, false, Some(platform))?;
+        let request = DeploymentRequest {
+            target: args.ssh_target,
+            release: inputs.signed.manifest.release.clone(),
+            listener,
+            database_seed: inputs.seed,
+            approved_plan_hash: None,
+        };
+        let mut runner = crate::deployment::DeploymentRunner::new(executor)
+            .with_state_store(DeploymentStateStore::new(state_path));
+        let plan = runner.probe(&request, Some(&inputs.artifact))?;
+        if args.json {
+            println!("{}", plan.to_json()?);
+        } else {
+            println!("{}", plan.to_json()?);
+            println!(
+                "review plan hash {} and pass it with --approved-plan-hash --apply",
+                plan.plan_hash
+            );
+        }
+        return Ok(());
+    }
+
+    if !args.apply {
+        anyhow::bail!("pass --plan for a concrete probe or --apply with an approved plan hash");
+    }
+
+    let known_hosts = managed_known_hosts(paths)?;
+    let canonical = CanonicalSshTarget::resolve(&args.ssh_target)?;
+    confirm_managed_first_use(
+        &canonical,
+        &known_hosts,
+        args.confirm_host_fingerprint.as_deref(),
+    )?;
+    let mut executor = SshRemoteExecutor::from_canonical_target(canonical, known_hosts.clone())?;
+    let platform = executor.detect()?.platform;
+    let inputs = deployment_inputs(&args, config, true, Some(platform))?;
+    let request = DeploymentRequest {
+        target: args.ssh_target,
+        release: inputs.signed.manifest.release.clone(),
+        listener,
+        database_seed: inputs.seed,
+        approved_plan_hash: args.approved_plan_hash,
+    };
     let mut runner = crate::deployment::DeploymentRunner::new(executor)
         .with_state_store(DeploymentStateStore::new(state_path));
-    let receipt = runner.apply(&request, &artifact)?;
+    let receipt = runner.apply(&request, &inputs.artifact)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&receipt)?);
     } else {
@@ -637,6 +662,146 @@ fn deploy_hub(paths: &AppPaths, args: DeployHubArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+struct DeploymentInputs {
+    signed: SignedArtifactManifest,
+    artifact: crate::deployment::VerifiedArtifact,
+    seed: Option<Vec<u8>>,
+}
+
+fn deployment_inputs(
+    args: &DeployHubArgs,
+    config: &Config,
+    applying: bool,
+    platform: Option<crate::deployment::TargetPlatform>,
+) -> Result<DeploymentInputs> {
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("--manifest is required for deployment planning/apply")?;
+    let artifact_dir = args
+        .artifact_dir
+        .as_deref()
+        .context("--artifact-dir is required for deployment planning/apply")?;
+    let public_key_path = args
+        .public_key
+        .as_deref()
+        .context("--public-key is required for deployment planning/apply")?;
+    let key_id = args
+        .publisher_key_id
+        .as_deref()
+        .or(config.hub.allowed_publisher_key_id.as_deref())
+        .context("--publisher-key-id or configured publisher allowlist is required")?;
+    let fingerprint = args
+        .publisher_fingerprint
+        .as_deref()
+        .or(config.hub.allowed_publisher_fingerprint.as_deref())
+        .context("--publisher-fingerprint or configured publisher allowlist is required")?;
+    if let Some(configured) = config.hub.allowed_publisher_key_id.as_deref() {
+        if args
+            .publisher_key_id
+            .as_deref()
+            .is_some_and(|value| value != configured)
+        {
+            anyhow::bail!("--publisher-key-id does not match the configured publisher allowlist");
+        }
+    }
+    if let Some(configured) = config.hub.allowed_publisher_fingerprint.as_deref() {
+        if args
+            .publisher_fingerprint
+            .as_deref()
+            .is_some_and(|value| !value.eq_ignore_ascii_case(configured))
+        {
+            anyhow::bail!(
+                "--publisher-fingerprint does not match the configured publisher allowlist"
+            );
+        }
+    }
+    let signed: SignedArtifactManifest = serde_json::from_slice(
+        &fs::read(manifest_path)
+            .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
+    )
+    .context("parsing signed artifact manifest")?;
+    let public_key = read_public_key(public_key_path)?;
+    let publisher = PublisherKey::new(key_id, fingerprint, &public_key)?;
+    let verified_manifest = signed.verify_with_publisher(&publisher)?;
+    // Selection is completed after the remote probe by the runner.  Local
+    // artifact verification still uses every declared digest/size invariant.
+    let descriptor = match platform {
+        Some(platform) => verified_manifest.select(platform)?,
+        None if verified_manifest.manifest().artifacts.len() == 1 => {
+            &verified_manifest.manifest().artifacts[0]
+        }
+        None => anyhow::bail!("a concrete target platform is required to select an artifact"),
+    };
+    let artifact_path = artifact_dir.join(&descriptor.file);
+    let bytes = fs::read(&artifact_path)
+        .with_context(|| format!("reading signed artifact {}", artifact_path.display()))?;
+    let platform = descriptor.platform;
+    let artifact = verified_manifest.verify_artifact(platform, bytes)?;
+    let seed = args
+        .db_seed
+        .as_deref()
+        .map(|path| {
+            fs::read(path).with_context(|| format!("reading SQLite seed {}", path.display()))
+        })
+        .transpose()?;
+    if applying && args.approved_plan_hash.is_none() {
+        anyhow::bail!("--approved-plan-hash is required for --apply");
+    }
+    Ok(DeploymentInputs {
+        signed,
+        artifact,
+        seed,
+    })
+}
+
+fn managed_known_hosts(paths: &AppPaths) -> Result<PathBuf> {
+    Ok(paths
+        .config_path
+        .parent()
+        .context("config path has no parent")?
+        .join("deployment-known_hosts"))
+}
+
+fn confirm_managed_first_use(
+    target: &CanonicalSshTarget,
+    known_hosts_path: &Path,
+    confirmation: Option<&str>,
+) -> Result<()> {
+    let output = ProcessCommand::new("ssh-keyscan")
+        .args(target.keyscan_args())
+        .output()
+        .context("observing remote SSH host key")?;
+    if !output.status.success() || output.stdout.is_empty() {
+        anyhow::bail!("SSH host-key observation failed");
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let known_hosts_line = canonical_known_hosts_line(target, &line)?;
+    let observation =
+        HostKeyObservation::new(host_key_fingerprint(&known_hosts_line)?, known_hosts_line)?;
+    let store = KnownHostStore::new(known_hosts_path);
+    match store.status(&target.host_key_name(), &observation.fingerprint)? {
+        HostKeyStatus::Matching => Ok(()),
+        HostKeyStatus::Changed => anyhow::bail!(
+            "managed host key changed; refusing deployment without destructive trust reset"
+        ),
+        HostKeyStatus::Unknown => {
+            if confirmation != Some(observation.fingerprint.as_str()) {
+                anyhow::bail!(
+                    "first use requires --confirm-host-fingerprint {}",
+                    observation.fingerprint
+                );
+            }
+            store.confirm_unknown(&target.host_key_name(), &observation)
+        }
+    }
 }
 
 fn read_public_key(path: &std::path::Path) -> Result<Vec<u8>> {
