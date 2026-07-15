@@ -170,6 +170,31 @@ fn collector_reconcile_and_diagnostics_use_separate_state_database() {
 }
 
 #[test]
+fn deploy_hub_plan_is_inspectable_and_secret_free() {
+    let dir = tempdir().unwrap();
+    let output = dirtydash_cmd()
+        .args([
+            "--db",
+            dir.path().join("dirtydash.sqlite3").to_str().unwrap(),
+            "--config",
+            dir.path().join("config.toml").to_str().unwrap(),
+            "deploy",
+            "hub",
+            "ssh-alias",
+            "--plan",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("verify-signed-artifact"));
+    assert!(text.contains("consent-required"));
+    assert!(!text.contains("PASSWORD_SENTINEL"));
+    assert!(!text.contains("SUDO_SENTINEL"));
+}
+
+#[test]
 fn serve_starts_and_prints_dashboard_url() {
     let dir = tempdir().unwrap();
     let db = dir.path().join("dirtydash.sqlite3");

@@ -1,5 +1,26 @@
 # dirtydash deployment
 
+## Signed Hub deployment (fleet)
+
+The fleet deployment path is separate from the historical Docker/Nginx helper below. Inspect a non-mutating plan first:
+
+```bash
+dirtydash deploy hub <ssh-target> --plan --json
+```
+
+Apply only a verified release with an externally managed Ed25519 public key:
+
+```bash
+dirtydash deploy hub <ssh-target> --apply \
+  --manifest release/manifest.json \
+  --artifact-dir release/artifacts \
+  --public-key release/signing-public-key
+```
+
+Tailscale Serve is the default private listener. Use `--listener public` only with the explicitly configured fallback administrator/trusted-proxy policy. The command never accepts passwords or private keys as arguments or environment variables; SSH aliases and the host's configured key agent handle transport authentication. Production signing keys and live host/Tailscale consent are external release evidence.
+
+The installer uses versioned user-owned paths, non-root systemd user or launchd services, atomic activation, health verification, and rollback/cleanup. An optional `--db-seed PATH` is transferred through SSH stdin and is not serialized into the plan.
+
 dirtydash is deployed on `di` behind Nginx Proxy Manager at:
 
 ```text

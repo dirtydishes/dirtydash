@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -7,7 +8,13 @@ use crate::app_paths::AppPaths;
 use crate::collector;
 use crate::config::Config;
 use crate::db::Database;
+use crate::deployment::{
+    DeploymentPlan, DeploymentRequest, DeploymentStateStore, RemoteExecutor,
+    SignedArtifactManifest, SshRemoteExecutor,
+};
+use crate::hub::ListenerTrustMode;
 use crate::importers::{self, ImportOptions};
+use crate::listener::{ListenerPlan, PublicTrustConfig};
 use crate::loop_upgrade;
 use crate::pricing;
 use crate::remote;
@@ -45,6 +52,8 @@ pub enum Command {
     Collector(CollectorCommand),
     /// Configure pull-based SSH remotes.
     Remote(RemoteCommand),
+    /// Deploy a signed Hub and its local Collector over SSH.
+    Deploy(DeployCommand),
     /// Inspect bundled pricing and manage manual overrides.
     Pricing(PricingCommand),
     /// Inspect or maintain dirtyloops loop artifacts.
@@ -76,6 +85,14 @@ pub struct ServeArgs {
 
     #[arg(long)]
     pub open: bool,
+
+    /// Run the authenticated Hub listener rather than loopback local serve.
+    #[arg(long)]
+    pub hub: bool,
+
+    /// Hub listener trust mode. Tailscale is private-by-default.
+    #[arg(long, default_value = "tailscale")]
+    pub listener: String,
 }
 
 #[derive(Debug, Args)]
@@ -166,6 +183,50 @@ pub struct RemoteListArgs {
 #[derive(Debug, Args)]
 pub struct RemoteRemoveArgs {
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DeployCommand {
+    #[command(subcommand)]
+    pub command: DeploySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeploySubcommand {
+    Hub(DeployHubArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DeployHubArgs {
+    /// SSH alias or user@host target. It is passed as one fixed SSH argument.
+    pub ssh_target: String,
+    /// Print the typed plan and do not probe or mutate the remote.
+    #[arg(long)]
+    pub plan: bool,
+    /// Apply only after local signed-artifact verification and remote probing.
+    #[arg(long)]
+    pub apply: bool,
+    /// Render the plan/receipt as machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Signed manifest JSON. Required for --apply.
+    #[arg(long)]
+    pub manifest: Option<PathBuf>,
+    /// Directory containing the manifest-selected artifact files.
+    #[arg(long)]
+    pub artifact_dir: Option<PathBuf>,
+    /// Ed25519 public key file (raw 32 bytes or hexadecimal).
+    #[arg(long)]
+    pub public_key: Option<PathBuf>,
+    /// Optional local SQLite seed, transferred through SSH stdin.
+    #[arg(long)]
+    pub db_seed: Option<PathBuf>,
+    /// Listener mode. Tailscale Serve is the secure default.
+    #[arg(long, default_value = "tailscale")]
+    pub listener: String,
+    /// Public reverse-proxy CIDR(s); public mode still uses fallback admin auth.
+    #[arg(long)]
+    pub trusted_proxy_cidr: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -264,10 +325,11 @@ pub fn run_with_cli(cli: Cli) -> Result<()> {
     match cli.command {
         Some(Command::Scan(args)) => scan(&config, args),
         Some(Command::Import(args)) => import(&paths, &config, args),
-        Some(Command::Serve(args)) => serve(&paths, args),
+        Some(Command::Serve(args)) => serve(&paths, args, &config),
         Some(Command::Doctor(args)) => doctor(&paths, &config, args),
         Some(Command::Collector(args)) => collector_command(&paths, &config, args),
         Some(Command::Remote(args)) => remote::run(&paths, &mut config, args),
+        Some(Command::Deploy(args)) => deploy_command(&paths, &config, args),
         Some(Command::Pricing(args)) => pricing_command(&paths, args),
         Some(Command::Loop(args)) => loop_command(args),
         None => first_run(paths, config),
@@ -325,10 +387,35 @@ fn import(paths: &AppPaths, config: &Config, args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-fn serve(paths: &AppPaths, args: ServeArgs) -> Result<()> {
+fn serve(paths: &AppPaths, args: ServeArgs, config: &Config) -> Result<()> {
     let db = Database::open(&paths.db_path)?;
     db.migrate()?;
     pricing::seed_bundled_pricing(&db)?;
+    if args.hub {
+        let trust_mode = match args.listener.trim().to_ascii_lowercase().as_str() {
+            "tailscale" | "tailscale-serve" => ListenerTrustMode::PrivateTailscale,
+            "public" | "public-https"
+                if config
+                    .hub
+                    .listener
+                    .public
+                    .as_ref()
+                    .and_then(|public| public.trusted_proxy.as_ref())
+                    .is_some() =>
+            {
+                ListenerTrustMode::TrustedProxy
+            }
+            "public" | "public-https" => ListenerTrustMode::Public,
+            other => anyhow::bail!("unsupported Hub listener mode {other}"),
+        };
+        return crate::hub::serve(
+            paths.db_path.clone(),
+            args.host,
+            args.port,
+            trust_mode,
+            &config.hub,
+        );
+    }
     server::serve(paths.db_path.clone(), args)
 }
 
@@ -432,6 +519,141 @@ fn collector_command(paths: &AppPaths, config: &Config, args: CollectorCommand) 
     Ok(())
 }
 
+fn deploy_command(paths: &AppPaths, _config: &Config, args: DeployCommand) -> Result<()> {
+    match args.command {
+        DeploySubcommand::Hub(args) => deploy_hub(paths, args),
+    }
+}
+
+fn deploy_hub(paths: &AppPaths, args: DeployHubArgs) -> Result<()> {
+    let listener = match args.listener.trim().to_ascii_lowercase().as_str() {
+        "tailscale" | "tailscale-serve" => {
+            ListenerPlan::tailscale_default(crate::deployment::DEFAULT_HUB_PORT)
+        }
+        "public" | "public-https" => ListenerPlan::public_https(
+            crate::deployment::DEFAULT_HUB_PORT,
+            PublicTrustConfig {
+                trusted_proxy: if args.trusted_proxy_cidr.is_empty() {
+                    None
+                } else {
+                    Some(crate::listener::PublicTrustedProxy {
+                        identity_header: "x-dirtydash-identity".to_string(),
+                        provenance_header: "x-dirtydash-proxy-provenance".to_string(),
+                        provenance_value: "proxy-verified".to_string(),
+                        source_cidrs: args.trusted_proxy_cidr.clone(),
+                    })
+                },
+                ..PublicTrustConfig::default()
+            },
+        )?,
+        other => anyhow::bail!("unsupported listener mode {other}; use tailscale or public"),
+    };
+    let release = args
+        .manifest
+        .as_deref()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<SignedArtifactManifest>(&bytes).ok())
+        .map(|manifest| manifest.manifest.release)
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let plan = DeploymentPlan::skeleton(
+        args.ssh_target.clone(),
+        release,
+        listener.clone(),
+        args.db_seed.is_some(),
+    )?;
+    if !args.apply {
+        if args.json {
+            println!("{}", plan.to_json()?);
+        } else {
+            println!("{}", plan.to_json()?);
+            println!("plan only: pass --apply after reviewing this plan");
+        }
+        return Ok(());
+    }
+    if args.plan {
+        anyhow::bail!("--plan and --apply are mutually exclusive");
+    }
+    let manifest_path = args
+        .manifest
+        .as_deref()
+        .context("--manifest is required for --apply")?;
+    let artifact_dir = args
+        .artifact_dir
+        .as_deref()
+        .context("--artifact-dir is required for --apply")?;
+    let public_key_path = args
+        .public_key
+        .as_deref()
+        .context("--public-key is required for --apply")?;
+    let signed: SignedArtifactManifest = serde_json::from_slice(
+        &fs::read(manifest_path)
+            .with_context(|| format!("reading signed manifest {}", manifest_path.display()))?,
+    )
+    .context("parsing signed artifact manifest")?;
+    let public_key = read_public_key(public_key_path)?;
+    let verified_manifest = signed.verify(&public_key)?;
+    let known_hosts = paths
+        .config_path
+        .parent()
+        .context("config path has no parent")?
+        .join("deployment-known_hosts");
+    let mut executor = SshRemoteExecutor::new(&args.ssh_target, known_hosts)?;
+    let facts = executor.detect()?;
+    let descriptor = verified_manifest.select(facts.platform)?;
+    let artifact_path = artifact_dir.join(&descriptor.file);
+    let artifact = verified_manifest.verify_artifact(
+        facts.platform,
+        fs::read(&artifact_path)
+            .with_context(|| format!("reading signed artifact {}", artifact_path.display()))?,
+    )?;
+    let seed = args
+        .db_seed
+        .as_deref()
+        .map(|path| {
+            fs::read(path).with_context(|| format!("reading SQLite seed {}", path.display()))
+        })
+        .transpose()?;
+    let request = DeploymentRequest {
+        target: args.ssh_target,
+        release: signed.manifest.release,
+        listener,
+        database_seed: seed,
+        approved_plan_hash: None,
+    };
+    let state_path = paths
+        .config_path
+        .parent()
+        .context("config path has no parent")?
+        .join("deployment-checkpoint.json");
+    let mut runner = crate::deployment::DeploymentRunner::new(executor)
+        .with_state_store(DeploymentStateStore::new(state_path));
+    let receipt = runner.apply(&request, &artifact)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&receipt)?);
+    } else {
+        println!("deployment {}: {}", receipt.release, receipt.status);
+        if receipt.tailscale_state == crate::listener::TailscaleServeState::ConsentRequired {
+            println!("Tailscale Serve requires explicit consent; rerun --apply after approving it");
+        }
+    }
+    Ok(())
+}
+
+fn read_public_key(path: &std::path::Path) -> Result<Vec<u8>> {
+    let bytes =
+        fs::read(path).with_context(|| format!("reading Ed25519 public key {}", path.display()))?;
+    if bytes.len() == 32 {
+        return Ok(bytes);
+    }
+    let text =
+        String::from_utf8(bytes).context("public key is neither raw bytes nor hexadecimal")?;
+    let text = text.trim();
+    if text.len() != 64 || !text.chars().all(|character| character.is_ascii_hexdigit()) {
+        anyhow::bail!("public key must contain exactly 32 raw bytes or 64 hexadecimal characters");
+    }
+    Ok(hex::decode(text)?)
+}
+
 fn pricing_command(paths: &AppPaths, args: PricingCommand) -> Result<()> {
     let db = Database::open(&paths.db_path)?;
     db.migrate()?;
@@ -519,6 +741,8 @@ fn first_run(paths: AppPaths, config: Config) -> Result<()> {
         host: "127.0.0.1".to_string(),
         port: 4599,
         open: false,
+        hub: false,
+        listener: "tailscale".to_string(),
     };
     server::serve(paths.db_path, args)
 }

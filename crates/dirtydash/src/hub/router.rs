@@ -31,6 +31,7 @@ pub fn build_router_with_config_and_connect_info(
 
 pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/api/v1/admin/bootstrap", post(admin_bootstrap))
         .route("/api/v1/admin/session", get(admin_session))
         .route("/api/v1/admin/session/login", post(admin_login))
@@ -262,6 +263,10 @@ async fn collector_ingest_batch(
     let auth = collector_auth(&state.repo, &headers)?;
     let response = state.repo.ingest_batch(&auth, request)?;
     Ok(Json(response))
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "ok", "service": "dirtydash-hub"}))
 }
 
 fn bootstrap_allowed(

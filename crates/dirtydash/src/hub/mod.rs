@@ -1,5 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use tokio::net::TcpListener;
 
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -20,6 +24,40 @@ mod tests;
 pub use router::{
     build_router, build_router_with_config, build_router_with_config_and_connect_info,
 };
+
+/// Run the authenticated Hub listener on a real socket.  The connect-info
+/// make-service is mandatory here: trusted-proxy identity is accepted only
+/// after the transport-derived peer address passes its configured CIDR policy.
+pub fn serve(
+    db_path: PathBuf,
+    host: String,
+    port: u16,
+    trust_mode: ListenerTrustMode,
+    hub_config: &crate::config::HubConfig,
+) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("starting Hub Tokio runtime")?;
+    runtime.block_on(async move {
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let repository = HubRepository::new(db);
+        let router_config = HubRouterConfig::from_config(trust_mode, hub_config);
+        let service = build_router_with_config_and_connect_info(repository, router_config);
+        let address: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .with_context(|| format!("parsing Hub listen address {host}:{port}"))?;
+        let listener = TcpListener::bind(address)
+            .await
+            .with_context(|| format!("binding Hub listener to {address}"))?;
+        println!("dirtydash Hub listener: http://{}", listener.local_addr()?);
+        axum::serve(listener, service)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .context("running Hub listener")?;
+        Ok(())
+    })
+}
 
 pub(crate) use errors::{
     hash_password, header_value, normalize_utc_timestamp, now_utc, parse_utc_timestamp,
@@ -261,14 +299,35 @@ impl HubRouterConfig {
                 )
             })
             .collect();
-        router_config.trusted_proxy = config.trusted_proxy.as_ref().map(|proxy| {
-            TrustedProxyConfig::new(
-                proxy.identity_header.clone(),
-                proxy.provenance_header.clone(),
-                proxy.provenance_value.clone(),
-            )
-            .with_source_cidrs(proxy.source_cidrs.clone())
-        });
+        router_config.trusted_proxy = config
+            .trusted_proxy
+            .as_ref()
+            .map(|proxy| {
+                TrustedProxyConfig::new(
+                    proxy.identity_header.clone(),
+                    proxy.provenance_header.clone(),
+                    proxy.provenance_value.clone(),
+                )
+                .with_source_cidrs(proxy.source_cidrs.clone())
+            })
+            .or_else(|| {
+                config
+                    .listener
+                    .public
+                    .as_ref()
+                    .and_then(|public| public.trusted_proxy.as_ref())
+                    .map(|proxy| {
+                        TrustedProxyConfig::new(
+                            proxy.identity_header.clone(),
+                            proxy.provenance_header.clone(),
+                            proxy.provenance_value.clone(),
+                        )
+                        .with_source_cidrs(proxy.source_cidrs.clone())
+                    })
+            });
+        if router_config.trusted_proxy.is_some() && trust_mode == ListenerTrustMode::Public {
+            router_config.trust_mode = ListenerTrustMode::TrustedProxy;
+        }
         if let Some(setup_token) = &config.bootstrap_setup_token {
             router_config = router_config.with_bootstrap_setup_token(setup_token.clone());
         }

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::listener::ListenerPlan;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_version")]
@@ -29,6 +31,9 @@ pub struct HubConfig {
     pub trusted_proxy: Option<TrustedProxyConfig>,
     #[serde(default)]
     pub cookie_transport: CookieTransportConfig,
+    /// Non-secret Hub listener policy. Tailscale Serve is the default.
+    #[serde(default)]
+    pub listener: ListenerPlan,
     /// One-time setup secret for bootstrap when the local setup route is not available.
     #[serde(default)]
     pub bootstrap_setup_token: Option<String>,
