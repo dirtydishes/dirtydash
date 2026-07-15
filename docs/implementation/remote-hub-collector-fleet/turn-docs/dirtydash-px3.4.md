@@ -99,6 +99,16 @@ The final narrow PR #11 service-state repair keeps the phase scope bounded:
 
 The production enrollment rollback assertion now accepts either successful cleanup of the snapshot after absent-unit repair or retained snapshot evidence when another rollback step is unavailable. No Beads state was mutated, no merge was performed, and the coordinator still owns integration.
 
+## Final Systemd-State Repair Pass
+
+The final PR #11 follow-up closes the remaining systemd state ambiguity without widening Phase 4:
+
+1. Systemd snapshot queries now fail closed on manager, transport, permission, missing-property, and unsupported-state errors. Only an exact `LoadState=not-found` is recorded as unloaded; every other non-empty LoadState is recorded as loaded.
+2. Rollback re-queries each Hub and Collector unit and asserts the captured loaded/unloaded LoadState category plus active/inactive ActiveState category. The same explicit query semantics protect absent-unit quiesce and rollback stop handling, so real stop failures remain fatal.
+3. Stateful production `SshRemoteExecutor` coverage runs fresh service-definition installs followed by restart from initially absent units, and performs a loaded-inactive Hub/Collector rollback while asserting the final loaded/inactive state. Additional snapshot tests cover permission failure and non-`not-found` LoadState handling.
+
+No Beads state was mutated, no merge was performed, and the coordinator still owns integration.
+
 ## Review
 
 Pending independent fresh review of this repair pass. Live signing keys, real SSH hosts/managers, public certificates, and tailnet consent remain unavailable external gates; no evidence is fabricated.
@@ -114,7 +124,7 @@ Evidence:
 - `cargo fmt --all`: passed.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - Thermo-nuclear repair validation covers persisted reviewed plans, durable publisher anchoring/replacement rejection, canonical SSH/host-key trust, controlled live-PTY password/sudo success/failure/redaction, secret snapshots/permissions, no-sqlite3 byte-level valid/malformed/WAL paths, actual listener/service/current-pointer rollback, old Hub/Collector rollback health, manual-recovery status, listener CIDRs/peer trust, execution restart, redaction, absent-systemd quiesce, and loaded-inactive launchd rollback.
-- `cargo test --all-targets --all-features`: passed (105 unit tests, 9 CLI tests, 14 Collector integration tests).
+- `cargo test --all-targets --all-features`: passed (109 unit tests, 9 CLI tests, 14 Collector integration tests).
 - `npm --prefix dashboard run build`: passed with Vite production output.
 - Local Hub smoke: `target/debug/dirtydash serve --hub --listener public --host 127.0.0.1 --port 4598` started a real connect-info router and `/healthz` returned `{"service":"dirtydash-hub","status":"ok"}`.
 - `git diff --check` and allowed-path/protected-artifact checks: passed; protected conversion/migration artifacts are byte-identical to `HEAD`.
@@ -127,6 +137,7 @@ Evidence:
 - Final release-blocker repair commit `55c7ec3` (`fix: close phase 4 release blockers`).
 - Final review repair commit `7a10159` (`fix: close final phase 4 review blockers`).
 - Final service-state repair commit `e355e08` (`fix: repair phase 4 service state rollback`).
+- Final systemd-state repair commit `a04ed7c` (`fix: make systemd state rollback fail closed`).
 - Phase PR: [#11](https://github.com/dirtydishes/dirtydash/pull/11), head `lavender/remote-hub-collector-fleet-4-deployment`, base `lavender/remote-hub-collector-fleet-implementation`.
 - Branch pushed to `origin`; merge remains coordinator-owned.
 
