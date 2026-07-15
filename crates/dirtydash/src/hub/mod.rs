@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -455,7 +456,7 @@ struct HubState {
 pub struct HubRepository {
     db: Database,
     write_guard: Arc<Mutex<()>>,
-    command_notify: Arc<Notify>,
+    command_notify: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     #[cfg(test)]
     final_insert_failure: Arc<Mutex<bool>>,
 }

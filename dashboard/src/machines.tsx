@@ -808,7 +808,7 @@ function EnrollmentTab({ csrf, desktopAdmin, drafts, onChange }: { csrf: string;
   }
   async function step(path: string, body: unknown) {
     if (!selected) return;
-    const carriesSecret = path === "trust" || path === "cleanup" || path === "execute";
+    const carriesSecret = ["trust", "probe", "cleanup", "execute"].includes(path);
     // Secret-bearing request objects must not survive a failed fetch in a
     // retry closure. Clear the controlled fields before the request; a retry
     // therefore requires fresh operator input instead of replaying credentials.

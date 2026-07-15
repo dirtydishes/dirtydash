@@ -14,6 +14,7 @@ assert.match(source, /role="alert"/);
 assert.match(source, /role="dialog" aria-modal="true"/);
 assert.match(source, /createPortal\(/);
 assert.match(source, /carriesSecret/);
+assert.match(source, /\["trust", "probe", "cleanup", "execute"\]\.includes\(path\)/);
 assert.match(source, /step\(path, carriesSecret \? \{\} : body\)/);
 assert.match(source, /aria-expanded=\{openDialog === "archive"\}/);
 assert.match(source, /ResizeObserver/);

@@ -3,7 +3,7 @@ import axe from "axe-core";
 import { fireEvent, render, screen, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React, { useState } from "react";
-import { DestructiveModal } from "../src/machines";
+import { DestructiveModal, MachinesWorkspace } from "../src/machines";
 
 function ModalHarness() {
   const [open, setOpen] = useState(true);
@@ -22,7 +22,68 @@ function ModalHarness() {
   );
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+const hostTrustDraft = {
+  id: "enroll-probe-secret",
+  machine_id: "machine-probe-secret",
+  display_name: "Probe Secret Machine",
+  state: "host-trust-auth",
+  blocker: "none",
+  execution_substate: "not-started",
+  cleanup_complete: true,
+  updated_at: "2026-07-15T00:00:00Z"
+};
+
+describe("enrollment secret retry handling", () => {
+  it("clears probe credentials and retries without captured plaintext", async () => {
+    const user = userEvent.setup();
+    const probeBodies: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      if (url.endsWith("/api/v1/admin/session/csrf")) return jsonResponse({ csrf_token: "csrf-token" });
+      if (url.endsWith("/api/v1/admin/machines")) return jsonResponse([]);
+      if (url.endsWith("/api/v1/admin/updates")) return jsonResponse([]);
+      if (url.endsWith("/api/v1/admin/enrollment")) return jsonResponse([hostTrustDraft]);
+      if (url.endsWith("/api/v1/admin/enrollment/enroll-probe-secret/probe")) {
+        probeBodies.push(String(init?.body ?? ""));
+        return jsonResponse({ message: "probe failed" }, 500);
+      }
+      return jsonResponse({ message: `unexpected ${url}` }, 404);
+    }));
+
+    render(<MachinesWorkspace activeTab="enroll" />);
+    const probe = await screen.findByRole("button", { name: /probe \+ plan/i });
+    const sshPassword = screen.getByLabelText(/SSH password/i) as HTMLInputElement;
+    const sudoPassword = screen.getByLabelText(/sudo password/i) as HTMLInputElement;
+
+    await user.type(sshPassword, "ssh-secret-sentinel");
+    await user.type(sudoPassword, "sudo-secret-sentinel");
+    await user.click(probe);
+
+    await waitFor(() => expect(probeBodies).toHaveLength(1));
+    expect(sshPassword.value).toBe("");
+    expect(sudoPassword.value).toBe("");
+    expect(probeBodies[0]).toContain("ssh-secret-sentinel");
+    expect(probeBodies[0]).toContain("sudo-secret-sentinel");
+
+    await user.click(await screen.findByRole("button", { name: "retry" }));
+    await waitFor(() => expect(probeBodies).toHaveLength(2));
+    expect(probeBodies[1]).not.toContain("ssh-secret-sentinel");
+    expect(probeBodies[1]).not.toContain("sudo-secret-sentinel");
+    expect(JSON.parse(probeBodies[1])).toEqual({});
+  });
+});
 
 describe("destructive confirmation dialog", () => {
   it("is modal, traps focus, makes the background inert, and restores the trigger", async () => {

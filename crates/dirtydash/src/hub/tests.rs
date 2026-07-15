@@ -1,9 +1,16 @@
 use super::*;
+use crate::app_paths::AppPaths;
 use crate::collector::{
     Collector, CollectorHttpTransport, CollectorOptions, CollectorTransport, CommandOutcome,
     RetryClass, TransportError,
 };
-use crate::config::SourceRoot;
+use crate::config::{Config, SourceRoot};
+use crate::deployment::{
+    ArtifactArch, ArtifactDescriptor, ArtifactManifest, ArtifactOs, DeploymentPaths,
+    DeploymentRequest, DeploymentRunner, DeploymentStateStore, PublisherTrustPolicy, RemoteAction,
+    RemoteExecutor, RemoteFacts, RemoteResult, SignedArtifactManifest, TargetPlatform,
+    VerifiedArtifact, MANIFEST_SCHEMA_VERSION,
+};
 use anyhow::Context;
 use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::ConnectInfo;
@@ -11,10 +18,15 @@ use axum::http::header;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use axum::{Extension, Router};
+use ed25519_dalek::{Signer, SigningKey};
 use rusqlite::params;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 use tower::util::ServiceExt;
@@ -49,6 +61,121 @@ fn test_repo() -> HubRepository {
     let db = Database::open(root.join("dirtydash.sqlite3")).unwrap();
     db.migrate().unwrap();
     HubRepository::new(db)
+}
+
+fn signed_collector_fixture(
+    release: &str,
+    platform: TargetPlatform,
+) -> (PublisherTrustPolicy, VerifiedArtifact) {
+    let key = SigningKey::from_bytes(&[17_u8; 32]);
+    let bytes = b"dirtydash-hosted-collector-artifact".to_vec();
+    let mut signed = SignedArtifactManifest {
+        key_id: PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        manifest: ArtifactManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            release: release.to_string(),
+            artifacts: vec![ArtifactDescriptor {
+                platform,
+                file: "dirtydash-linux-x86_64".to_string(),
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                size: bytes.len() as u64,
+            }],
+        },
+        signature: String::new(),
+    };
+    let signing_bytes = signed.signing_bytes().unwrap();
+    signed.signature = hex::encode(key.sign(&signing_bytes).to_bytes());
+    let policy = PublisherTrustPolicy::new(
+        signed.key_id.clone(),
+        PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
+        &key.verifying_key().to_bytes(),
+    )
+    .unwrap();
+    let artifact = policy
+        .verify(&signed)
+        .unwrap()
+        .verify_artifact(platform, bytes)
+        .unwrap();
+    (policy, artifact)
+}
+
+fn collector_remote_facts(home: &Path) -> RemoteFacts {
+    RemoteFacts {
+        platform: TargetPlatform {
+            os: ArtifactOs::Linux,
+            arch: ArtifactArch::X86_64,
+        },
+        user: "deploy".to_string(),
+        uid: 1000,
+        home: home.display().to_string(),
+        current_release: None,
+    }
+}
+
+struct InstallingExecutor {
+    facts: RemoteFacts,
+    actions: Vec<RemoteAction>,
+    uploads: Vec<(String, u32)>,
+}
+
+impl InstallingExecutor {
+    fn new(facts: RemoteFacts) -> Self {
+        Self {
+            facts,
+            actions: Vec::new(),
+            uploads: Vec::new(),
+        }
+    }
+
+    fn write_remote_file(destination: &str, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+        let path = Path::new(destination);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, bytes)?;
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+}
+
+impl RemoteExecutor for InstallingExecutor {
+    fn detect(&mut self) -> anyhow::Result<RemoteFacts> {
+        Ok(self.facts.clone())
+    }
+
+    fn run(&mut self, action: RemoteAction) -> anyhow::Result<RemoteResult> {
+        if let RemoteAction::InstallRuntimeConfig {
+            config_path,
+            config,
+        } = &action
+        {
+            if config.contains("password") || config.contains("token") || config.contains("secret")
+            {
+                anyhow::bail!("runtime config contains a secret-bearing field");
+            }
+            Self::write_remote_file(config_path, config.as_bytes(), 0o600)?;
+        }
+        self.actions.push(action);
+        Ok(RemoteResult::success("ok"))
+    }
+
+    fn upload(
+        &mut self,
+        destination: &str,
+        bytes: &[u8],
+        mode: u32,
+    ) -> anyhow::Result<RemoteResult> {
+        Self::write_remote_file(destination, bytes, mode)?;
+        self.uploads.push((destination.to_string(), mode));
+        Ok(RemoteResult::success("uploaded"))
+    }
+
+    fn upload_secret(&mut self, destination: &str, bytes: &[u8]) -> anyhow::Result<RemoteResult> {
+        Self::write_remote_file(destination, bytes, 0o600)?;
+        self.uploads.push((destination.to_string(), 0o600));
+        Ok(RemoteResult::success("secret uploaded"))
+    }
 }
 
 async fn json_response(response: Response) -> Value {
@@ -104,6 +231,16 @@ async fn rotate_credential(
     cookie: &str,
     csrf: &str,
 ) -> RotateCollectorCredentialResponse {
+    rotate_credential_for_machine(app, cookie, csrf, "machine-a", "Machine A").await
+}
+
+async fn rotate_credential_for_machine(
+    app: &Router,
+    cookie: &str,
+    csrf: &str,
+    machine_id: &str,
+    display_name: &str,
+) -> RotateCollectorCredentialResponse {
     let response = app
         .clone()
         .oneshot(
@@ -115,8 +252,8 @@ async fn rotate_credential(
                 .header(OWNER_CSRF_HEADER, csrf)
                 .body(Body::from(
                     json!({
-                        "machine_id": "machine-a",
-                        "display_name": "Machine A",
+                        "machine_id": machine_id,
+                        "display_name": display_name,
                         "credential_label": "default"
                     })
                     .to_string(),
@@ -887,23 +1024,16 @@ fn hosted_enrollment_canonical_url_and_pending_credentials_are_safe_to_retry() {
 }
 
 #[tokio::test]
-async fn enrolled_collector_http_path_ingests_usage_and_polls_commands() {
+async fn enrolled_collector_uses_installed_config_secret_for_http_ingest_and_commands() {
     let repo = test_repo();
+    let machine_id = "machine-http-installed".to_string();
+    let enrollment_id = "enroll-http".to_string();
     let issued = repo
-        .prepare_enrollment_credential(
-            "enroll-http",
-            "machine-http-installed",
-            "HTTP Installed Collector",
-        )
+        .prepare_enrollment_credential(&enrollment_id, &machine_id, "HTTP Installed Collector")
         .unwrap()
         .unwrap();
-    repo.complete_enrollment_credential(
-        "enroll-http",
-        "machine-http-installed",
-        &issued.credential_id,
-    )
-    .unwrap();
     let token = issued.token.to_string();
+    let token_secret = token.rsplit_once('.').unwrap().1.to_string();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -919,8 +1049,88 @@ async fn enrolled_collector_http_path_ingests_usage_and_polls_commands() {
         .await
     });
 
+    let dir = tempdir().unwrap();
+    let remote_home = dir.path().join("remote-home");
+    let source_root = remote_home.join(".config/claude/projects/project-http");
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        source_root.join("session.jsonl"),
+        r#"{"sessionId":"http-installed-session","cwd":"/private/project","timestamp":"2026-07-15T00:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":42,"output_tokens":9}}}"#,
+    )
+    .unwrap();
+
+    let facts = collector_remote_facts(&remote_home);
+    let deployment_paths = DeploymentPaths::for_facts(&facts, "0.1.2-test").unwrap();
+    let (policy, artifact) = signed_collector_fixture("0.1.2-test", facts.platform);
+    let hub_url = format!("http://{address}");
+    let mut runner = DeploymentRunner::new(InstallingExecutor::new(facts), policy)
+        .with_state_store(DeploymentStateStore::new(
+            dir.path().join("deployment-state.json"),
+        ));
+    let request = DeploymentRequest::new(
+        "deploy@example",
+        "0.1.2-test",
+        crate::listener::ListenerPlan::default(),
+    )
+    .with_collector_credentials(&machine_id, &hub_url, token.clone().into_bytes());
+    let plan = runner.probe(&request, Some(&artifact)).unwrap();
+    let mut approved = request.clone();
+    approved.approved_plan_hash = Some(plan.plan_hash.clone());
+    let receipt = runner.apply(&approved, &artifact).unwrap();
+    assert_eq!(receipt.status, "complete");
+    assert!(receipt.collector_service_verified);
+    assert!(runner
+        .executor()
+        .actions
+        .iter()
+        .any(|action| matches!(action, RemoteAction::InstallRuntimeConfig { .. })));
+
+    let config_path = Path::new(&deployment_paths.config_file).to_path_buf();
+    let secret_path = Path::new(&deployment_paths.secrets_file).to_path_buf();
+    let installed_toml = fs::read_to_string(&config_path).unwrap();
+    assert!(installed_toml.contains(&format!("hub_url = \"{hub_url}\"")));
+    assert!(installed_toml.contains(&format!("machine_id = \"{machine_id}\"")));
+    assert!(!installed_toml.contains(&token));
+    assert!(!installed_toml.contains(&token_secret));
+    let secret_json = fs::read_to_string(&secret_path).unwrap();
+    assert!(secret_json.contains(&token));
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let detected_root = remote_home.join(".config/claude/projects");
+    let mut installed_config = Config::load(&config_path).unwrap();
+    assert_eq!(
+        installed_config.collector.hub_url.as_deref(),
+        Some(hub_url.as_str())
+    );
+    assert_eq!(
+        installed_config.collector.machine_id.as_deref(),
+        Some(machine_id.as_str())
+    );
+    assert_eq!(
+        installed_config.collector.credential_token.as_deref(),
+        Some(token.as_str())
+    );
+    installed_config.source_roots.push(SourceRoot {
+        kind: "claude-code".to_string(),
+        path: detected_root,
+    });
+    installed_config.save(&config_path).unwrap();
+    assert!(!fs::read_to_string(&config_path).unwrap().contains(&token));
+
+    repo.complete_enrollment_credential(&enrollment_id, &machine_id, &issued.credential_id)
+        .unwrap();
     repo.issue_collector_command(IssueCollectorCommandRequest {
-        machine_id: "machine-http-installed".to_string(),
+        machine_id: machine_id.clone(),
         command: OwnerCommand::Diagnostics {
             command_id: "first-http-command".to_string(),
         },
@@ -928,36 +1138,42 @@ async fn enrolled_collector_http_path_ingests_usage_and_polls_commands() {
     })
     .unwrap();
 
-    let dir = tempdir().unwrap();
-    let source_root = dir.path().join("claude/projects/project-http");
-    fs::create_dir_all(&source_root).unwrap();
-    fs::write(
-        source_root.join("session.jsonl"),
-        r#"{"sessionId":"http-installed-session","cwd":"/private/project","timestamp":"2026-07-15T00:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":42,"output_tokens":9}}}"#,
-    )
-    .unwrap();
-    let usage_path = dir.path().join("usage.sqlite3");
-    let collector_path = dir.path().join("collector.sqlite3");
+    let usage_path = Path::new(&deployment_paths.hub_db).to_path_buf();
+    let collector_path = Path::new(&deployment_paths.collector_db).to_path_buf();
+    let collector_hub_url = hub_url.clone();
+    let collector_machine_id = machine_id.clone();
+    let collector_token = token.clone();
     let handle = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, CommandOutcome)> {
-        let options = CollectorOptions {
-            source_roots: vec![SourceRoot {
-                kind: "claude-code".to_string(),
-                path: dir.path().join("claude/projects"),
-            }],
-            machine_id: Some("machine-http-installed".to_string()),
-            credential_token: Some(token),
-            ..CollectorOptions::default()
+        let installed_config = Config::load(&config_path)?;
+        assert_eq!(
+            installed_config.collector.hub_url.as_deref(),
+            Some(collector_hub_url.as_str())
+        );
+        assert_eq!(
+            installed_config.collector.machine_id.as_deref(),
+            Some(collector_machine_id.as_str())
+        );
+        assert_eq!(
+            installed_config.collector.credential_token.as_deref(),
+            Some(collector_token.as_str())
+        );
+        let paths = AppPaths {
+            config_path: config_path.clone(),
+            db_path: usage_path,
+            collector_db_path: collector_path,
         };
-        let mut collector = Collector::with_databases(
-            Database::open(&usage_path)?,
-            Database::open(&collector_path)?,
-            options,
-        )?;
+        let mut collector = Collector::open(&paths, &installed_config)?;
         collector.reconcile_startup(
             chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:00Z")?
                 .with_timezone(&chrono::Utc),
         )?;
-        let mut transport = CollectorHttpTransport::new(&format!("http://{address}"))?;
+        let mut transport = CollectorHttpTransport::new(
+            installed_config
+                .collector
+                .hub_url
+                .as_deref()
+                .context("installed Collector config has no Hub URL")?,
+        )?;
         let delivery = collector.deliver_pending(
             &mut transport,
             chrono::DateTime::parse_from_rfc3339("2026-07-15T00:00:01Z")?
@@ -993,6 +1209,19 @@ async fn enrolled_collector_http_path_ingests_usage_and_polls_commands() {
         )
         .unwrap();
     assert!(result_json.contains("diagnostics"));
+    for needle in [&token, &token_secret] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collector_credentials WHERE secret_hash LIKE ?1",
+                [format!("%{needle}%")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "raw Collector credential material persisted in Hub DB"
+        );
+    }
 
     server.abort();
     let _ = server.await;
@@ -2533,6 +2762,88 @@ async fn collector_long_poll_wakes_without_holding_database_lock() {
         .unwrap();
     assert_eq!(timeout.status(), StatusCode::OK);
     assert!(timeout_started.elapsed() >= std::time::Duration::from_millis(900));
+}
+
+#[tokio::test]
+async fn collector_long_poll_wakes_target_machine_under_concurrent_polls() {
+    let repo = test_repo();
+    let app = test_app(repo, ListenerTrustMode::Public);
+    let (cookie, csrf) = bootstrap_session(&app).await;
+    let machine_a =
+        rotate_credential_for_machine(&app, &cookie, &csrf, "machine-a", "Machine A").await;
+    let machine_b =
+        rotate_credential_for_machine(&app, &cookie, &csrf, "machine-b", "Machine B").await;
+
+    let poll_a_app = app.clone();
+    let poll_a_token = machine_a.token.clone();
+    let poll_a = tokio::spawn(async move {
+        poll_a_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/collector/commands?wait_seconds=2")
+                    .header(header::AUTHORIZATION, format!("Bearer {poll_a_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let poll_b_app = app.clone();
+    let poll_b_token = machine_b.token.clone();
+    let poll_b = tokio::spawn(async move {
+        poll_b_app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/collector/commands?wait_seconds=2")
+                    .header(header::AUTHORIZATION, format!("Bearer {poll_b_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+
+    let started = std::time::Instant::now();
+    let issue = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/collector-commands")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, &cookie)
+                .header(OWNER_CSRF_HEADER, &csrf)
+                .body(Body::from(
+                    json!({
+                        "machine_id": "machine-b",
+                        "command": {"type": "diagnostics", "command_id": "wake-machine-b"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(issue.status(), StatusCode::OK);
+
+    let target = match tokio::time::timeout(std::time::Duration::from_millis(600), poll_b).await {
+        Ok(joined) => joined.unwrap(),
+        Err(error) => {
+            poll_a.abort();
+            panic!("target Machine long-poll was not notified promptly: {error}");
+        }
+    };
+    assert_eq!(target.status(), StatusCode::OK);
+    let body = json_response(target).await;
+    assert_eq!(body["command"]["command_id"], "wake-machine-b");
+    assert!(started.elapsed() < std::time::Duration::from_millis(600));
+    poll_a.abort();
+    let _ = poll_a.await;
 }
 
 #[tokio::test]

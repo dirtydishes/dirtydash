@@ -1100,6 +1100,7 @@ async fn collector_poll_command(
     Query(query): Query<CollectorCommandPollQuery>,
 ) -> Result<Json<CollectorCommandPollResponse>, HubError> {
     let auth = collector_auth(&state.repo, &headers)?;
+    let notification = state.repo.command_notification(&auth.machine_id);
     if let Some(command) = state.repo.poll_collector_command(&auth)? {
         return Ok(Json(CollectorCommandPollResponse {
             command: Some(command),
@@ -1107,7 +1108,6 @@ async fn collector_poll_command(
     }
     let wait_seconds = query.wait_seconds.unwrap_or(20).min(20);
     if wait_seconds > 0 {
-        let notification = state.repo.command_notification();
         tokio::select! {
             _ = notification.notified() => {},
             _ = tokio::time::sleep(std::time::Duration::from_secs(wait_seconds)) => {},

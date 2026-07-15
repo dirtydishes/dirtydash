@@ -1421,25 +1421,25 @@ impl HubRepository {
             .map_err(HubError::internal)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(HubError::internal)?;
-        for (machine_id, node_status, node_revision) in nodes {
+        for (machine_id, node_status, node_revision) in &nodes {
             let (command_id, command) = if node_status == "rolling-back" {
-                let command_id = fleet_rollback_command_id(&update_id, &machine_id);
+                let command_id = fleet_rollback_command_id(&update_id, machine_id);
                 let command = OwnerCommand::RollbackUpdate {
                     command_id: command_id.clone(),
                     update_id: update_id.clone(),
                     version: version.clone(),
                     sha256: sha256.clone(),
-                    expected_state_revision: node_revision,
+                    expected_state_revision: *node_revision,
                 };
                 (command_id, command)
             } else {
-                let command_id = fleet_update_command_id(&update_id, &machine_id);
+                let command_id = fleet_update_command_id(&update_id, machine_id);
                 let command = OwnerCommand::ApprovedUpdate {
                     command_id: command_id.clone(),
                     update_id: update_id.clone(),
                     version: version.clone(),
                     sha256: sha256.clone(),
-                    expected_state_revision: node_revision,
+                    expected_state_revision: *node_revision,
                 };
                 (command_id, command)
             };
@@ -1451,7 +1451,9 @@ impl HubRepository {
             .map_err(HubError::internal)?;
         }
         tx.commit().map_err(HubError::internal)?;
-        self.command_notify.notify_one();
+        for (machine_id, _, _) in nodes {
+            self.notify_machine_command(&machine_id);
+        }
         Ok(())
     }
 
@@ -1774,7 +1776,7 @@ impl HubRepository {
             .map_err(HubError::internal)?;
         }
         tx.commit().map_err(HubError::internal)?;
-        self.command_notify.notify_one();
+        self.notify_machine_command(&machine_id);
         Ok(MachineActionResponse {
             machine_id,
             command_id,

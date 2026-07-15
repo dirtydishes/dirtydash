@@ -9,7 +9,7 @@ impl HubRepository {
         Self {
             db,
             write_guard: Arc::new(Mutex::new(())),
-            command_notify: Arc::new(Notify::new()),
+            command_notify: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             final_insert_failure: Arc::new(Mutex::new(false)),
         }
@@ -895,8 +895,28 @@ impl HubRepository {
         })
     }
 
-    pub(crate) fn command_notification(&self) -> Arc<Notify> {
-        Arc::clone(&self.command_notify)
+    pub(crate) fn command_notification(&self, machine_id: &str) -> Arc<Notify> {
+        let mut notifications = self
+            .command_notify
+            .lock()
+            .expect("command notification mutex poisoned");
+        Arc::clone(
+            notifications
+                .entry(machine_id.to_string())
+                .or_insert_with(|| Arc::new(Notify::new())),
+        )
+    }
+
+    pub(crate) fn notify_machine_command(&self, machine_id: &str) {
+        if let Some(notification) = self
+            .command_notify
+            .lock()
+            .expect("command notification mutex poisoned")
+            .get(machine_id)
+            .cloned()
+        {
+            notification.notify_one();
+        }
     }
 
     pub(crate) fn issue_collector_command(
@@ -1035,9 +1055,10 @@ impl HubRepository {
             ));
         }
         tx.commit().map_err(HubError::internal)?;
-        // Keep a permit if the poller is between its immediate DB check and
-        // registering the long-poll future; this closes the command wake race.
-        self.command_notify.notify_one();
+        // Keep a target-specific permit if this Machine's poller is between
+        // its immediate DB check and registering the long-poll future; this
+        // closes the command wake race without waking the wrong Collector.
+        self.notify_machine_command(&machine_id);
         Ok(IssueCollectorCommandResponse {
             command_id,
             machine_id,
