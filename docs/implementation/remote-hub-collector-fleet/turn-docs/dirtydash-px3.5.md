@@ -73,7 +73,7 @@ No separate review session was run in this bounded checkout. Local correctness e
 
 Owner: implementation session
 
-State: local gates passed; remote CI running on PR #12
+State: local gates passed; PR #12 is open and no remote checks are reported yet
 
 Evidence:
 
