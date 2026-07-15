@@ -317,6 +317,22 @@ impl Database {
         .map_err(Into::into)
     }
 
+    pub fn collector_manifests(&self) -> Result<Vec<CollectorManifestRecord>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            r#"
+            SELECT source_key, agent, local_path, file_fingerprint, parser_version,
+                item_count, cursor, parse_error, last_reconciled_at
+            FROM collector_source_manifests
+            ORDER BY source_key
+            "#,
+        )?;
+        let rows = statement
+            .query_map([], collector_manifest_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn upsert_collector_manifest(&self, record: &CollectorManifestRecord) -> Result<()> {
         let conn = self.connection()?;
         conn.execute(

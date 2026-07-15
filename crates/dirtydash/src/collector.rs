@@ -501,6 +501,7 @@ impl Collector {
         let mut payload_manifests = Vec::new();
         let mut payload_events = Vec::new();
         let mut seen_event_ids = BTreeSet::new();
+        let mut seen_source_keys = BTreeSet::new();
         let mut files_reprocessed = 0;
         let mut parse_errors = 0;
         let mut current_agents = BTreeSet::new();
@@ -515,6 +516,7 @@ impl Collector {
                     parsed_file.file.display()
                 ),
             );
+            seen_source_keys.insert(source_key.clone());
             let previous = self.store.collector_manifest(&source_key)?;
             let parser_version = parsed_file.source.kind.parser_version();
             let should_reprocess = reason.forces_reparse()
@@ -580,6 +582,46 @@ impl Collector {
                     payload_events.push(self.redact_event(event, &source_key, now));
                 }
             }
+        }
+
+        // A complete reconciliation also publishes tombstones for files that
+        // disappeared since the last scan. The local path remains local-only;
+        // the Hub sees the same redacted source key with item_count=0.
+        for stale in self.store.collector_manifests()? {
+            if seen_source_keys.contains(&stale.source_key) {
+                continue;
+            }
+            current_agents.insert(stale.agent.clone());
+            manifests.push(CollectorManifestRecord {
+                source_key: stale.source_key.clone(),
+                agent: stale.agent.clone(),
+                local_path: stale.local_path.clone(),
+                file_fingerprint: "missing".to_string(),
+                parser_version: stale.parser_version.clone(),
+                item_count: 0,
+                cursor: None,
+                parse_error: Some("source missing".to_string()),
+                last_reconciled_at: imported_at.clone(),
+            });
+            payload_manifests.push(SourceManifestInput {
+                source_key: stale.source_key.clone(),
+                agent: stale.agent,
+                display_path: format!(
+                    "source/{}",
+                    redacted_identifier(
+                        &self.identity.project_salt,
+                        "missing-source",
+                        &stale.local_path,
+                    )
+                ),
+                item_count: 0,
+                cursor: None,
+                manifest_fingerprint: redacted_identifier(
+                    &self.identity.project_salt,
+                    "missing-manifest",
+                    &stale.source_key,
+                ),
+            });
         }
 
         if !payload_manifests.is_empty() || !payload_events.is_empty() {
