@@ -107,6 +107,7 @@ Evidence:
 - Implementation commits: `cfe13e4` (`feat: add durable outbound collector runtime`) and `b87597d` (removed-source tombstones/manifest completeness).
 - Repair commit: `eb8a614` (`repair collector refresh idempotency and secret-free rotation`).
 - Final migration repair commit: `4d0456a` (`fix: scrub legacy collector command acknowledgements`).
+- Test-only closeout correction: `08f9cd5` (`test: isolate legacy migration credential fixtures`).
 - Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`, state open.
 - Coordinator retains integration/merge ownership; this session does not mutate Beads or merge the PR.
 
