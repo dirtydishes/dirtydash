@@ -91,6 +91,7 @@ The coordinator validated the Pi binding and certified adapter contract before r
 - The PR #12 repair pass makes command/result and update-receipt payloads typed and bounded, binds acknowledgements to issued command variants, and accepts completion only from an authenticated Collector after a new runtime generation proves restart and health.
 - Hub restart reconciliation remains resumable across the old/new process boundary; the browser can request execution/reconciliation but cannot submit health, signature, or receipt evidence.
 - Repair cycle 1 for PR #12 treats probe as a secret-bearing enrollment step, clears SSH/sudo inputs before request dispatch, and retries with an empty body rather than retaining plaintext in React closures.
+- Repair cycle 2 branches before retry closure creation so secret-bearing enrollment retries bind only `step(path, {})` and never lexically reference the original request object.
 - Repair cycle 1 scopes long-poll wakeups by Machine ID so a command for one Collector cannot be consumed by another Machine's waiter.
 - Repair cycle 1 strengthens the hosted enrollment-to-Collector evidence through the DeploymentRunner install seam, generated runtime config, restrictive secret store, production `Config::load`/`Collector::open`, real HTTP ingest, and command polling. The exact `/execute` handler plus non-loopback HTTPS/SSH/service-manager path remains an external integration gate.
 - `.pi-subagents/` was removed before closeout; no mutable harness/session artifacts are part of the worktree.
@@ -110,10 +111,11 @@ Slice `dirtydash-px3.8` tightens hosted enrollment through first Hub ingest: hos
 - Documentation: this turn document, the phase docs, and `/api/v1` invariant notes record canonical URLs, secret transfer, receipt/rollback, lifecycle, and snapshot-permission contracts.
 - Slice `dirtydash-px3.8`: `crates/dirtydash/src/hub/router.rs`, `hub/repository.rs`, `hub/mod.rs`, and `hub/tests.rs` cover non-loopback hosted canonical URL enforcement, pending credential revocation/retry semantics, first-ingest/command-poll production HTTP evidence, and Machine-scoped long-poll notification.
 - Repair cycle 1: `dashboard/src/machines.tsx`, `dashboard/tests/machines-a11y.test.tsx`, and `dashboard/tests/machines-contract.test.mjs` cover probe secret clearing and retry-body scrubbing.
+- Repair cycle 2: `dashboard/src/machines.tsx`, `dashboard/tests/machines-a11y.test.tsx`, `dashboard/tests/machines-contract.test.mjs`, and regenerated `dashboard/dist` assets cover secret-bearing retry closures with no lexical request-body capture.
 
 ## Review
 
-This bounded repair pass addresses the independent PR #12 security/correctness and accessibility findings in the same implementation checkout. Repair cycle 1 addresses the follow-up review findings for probe plaintext retention, production-path evidence, and wrong-Collector long-poll wakeups without widening the phase scope. A fresh external browser/tailnet review remains an integration gate; local rendered modal/axe coverage and typed backend tests provide the available evidence.
+This bounded repair pass addresses the independent PR #12 security/correctness and accessibility findings in the same implementation checkout. Repair cycle 1 addresses the follow-up review findings for probe plaintext retention, production-path evidence, and wrong-Collector long-poll wakeups without widening the phase scope. Repair cycle 2 addresses the remaining high finding by ensuring a secret-bearing rendered retry handler's closure source contains `step(path, {})` and no `body` or `carriesSecret` reference. A fresh external browser/tailnet review remains an integration gate; local rendered modal/axe coverage and typed backend tests provide the available evidence.
 
 ## CI And Gates
 
@@ -159,6 +161,15 @@ Repair cycle 1 evidence:
 - `cd dashboard && npx tsc --noEmit` passed.
 - `npm --prefix dashboard run build` passed with regenerated `dashboard/dist/assets/index-hzSTiPxX.js`.
 - `git diff --check` passed.
+
+Repair cycle 2 evidence:
+
+- `npm --prefix dashboard run test` passed: 3 rendered tests; the enrollment retry regression inspects the rendered retry button handler and rejects `body`/`carriesSecret` lexical references.
+- `npm --prefix dashboard run test:contract` passed: source contract rejects the old conditional retry closure and requires the secret branch to bind `step(path, {})` without `body`.
+- `cd dashboard && npx tsc --noEmit` passed.
+- `npm --prefix dashboard run build` passed with regenerated `dashboard/dist/assets/index-B9mQIdSB.js`.
+- `git diff --check` passed.
+- No Rust files changed; no Rust regression was required for this dashboard-only repair.
 
 ## PR And Commits
 

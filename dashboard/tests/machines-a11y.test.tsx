@@ -34,6 +34,14 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
+function renderedReactOnClickSource(element: HTMLElement) {
+  const reactPropsKey = Object.keys(element).find((key) => key.startsWith("__reactProps$"));
+  expect(reactPropsKey).toBeDefined();
+  const props = (element as unknown as Record<string, { onClick?: unknown }>)[reactPropsKey!];
+  expect(typeof props.onClick).toBe("function");
+  return String(props.onClick);
+}
+
 const hostTrustDraft = {
   id: "enroll-probe-secret",
   machine_id: "machine-probe-secret",
@@ -46,7 +54,7 @@ const hostTrustDraft = {
 };
 
 describe("enrollment secret retry handling", () => {
-  it("clears probe credentials and retries without captured plaintext", async () => {
+  it("clears probe credentials and renders a retry closure that cannot capture the request body", async () => {
     const user = userEvent.setup();
     const probeBodies: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -77,7 +85,13 @@ describe("enrollment secret retry handling", () => {
     expect(probeBodies[0]).toContain("ssh-secret-sentinel");
     expect(probeBodies[0]).toContain("sudo-secret-sentinel");
 
-    await user.click(await screen.findByRole("button", { name: "retry" }));
+    const retryButton = await screen.findByRole("button", { name: "retry" });
+    const retryHandlerSource = renderedReactOnClickSource(retryButton);
+    expect(retryHandlerSource).toMatch(/step\(path, \{\}\)/);
+    expect(retryHandlerSource).not.toMatch(/\bbody\b/);
+    expect(retryHandlerSource).not.toMatch(/carriesSecret/);
+
+    await user.click(retryButton);
     await waitFor(() => expect(probeBodies).toHaveLength(2));
     expect(probeBodies[1]).not.toContain("ssh-secret-sentinel");
     expect(probeBodies[1]).not.toContain("sudo-secret-sentinel");

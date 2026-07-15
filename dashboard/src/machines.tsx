@@ -821,7 +821,13 @@ function EnrollmentTab({ csrf, desktopAdmin, drafts, onChange }: { csrf: string;
       onChange();
     } catch (stepError) {
       setError((stepError as Error).message);
-      setRetry(() => () => void step(path, carriesSecret ? {} : body));
+      if (carriesSecret) {
+        const retryStep = () => void step(path, {});
+        setRetry(() => retryStep);
+      } else {
+        const retryStep = () => void step(path, body);
+        setRetry(() => retryStep);
+      }
     } finally { setWorking(false); }
   }
   const secretBody = { password: secrets.password || undefined, key_passphrase: secrets.key_passphrase || undefined, sudo_password: secrets.sudo_password || undefined };
