@@ -101,7 +101,7 @@ Evidence:
 - Commits:
   - `b071bac` — `Add hub protocol and auth foundation`
   - `3655174` — `Record phase 2 implementation evidence`
-  - repair commit recorded below after push
+  - `a558338` — `Repair phase 2 hub security and transaction seams`
 - PR: #9 — `Phase 2: add hub protocol and auth foundation`
 - Branch: `lavender/remote-hub-collector-fleet-2-foundation`
 - Target: `lavender/remote-hub-collector-fleet-implementation`
@@ -120,4 +120,4 @@ Phase 1 must establish the canonical domain and ADRs first.
 
 ## Closeout
 
-Repair implementation and local gates are complete. The repair commit and push evidence will be recorded here; PR #9 remains open for coordinator-owned final review/CI/Beads/merge.
+Repair implementation and local gates are complete. Commit `a558338` contains the repairs; the branch remains open for coordinator-owned final review/CI/Beads/merge.
