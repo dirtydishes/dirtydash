@@ -5,7 +5,7 @@
   "additionalProperties": false,
   "required": ["strategy", "rationale", "delegations", "adaptations"],
   "properties": {
-    "strategy": { "enum": ["direct", "subagents", "threads", "native-multi-agent", "hybrid"] },
+    "strategy": { "enum": ["direct", "delegates", "sessions", "native-multi-agent", "hybrid"] },
     "rationale": { "type": "string", "minLength": 1 },
     "delegations": {
       "type": "array",

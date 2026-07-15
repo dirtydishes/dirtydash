@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dirtydishes.dev/dirtyloops/runtime-capabilities.schema.json",
+  "title": "DirtyloopRuntimeCapabilities",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["harness", "adapter", "adapter_contract", "capabilities"],
+  "properties": {
+    "harness": { "enum": ["codex", "pi"] },
+    "adapter": { "type": "string", "minLength": 1 },
+    "adapter_contract": { "const": "dirtyloops-harness/1" },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "harness-binding.schema.json#/$defs/capability" }
+    },
+    "optional_backends": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["certified", "unavailable", "incompatible"] },
+          "protocol": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "adapter_contract": "dirtyloops-harness/1",
+  "runtime_adapter": "dirtyloops-pi-vanilla",
+  "optional_backend": {
+    "name": "nicobailon/pi-subagents",
+    "package": "pi-subagents",
+    "protocol": "rpc-v1",
+    "protocol_version": 1,
+    "request_event": "subagents:rpc:v1:request",
+    "reply_event_prefix": "subagents:rpc:v1:reply:",
+    "agent": "dirtyloops.scout",
+    "scope": "read-only-delegates"
+  }
+}

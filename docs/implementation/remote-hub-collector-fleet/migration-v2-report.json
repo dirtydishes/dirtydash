@@ -1,0 +1,71 @@
+{
+  "status": "refreshed-v2",
+  "source_version": 2,
+  "target_version": 2,
+  "doc_root": "docs/implementation/remote-hub-collector-fleet",
+  "blockers": [],
+  "manual_classifications": [
+    {
+      "path": "00-roadmap.md",
+      "token": "orchestrator-callback",
+      "classification": "protected explicit user topology constraint, not legacy generated policy",
+      "action": "preserved byte-for-byte"
+    }
+  ],
+  "actions": [
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/execution-summary.schema.json"
+    },
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/review-callback.schema.json"
+    },
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/harness-binding.schema.json"
+    },
+    {
+      "action": "install-v2-schema",
+      "path": "schemas/runtime-capabilities.schema.json"
+    },
+    {
+      "action": "install-pi-adapter-config",
+      "path": "runtime/adapter.json"
+    }
+  ],
+  "protected_hashes_before": {
+    "00-roadmap.md": "06a77dde9c7dbc4546cb8a98591fbcf160361fb807ad94e2bd9f8512601ad252",
+    "01-documentation-and-tracker-reset.md": "bc0e5a690898a58344caf37791161c2d8a79c81ad409d7bd299f6f63746ea96e",
+    "02-storage-and-protocol-foundation.md": "9f0d15a09fb4bfbbee621ded288b6cee5e5435830392de71c8de3cb8233034b6",
+    "03-collector-runtime.md": "a564c293ea877d389663832c4d9711e8f8704e7b93bde48a37e3011f8671a93d",
+    "04-hub-deployment-and-enrollment.md": "0bc84c697d4ea44d4248b7534b4e693afa94175b517899985f2f1d0b01b61e24",
+    "05-fleet-management.md": "bf57fb7845e7c10244c3a018cfdaecf480afb058ac661b7d58b525f8b7ea45c6",
+    "06-usage-redesign-and-themes.md": "7b3785d160e289e11deaad1c6deb2a4bd098371a93e8b687e259b2e6ed968add",
+    "07-migration-backup-and-release-hardening.md": "6cc56783dfd2c6afcad22018bd111fd13f975ed94c6e4aeee8c847f6ffbcbb0b",
+    "turn-docs/dirtydash-px3.1.md": "96f2e1a6eca446647de67b7da46b5fa7d7dc99e698eea3f179bab3bbee675e58",
+    "turn-docs/dirtydash-px3.2.md": "ca3080e810bfd34d62a5e2f164a8fc0e2f6b7e9b353231062ffc1f451f5b6de4",
+    "turn-docs/dirtydash-px3.3.md": "2b4bbc8af5d8f71f5f9dae9cb693fd023dc43bdaf4eed931073cc971726c8a6a",
+    "turn-docs/dirtydash-px3.4.md": "1aaf8428f6f50b57979e39c0f952c8b323ab96dd680392e31a045d8f847cdf38",
+    "turn-docs/dirtydash-px3.5.md": "9d36730d75ef471a6355c3d62ccef0ea7a60f751434225c238460726ff2a81fb",
+    "turn-docs/dirtydash-px3.6.md": "65f914e1b39cab070504af880f9a4b606b780fbd36b6a7202426f54b1a1069dd",
+    "turn-docs/dirtydash-px3.7.md": "9d8ce41c847e2e6a62dd49342a7866a6c52b44f347817a49602a20d751465d0a"
+  },
+  "protected_hashes_after": {
+    "00-roadmap.md": "06a77dde9c7dbc4546cb8a98591fbcf160361fb807ad94e2bd9f8512601ad252",
+    "01-documentation-and-tracker-reset.md": "bc0e5a690898a58344caf37791161c2d8a79c81ad409d7bd299f6f63746ea96e",
+    "02-storage-and-protocol-foundation.md": "9f0d15a09fb4bfbbee621ded288b6cee5e5435830392de71c8de3cb8233034b6",
+    "03-collector-runtime.md": "a564c293ea877d389663832c4d9711e8f8704e7b93bde48a37e3011f8671a93d",
+    "04-hub-deployment-and-enrollment.md": "0bc84c697d4ea44d4248b7534b4e693afa94175b517899985f2f1d0b01b61e24",
+    "05-fleet-management.md": "bf57fb7845e7c10244c3a018cfdaecf480afb058ac661b7d58b525f8b7ea45c6",
+    "06-usage-redesign-and-themes.md": "7b3785d160e289e11deaad1c6deb2a4bd098371a93e8b687e259b2e6ed968add",
+    "07-migration-backup-and-release-hardening.md": "6cc56783dfd2c6afcad22018bd111fd13f975ed94c6e4aeee8c847f6ffbcbb0b",
+    "turn-docs/dirtydash-px3.1.md": "96f2e1a6eca446647de67b7da46b5fa7d7dc99e698eea3f179bab3bbee675e58",
+    "turn-docs/dirtydash-px3.2.md": "ca3080e810bfd34d62a5e2f164a8fc0e2f6b7e9b353231062ffc1f451f5b6de4",
+    "turn-docs/dirtydash-px3.3.md": "2b4bbc8af5d8f71f5f9dae9cb693fd023dc43bdaf4eed931073cc971726c8a6a",
+    "turn-docs/dirtydash-px3.4.md": "1aaf8428f6f50b57979e39c0f952c8b323ab96dd680392e31a045d8f847cdf38",
+    "turn-docs/dirtydash-px3.5.md": "9d36730d75ef471a6355c3d62ccef0ea7a60f751434225c238460726ff2a81fb",
+    "turn-docs/dirtydash-px3.6.md": "65f914e1b39cab070504af880f9a4b606b780fbd36b6a7202426f54b1a1069dd",
+    "turn-docs/dirtydash-px3.7.md": "9d8ce41c847e2e6a62dd49342a7866a6c52b44f347817a49602a20d751465d0a"
+  }
+}
