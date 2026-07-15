@@ -49,6 +49,15 @@ pub struct HubConfig {
     /// It is public trust material, never a signing secret.
     #[serde(default)]
     pub allowed_publisher_public_key: Option<String>,
+    /// Local, administrator-owned signed release bytes used by the server-side
+    /// fleet executor. URLs and shell commands are intentionally not config.
+    #[serde(default)]
+    pub fleet_update_artifact_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub fleet_update_target: Option<PathBuf>,
+    /// Fixed service manager used for the server-owned Hub restart proof.
+    #[serde(default)]
+    pub fleet_update_service_manager: Option<String>,
     /// One-time setup secret for bootstrap when the local setup route is not available.
     ///
     /// This value is loaded from [`SecretStore`].  It is deliberately skipped
@@ -99,6 +108,23 @@ impl HubConfig {
                 .is_some_and(|value| value.trim().is_empty())
         {
             bail!("publisher allowlist values cannot be empty");
+        }
+        let fleet_runtime_fields = [
+            self.fleet_update_artifact_dir.is_some(),
+            self.fleet_update_target.is_some(),
+            self.fleet_update_service_manager.is_some(),
+        ];
+        let configured_fleet_runtime_fields = fleet_runtime_fields
+            .iter()
+            .filter(|present| **present)
+            .count();
+        if configured_fleet_runtime_fields != 0 && configured_fleet_runtime_fields != 3 {
+            bail!("fleet update execution requires an artifact directory, update target, and service manager");
+        }
+        if let Some(manager) = &self.fleet_update_service_manager {
+            if !matches!(manager.as_str(), "systemd-user" | "launchd") {
+                bail!("fleet_update_service_manager must be systemd-user or launchd");
+            }
         }
         if let Some(public_key) = &self.allowed_publisher_public_key {
             let bytes =
@@ -208,6 +234,12 @@ impl fmt::Debug for HubConfig {
             .field(
                 "allowed_publisher_public_key",
                 &self.allowed_publisher_public_key,
+            )
+            .field("fleet_update_artifact_dir", &self.fleet_update_artifact_dir)
+            .field("fleet_update_target", &self.fleet_update_target)
+            .field(
+                "fleet_update_service_manager",
+                &self.fleet_update_service_manager,
             )
             .field(
                 "bootstrap_setup_token",

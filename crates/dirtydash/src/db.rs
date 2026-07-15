@@ -1339,6 +1339,7 @@ impl Database {
                 desired_version TEXT,
                 collector_version TEXT,
                 collector_protocol_version INTEGER,
+                collector_runtime_generation TEXT,
                 last_sync_at TEXT,
                 diagnostics_json TEXT,
                 diagnostics_status TEXT,
@@ -1502,6 +1503,8 @@ impl Database {
                 machine_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 previous_version TEXT,
+                previous_desired_version TEXT,
+                previous_runtime_generation TEXT,
                 snapshot_at TEXT,
                 update_started_at TEXT,
                 restarted_at TEXT,
@@ -1519,6 +1522,25 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_fleet_update_nodes_machine
                 ON fleet_update_nodes(machine_id, status);
 
+            CREATE TABLE IF NOT EXISTS fleet_update_snapshots (
+                update_id TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                machine_id TEXT,
+                snapshot_path TEXT NOT NULL,
+                snapshot_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(update_id, target_kind, machine_id),
+                FOREIGN KEY(update_id) REFERENCES fleet_update_runs(update_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS hub_runtime_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                runtime_generation TEXT NOT NULL,
+                runtime_version TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                health_checked_at TEXT NOT NULL
+            );
+
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (2, datetime('now'));
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -1531,6 +1553,7 @@ impl Database {
             ("desired_version", "TEXT"),
             ("collector_version", "TEXT"),
             ("collector_protocol_version", "INTEGER"),
+            ("collector_runtime_generation", "TEXT"),
             ("last_sync_at", "TEXT"),
             ("diagnostics_json", "TEXT"),
             ("diagnostics_status", "TEXT"),
@@ -1550,6 +1573,18 @@ impl Database {
             "fleet_update_nodes",
             "attempts",
             "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "fleet_update_nodes",
+            "previous_desired_version",
+            "TEXT",
+        )?;
+        ensure_column(
+            conn,
+            "fleet_update_nodes",
+            "previous_runtime_generation",
+            "TEXT",
         )?;
         Ok(())
     }

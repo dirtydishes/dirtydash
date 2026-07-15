@@ -10,11 +10,23 @@ use anyhow::bail;
 
 type HubResult<T> = std::result::Result<T, HubError>;
 type AnyResult<T> = anyhow::Result<T>;
-type FleetTargetRow = (String, Option<String>, Option<u32>, Option<String>, i64);
+type FleetTargetRow = (
+    String,
+    Option<String>,
+    Option<u32>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+type FleetMachineStateRow = (Option<String>, Option<String>, Option<u32>, i64);
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
 
 /// Current Collector wire protocol accepted by the Hub.
 pub const CURRENT_COLLECTOR_PROTOCOL_VERSION: u32 = API_V1_PROTOCOL_VERSION;
@@ -172,12 +184,15 @@ pub struct FleetUpdateEvidence {
     pub publisher_key_id: String,
     pub publisher_fingerprint: String,
     pub manifest_sha256: String,
-    pub signature_verified: bool,
+    /// Set only by the server after the configured publisher policy verifies
+    /// the signed manifest. This field is never accepted as request input.
+    #[serde(default, skip_deserializing)]
+    pub publisher_verified: bool,
 }
 
 impl FleetUpdateEvidence {
     /// Build update evidence only from Deployment's already verified artifact;
-    /// callers should not hand-author the `signature_verified` assertion.
+    /// callers should not hand-author the `publisher_verified` assertion.
     pub fn from_verified_artifact(artifact: &crate::deployment::VerifiedArtifact) -> Self {
         Self {
             version: artifact.manifest().manifest().release.clone(),
@@ -185,7 +200,7 @@ impl FleetUpdateEvidence {
             publisher_key_id: artifact.manifest().key_id().to_string(),
             publisher_fingerprint: artifact.manifest().publisher_fingerprint().to_string(),
             manifest_sha256: artifact.manifest().manifest_sha256().to_string(),
-            signature_verified: true,
+            publisher_verified: true,
         }
     }
 }
@@ -217,6 +232,8 @@ pub struct FleetUpdateNode {
     pub machine_id: String,
     pub status: String,
     pub previous_version: Option<String>,
+    pub previous_desired_version: Option<String>,
+    pub previous_runtime_generation: Option<String>,
     pub snapshot_at: Option<String>,
     pub update_started_at: Option<String>,
     pub restarted_at: Option<String>,
@@ -224,7 +241,7 @@ pub struct FleetUpdateNode {
     pub rolled_back_at: Option<String>,
     pub failure_reason: Option<String>,
     pub collector_protocol_version: Option<u32>,
-    pub evidence: Option<FleetUpdateEvidence>,
+    pub receipt: Option<CollectorUpdateReceipt>,
     pub attempts: i64,
     pub state_revision: i64,
 }
@@ -353,6 +370,11 @@ fn update_id() -> String {
 
 fn command_id(action: &str) -> String {
     format!("fleet-{action}-{}", random_token(12))
+}
+
+pub(crate) fn fleet_update_command_id(update_id: &str, machine_id: &str) -> String {
+    let digest = sha256_hex(&format!("{update_id}:{machine_id}"));
+    format!("fleet-update-{}", &digest[..24])
 }
 
 impl HubRepository {
@@ -613,27 +635,23 @@ impl HubRepository {
     pub(crate) fn record_collector_diagnostics(
         &self,
         machine_id: &str,
-        diagnostics: &serde_json::Value,
+        diagnostics: &CollectorDiagnosticsReceipt,
     ) -> HubResult<()> {
         let machine_id = validate_identifier(machine_id, "machine_id")?;
+        if diagnostics.machine_id != machine_id {
+            return Err(HubError::unauthorized(
+                "collector-machine-mismatch",
+                "diagnostics receipt does not belong to the authenticated Machine",
+            ));
+        }
+        CollectorCommandResult::Diagnostics {
+            diagnostics: diagnostics.clone(),
+        }
+        .validate()?;
         let diagnostics_json = serde_json::to_string(diagnostics).map_err(HubError::internal)?;
-        let diagnostic_object = diagnostics
-            .get("Diagnostics")
-            .or_else(|| diagnostics.get("diagnostics"))
-            .unwrap_or(diagnostics);
-        let status = if diagnostic_object
-            .pointer("/watcher/degraded")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-            || diagnostic_object
-                .get("credential_rotation_pending")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            || diagnostic_object
-                .get("terminal_outbox")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                > 0
+        let status = if diagnostics.watcher.degraded
+            || diagnostics.credential_rotation_pending
+            || diagnostics.terminal_outbox > 0
         {
             "degraded"
         } else {
@@ -757,15 +775,43 @@ impl HubRepository {
         )
         .map_err(HubError::internal)?;
         for machine_id in &machine_ids {
+            let overlapping: bool = tx
+                .query_row(
+                    r#"SELECT EXISTS(
+                        SELECT 1 FROM fleet_update_nodes n
+                        JOIN fleet_update_runs r ON r.update_id = n.update_id
+                        WHERE n.machine_id = ?1
+                          AND n.status IN ('queued', 'updating', 'rolling-back')
+                          AND r.status NOT IN ('completed', 'completed-with-failures', 'failed')
+                    )"#,
+                    params![machine_id],
+                    |row| row.get(0),
+                )
+                .map_err(HubError::internal)?;
+            if overlapping {
+                return Err(HubError::conflict(
+                    "machine-update-overlap",
+                    "an active fleet update already owns this Machine",
+                ));
+            }
             let current: Option<FleetTargetRow> = tx
                 .query_row(
-                    "SELECT display_name, collector_version, collector_protocol_version, archived_at, state_revision FROM machines WHERE machine_id = ?1",
+                    "SELECT display_name, collector_version, collector_protocol_version, archived_at, state_revision, desired_version, collector_runtime_generation FROM machines WHERE machine_id = ?1",
                     params![machine_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
                 )
                 .optional()
                 .map_err(HubError::internal)?;
-            let Some((_, current_version, protocol, archived_at, revision)) = current else {
+            let Some((
+                _,
+                current_version,
+                protocol,
+                archived_at,
+                revision,
+                desired_version,
+                runtime_generation,
+            )) = current
+            else {
                 return Err(HubError::not_found(
                     "machine-not-found",
                     "update target Machine was not found",
@@ -780,9 +826,9 @@ impl HubRepository {
             tx.execute(
                 r#"INSERT INTO fleet_update_nodes(
                     update_id, machine_id, status, previous_version,
-                    collector_protocol_version, state_revision
-                ) VALUES (?1, ?2, 'queued', ?3, ?4, 0)"#,
-                params![update_id, machine_id, current_version, protocol],
+                    previous_desired_version, previous_runtime_generation, collector_protocol_version, state_revision
+                ) VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, 0)"#,
+                params![update_id, machine_id, current_version, desired_version, runtime_generation, protocol],
             )
             .map_err(HubError::internal)?;
             let revision_changed = tx
@@ -844,7 +890,7 @@ impl HubRepository {
         let mut nodes = conn
             .prepare(
                 r#"SELECT update_id, machine_id, status, previous_version,
-                    snapshot_at, update_started_at, restarted_at, health_checked_at,
+                    previous_desired_version, previous_runtime_generation, snapshot_at, update_started_at, restarted_at, health_checked_at,
                     rolled_back_at, failure_reason, collector_protocol_version,
                     evidence_json, attempts, state_revision
                 FROM fleet_update_nodes WHERE update_id = ?1 ORDER BY machine_id"#,
@@ -859,6 +905,82 @@ impl HubRepository {
         Ok(run)
     }
 
+    pub(crate) fn record_hub_snapshot_server(
+        &self,
+        update_id: &str,
+    ) -> HubResult<FleetUpdateSnapshotResponse> {
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let now = now_utc();
+        let snapshot_path = self.hub_snapshot_path(&update_id)?;
+        if snapshot_path.exists() {
+            return Err(HubError::conflict(
+                "hub-snapshot-exists",
+                "the durable Hub snapshot already exists for this update",
+            ));
+        }
+        if let Some(parent) = snapshot_path.parent() {
+            fs::create_dir_all(parent).map_err(HubError::internal)?;
+        }
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let changed = tx
+            .execute(
+                r#"UPDATE fleet_update_runs SET status = 'hub-updating', started_at = COALESCE(started_at, ?2),
+                    hub_snapshot_at = ?2, attempts = attempts + 1, state_revision = state_revision + 1
+                    WHERE update_id = ?1 AND status = 'planned'"#,
+                params![update_id, now],
+            )
+            .map_err(HubError::internal)?;
+        if changed == 0 {
+            return Err(HubError::conflict(
+                "hub-snapshot-order",
+                "Hub snapshot is only valid as the first fleet update mutation",
+            ));
+        }
+        tx.commit().map_err(HubError::internal)?;
+        // VACUUM INTO is SQLite's backup primitive and includes a consistent
+        // WAL view. It is intentionally performed after the state transition;
+        // a crash before this write is reconciled as a failed-start run.
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        conn.execute(
+            "VACUUM INTO ?1",
+            params![snapshot_path.to_string_lossy().to_string()],
+        )
+        .map_err(HubError::internal)?;
+        let bytes = fs::read(&snapshot_path).map_err(HubError::internal)?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        conn.execute(
+            "INSERT INTO fleet_update_snapshots(update_id, target_kind, machine_id, snapshot_path, snapshot_sha256, created_at) VALUES (?1, 'hub', NULL, ?2, ?3, ?4)",
+            params![update_id, snapshot_path.to_string_lossy().to_string(), digest, now],
+        )
+        .map_err(HubError::internal)?;
+        self.fleet_update(&update_id)
+            .map(|update| FleetUpdateSnapshotResponse {
+                update_id,
+                status: update.status,
+                state_revision: update.state_revision,
+                hub_snapshot_at: update.hub_snapshot_at.unwrap_or(now),
+            })
+    }
+
+    fn hub_snapshot_path(&self, update_id: &str) -> HubResult<PathBuf> {
+        let root = self
+            .db
+            .path()
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Ok(root
+            .join("fleet-updates")
+            .join(update_id)
+            .join("hub.sqlite3"))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn record_hub_snapshot(
         &self,
         update_id: &str,
@@ -890,6 +1012,305 @@ impl HubRepository {
         })
     }
 
+    pub(crate) fn mark_hub_runtime_started(&self, runtime_version: &str) -> HubResult<()> {
+        let runtime_version = validate_non_empty(runtime_version, "runtime_version")?;
+        let now = now_utc();
+        let generation = format!("hub-runtime-{}", random_token(12));
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        conn.execute(
+            "INSERT INTO hub_runtime_state(singleton, runtime_generation, runtime_version, started_at, health_checked_at) VALUES (1, ?1, ?2, ?3, ?3) ON CONFLICT(singleton) DO UPDATE SET runtime_generation = excluded.runtime_generation, runtime_version = excluded.runtime_version, started_at = excluded.started_at, health_checked_at = excluded.health_checked_at",
+            params![generation, runtime_version, now],
+        )
+        .map_err(HubError::internal)?;
+        Ok(())
+    }
+
+    pub(crate) fn record_hub_health_server(&self, update_id: &str) -> HubResult<FleetUpdateRun> {
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let update = self.fleet_update(&update_id)?;
+        let runtime: Option<(String, String, String, String)> = self
+            .db
+            .connection()
+            .map_err(HubError::internal)?
+            .query_row(
+                "SELECT runtime_generation, runtime_version, health_checked_at, started_at FROM hub_runtime_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let snapshot_exists: bool = self
+            .db
+            .connection()
+            .map_err(HubError::internal)?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fleet_update_snapshots WHERE update_id = ?1 AND target_kind = 'hub' AND machine_id IS NULL)",
+                params![update_id],
+                |row| row.get(0),
+            )
+            .map_err(HubError::internal)?;
+        if !snapshot_exists {
+            return self.fail_hub_update(&update_id, "durable Hub snapshot proof did not complete");
+        }
+        let Some((generation, runtime_version, health_checked_at, runtime_started_at)) = runtime
+        else {
+            // The request that applied the artifact may be terminating before
+            // the replacement Hub records its new process generation. Keep the
+            // durable run resumable instead of treating the old generation as
+            // a client-confirmed health failure.
+            return self.fleet_update(&update_id);
+        };
+        let snapshot_at = update
+            .hub_snapshot_at
+            .as_deref()
+            .ok_or_else(|| HubError::internal("Hub snapshot timestamp is missing"))?;
+        let runtime_is_newer =
+            parse_utc_timestamp(&runtime_started_at)? > parse_utc_timestamp(snapshot_at)?;
+        if !runtime_is_newer {
+            return self.fleet_update(&update_id);
+        }
+        if runtime_version != update.version || generation.is_empty() {
+            return self.fail_hub_update(
+                &update_id,
+                "Hub restart generation is new but its version proof did not match the plan",
+            );
+        }
+        let now = now_utc();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let conn = self.db.connection().map_err(HubError::internal)?;
+        let changed = conn
+            .execute(
+                "UPDATE fleet_update_runs SET status = 'collectors-queued', hub_updated_at = ?2, hub_health_at = ?3, attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND status = 'hub-updating'",
+                params![update_id, now, health_checked_at],
+            )
+            .map_err(HubError::internal)?;
+        if changed == 0 {
+            return Err(HubError::conflict(
+                "hub-health-order",
+                "Hub health has already been recorded or the run is not updating",
+            ));
+        }
+        drop(_guard);
+        self.finish_update_if_terminal(&update_id)
+    }
+
+    pub(crate) fn execute_server_fleet_update(
+        &self,
+        update_id: &str,
+        artifact_dir: Option<&PathBuf>,
+        update_target: Option<&PathBuf>,
+        service_manager: Option<&str>,
+    ) -> HubResult<FleetUpdateRun> {
+        let update = self.fleet_update(update_id)?;
+        if update.status == "planned" {
+            self.record_hub_snapshot_server(update_id)?;
+            if let Err(error) = self.apply_hub_update_artifact(
+                &update,
+                artifact_dir,
+                update_target,
+                service_manager,
+            ) {
+                let _ = self.fail_hub_update(update_id, "Hub artifact application failed");
+                let _ = self.restore_hub_update_target(update_target);
+                return Err(error);
+            }
+            // Restart is deliberately delegated to one fixed service manager;
+            // completion is reconciled after the next Hub process generation
+            // records its runtime proof. This request never asserts health.
+            if let Err(error) = self.request_hub_restart(service_manager) {
+                let _ = self.fail_hub_update(update_id, "Hub restart request failed");
+                let _ = self.restore_hub_update_target(update_target);
+                return Err(error);
+            }
+        }
+        self.reconcile_server_fleet_update(update_id, update_target)
+    }
+
+    pub(crate) fn reconcile_server_fleet_update(
+        &self,
+        update_id: &str,
+        update_target: Option<&PathBuf>,
+    ) -> HubResult<FleetUpdateRun> {
+        self.reconcile_collector_update_commands(update_id)?;
+        let update = self.fleet_update(update_id)?;
+        if update.status == "hub-updating" {
+            let update = self.record_hub_health_server(update_id)?;
+            if update.status != "collectors-queued" {
+                if update.status == "failed" {
+                    self.restore_hub_update_target(update_target)?;
+                }
+                return Ok(update);
+            }
+        }
+        let update = self.fleet_update(update_id)?;
+        if update.status == "collectors-queued" {
+            for node in update.nodes.iter().filter(|node| node.status == "queued") {
+                self.start_collector_update(update_id, &node.machine_id)?;
+            }
+        }
+        self.finish_update_if_terminal(update_id)
+    }
+
+    fn apply_hub_update_artifact(
+        &self,
+        update: &FleetUpdateRun,
+        artifact_dir: Option<&PathBuf>,
+        update_target: Option<&PathBuf>,
+        service_manager: Option<&str>,
+    ) -> HubResult<()> {
+        let (Some(artifact_dir), Some(update_target), Some(_)) =
+            (artifact_dir, update_target, service_manager)
+        else {
+            return Err(HubError::forbidden(
+                "fleet-runtime-required",
+                "server-owned fleet updates require configured local artifact and service-manager trust",
+            ));
+        };
+        let artifact_path = artifact_dir.join(format!("{}.artifact", update.version));
+        let artifact = fs::read(&artifact_path).map_err(|_| {
+            HubError::unprocessable(
+                "fleet-artifact-unavailable",
+                "the configured signed artifact is unavailable",
+            )
+        })?;
+        let digest = hex::encode(Sha256::digest(&artifact));
+        if !digest.eq_ignore_ascii_case(&update.artifact_sha256) {
+            return Err(HubError::unprocessable(
+                "fleet-artifact-mismatch",
+                "the configured artifact does not match the verified publisher plan",
+            ));
+        }
+        let parent = update_target.parent().ok_or_else(|| {
+            HubError::unprocessable("fleet-runtime-invalid", "Hub update target has no parent")
+        })?;
+        fs::create_dir_all(parent).map_err(HubError::internal)?;
+        let backup = update_target.with_extension("previous");
+        if update_target.exists() {
+            fs::copy(update_target, &backup).map_err(HubError::internal)?;
+        }
+        let temporary = parent.join(format!(".fleet-{}.tmp", random_token(8)));
+        fs::write(&temporary, artifact).map_err(HubError::internal)?;
+        fs::rename(&temporary, update_target).map_err(HubError::internal)?;
+        Ok(())
+    }
+
+    fn reconcile_collector_update_commands(&self, update_id: &str) -> HubResult<()> {
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let update: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT status, version, artifact_sha256 FROM fleet_update_runs WHERE update_id = ?1",
+                params![update_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((status, version, sha256)) = update else {
+            return Err(HubError::not_found(
+                "update-not-found",
+                "fleet update was not found",
+            ));
+        };
+        if status != "collectors-queued" {
+            tx.commit().map_err(HubError::internal)?;
+            return Ok(());
+        }
+        let nodes = tx
+            .prepare("SELECT machine_id FROM fleet_update_nodes WHERE update_id = ?1 AND status = 'updating'")
+            .map_err(HubError::internal)?
+            .query_map(params![update_id], |row| row.get::<_, String>(0))
+            .map_err(HubError::internal)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(HubError::internal)?;
+        for machine_id in nodes {
+            let command_id = fleet_update_command_id(&update_id, &machine_id);
+            let command = OwnerCommand::ApprovedUpdate {
+                command_id: command_id.clone(),
+                update_id: update_id.clone(),
+                version: version.clone(),
+                sha256: sha256.clone(),
+            };
+            let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO collector_commands(command_id, machine_id, command_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![command_id, machine_id, command_json, now_utc()],
+            )
+            .map_err(HubError::internal)?;
+        }
+        tx.commit().map_err(HubError::internal)?;
+        self.command_notify.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn restore_hub_update_target(
+        &self,
+        update_target: Option<&PathBuf>,
+    ) -> HubResult<()> {
+        let Some(update_target) = update_target else {
+            return Ok(());
+        };
+        let backup = update_target.with_extension("previous");
+        if backup.exists() {
+            fs::rename(backup, update_target).map_err(HubError::internal)?;
+        }
+        Ok(())
+    }
+
+    fn request_hub_restart(&self, service_manager: Option<&str>) -> HubResult<()> {
+        match service_manager {
+            Some("systemd-user") => {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", "dirtydash-hub.service"])
+                        .status();
+                });
+                Ok(())
+            }
+            Some("launchd") => {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let domain = format!("gui/{}", unsafe { libc::geteuid() });
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["kickstart", "-k", &format!("{domain}/dev.dirtydash.hub")])
+                        .status();
+                });
+                Ok(())
+            }
+            _ => Err(HubError::forbidden(
+                "fleet-runtime-required",
+                "Hub restart requires a configured fixed service manager",
+            )),
+        }
+    }
+
+    fn fail_hub_update(&self, update_id: &str, reason: &str) -> HubResult<FleetUpdateRun> {
+        let now = now_utc();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE fleet_update_runs SET status = 'failed', failure_reason = ?2, completed_at = ?3, state_revision = state_revision + 1 WHERE update_id = ?1 AND status IN ('planned', 'hub-updating')",
+            params![update_id, reason, now],
+        )
+        .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE machines SET desired_version = (SELECT previous_desired_version FROM fleet_update_nodes n WHERE n.update_id = ?1 AND n.machine_id = machines.machine_id), state_revision = state_revision + 1 WHERE machine_id IN (SELECT machine_id FROM fleet_update_nodes WHERE update_id = ?1) AND archived_at IS NULL",
+            params![update_id],
+        )
+        .map_err(HubError::internal)?;
+        tx.commit().map_err(HubError::internal)?;
+        self.fleet_update(update_id)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn record_hub_health(
         &self,
         update_id: &str,
@@ -942,116 +1363,175 @@ impl HubRepository {
         update_id: &str,
         machine_id: &str,
     ) -> HubResult<MachineActionResponse> {
-        let update = self.fleet_update(update_id)?;
-        if update.status != "collectors-queued" {
-            return Err(HubError::conflict(
-                "collector-update-order",
-                "Collectors can update only after the Hub health gate succeeds",
-            ));
-        }
-        let node = update
-            .nodes
-            .iter()
-            .find(|node| node.machine_id == machine_id)
-            .ok_or_else(|| {
-                HubError::not_found("update-machine-not-found", "Machine is not in this update")
-            })?;
-        if node.status != "queued" {
-            return Err(HubError::conflict(
-                "collector-update-state",
-                "Collector update is already running or complete",
-            ));
-        }
-        let machine = self.machine(machine_id)?;
-        if !ProtocolCompatibility::for_version(machine.collector_protocol_version).is_supported() {
-            return Err(HubError::conflict(
-                "incompatible-collector-protocol",
-                "Collector is outside the current/previous compatibility window",
-            ));
-        }
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let machine_id = validate_identifier(machine_id, "machine_id")?;
         let now = now_utc();
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let mut conn = self.db.connection().map_err(HubError::internal)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(HubError::internal)?;
-        let changed = tx
-            .execute(
-                r#"UPDATE fleet_update_nodes SET status = 'updating', snapshot_at = ?3,
-                    update_started_at = ?3, attempts = attempts + 1, state_revision = state_revision + 1
-                    WHERE update_id = ?1 AND machine_id = ?2 AND status = 'queued'"#,
-                params![update_id, machine_id, now],
+        let update: Option<(String, String)> = tx
+            .query_row(
+                "SELECT status, version FROM fleet_update_runs WHERE update_id = ?1",
+                params![update_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(HubError::internal)?;
-        if changed == 0 {
+        let Some((update_status, version)) = update else {
+            return Err(HubError::not_found(
+                "update-not-found",
+                "fleet update was not found",
+            ));
+        };
+        if update_status != "collectors-queued" {
             return Err(HubError::conflict(
-                "collector-update-state",
-                "Collector update was changed concurrently",
+                "collector-update-order",
+                "Collectors can update only after the Hub health gate succeeds",
             ));
         }
-        tx.commit().map_err(HubError::internal)?;
-        drop(_guard);
-        let update = self.fleet_update(update_id)?;
-        let command = update
-            .nodes
-            .iter()
-            .find(|entry| entry.machine_id == machine_id)
-            .map(|_| OwnerCommand::ApprovedUpdate {
-                command_id: command_id("update"),
-                version: update.version.clone(),
-                sha256: update.artifact_sha256.clone(),
-            })
-            .expect("node was checked above");
-        let issued = match self.issue_collector_command(IssueCollectorCommandRequest {
-            machine_id: machine_id.to_string(),
-            command,
-            expected_state_revision: Some(machine.state_revision),
-        }) {
-            Ok(issued) => issued,
-            Err(error) => {
-                self.fail_collector_update_start(
-                    update_id,
-                    machine_id,
-                    "Collector command could not be issued; retry after reloading Machine state",
-                )?;
-                return Err(error);
-            }
+        let node: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT status, state_revision FROM fleet_update_nodes WHERE update_id = ?1 AND machine_id = ?2",
+                params![update_id, machine_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((node_status, node_revision)) = node else {
+            return Err(HubError::not_found(
+                "update-machine-not-found",
+                "Machine is not in this update",
+            ));
         };
+        let machine: Option<FleetMachineStateRow> = tx
+            .query_row(
+                "SELECT revoked_at, archived_at, collector_protocol_version, state_revision FROM machines WHERE machine_id = ?1",
+                params![machine_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((revoked_at, archived_at, protocol, machine_revision)) = machine else {
+            return Err(HubError::not_found(
+                "machine-not-found",
+                "Machine was not found",
+            ));
+        };
+        if revoked_at.is_some() || archived_at.is_some() {
+            return Err(HubError::conflict(
+                "machine-archived",
+                "archived Machines cannot receive updates",
+            ));
+        }
+        if !ProtocolCompatibility::for_version(protocol).is_supported() {
+            return Err(HubError::conflict(
+                "incompatible-collector-protocol",
+                "Collector is outside the current/previous compatibility window",
+            ));
+        }
+        let command_id = fleet_update_command_id(&update_id, &machine_id);
+        let command = OwnerCommand::ApprovedUpdate {
+            command_id: command_id.clone(),
+            update_id: update_id.clone(),
+            version,
+            sha256: tx
+                .query_row(
+                    "SELECT artifact_sha256 FROM fleet_update_runs WHERE update_id = ?1",
+                    params![update_id],
+                    |row| row.get(0),
+                )
+                .map_err(HubError::internal)?,
+        };
+        let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
+        if command_json.len() > 4096 {
+            return Err(HubError::unprocessable(
+                "collector-command-too-large",
+                "Collector update command is outside the typed protocol bound",
+            ));
+        }
+        let existing_command: Option<String> = tx
+            .query_row(
+                "SELECT command_json FROM collector_commands WHERE command_id = ?1",
+                params![command_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        if let Some(existing_command) = existing_command {
+            if existing_command != command_json {
+                return Err(HubError::conflict(
+                    "collector-command-conflict",
+                    "deterministic update command is already bound to different data",
+                ));
+            }
+            if node_status == "updating" {
+                tx.commit().map_err(HubError::internal)?;
+                return Ok(MachineActionResponse {
+                    machine_id,
+                    command_id,
+                    action: "update".to_string(),
+                    state_revision: machine_revision,
+                });
+            }
+        } else if node_status != "queued" {
+            return Err(HubError::conflict(
+                "collector-update-state",
+                "Collector update is already running or complete",
+            ));
+        }
+        if node_status == "queued" {
+            tx.execute(
+                "INSERT INTO collector_commands(command_id, machine_id, command_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![command_id, machine_id, command_json, now],
+            )
+            .map_err(HubError::internal)?;
+            let node_changed = tx
+                .execute(
+                    "UPDATE fleet_update_nodes SET status = 'updating', snapshot_at = ?3, update_started_at = ?3, attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND machine_id = ?2 AND status = 'queued' AND state_revision = ?4",
+                    params![update_id, machine_id, now, node_revision],
+                )
+                .map_err(HubError::internal)?;
+            if node_changed == 0 {
+                return Err(HubError::conflict(
+                    "collector-update-state",
+                    "Collector update was changed concurrently",
+                ));
+            }
+            let machine_changed = tx
+                .execute(
+                    "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND state_revision = ?2 AND archived_at IS NULL AND revoked_at IS NULL",
+                    params![machine_id, machine_revision],
+                )
+                .map_err(HubError::internal)?;
+            if machine_changed == 0 {
+                return Err(HubError::conflict(
+                    "machine-state-conflict",
+                    "Machine changed while starting its update",
+                ));
+            }
+            tx.execute(
+                "UPDATE fleet_update_runs SET attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1",
+                params![update_id],
+            )
+            .map_err(HubError::internal)?;
+        }
+        tx.commit().map_err(HubError::internal)?;
+        self.command_notify.notify_one();
         Ok(MachineActionResponse {
-            machine_id: issued.machine_id,
-            command_id: issued.command_id,
+            machine_id,
+            command_id,
             action: "update".to_string(),
-            state_revision: self.machine(machine_id)?.state_revision,
+            state_revision: if node_status == "queued" {
+                machine_revision + 1
+            } else {
+                machine_revision
+            },
         })
     }
 
-    fn fail_collector_update_start(
-        &self,
-        update_id: &str,
-        machine_id: &str,
-        failure_reason: &str,
-    ) -> HubResult<()> {
-        let now = now_utc();
-        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
-        let conn = self.db.connection().map_err(HubError::internal)?;
-        let changed = conn
-            .execute(
-                r#"UPDATE fleet_update_nodes
-                   SET status = 'rolled-back', rolled_back_at = ?3,
-                       failure_reason = ?4, state_revision = state_revision + 1
-                   WHERE update_id = ?1 AND machine_id = ?2 AND status = 'updating'"#,
-                params![update_id, machine_id, now, failure_reason],
-            )
-            .map_err(HubError::internal)?;
-        if changed == 0 {
-            return Err(HubError::conflict(
-                "collector-update-state",
-                "Collector update state changed while recording command failure",
-            ));
-        }
-        Ok(())
-    }
-
+    #[allow(dead_code)]
     pub(crate) fn complete_collector_update(
         &self,
         update_id: &str,
@@ -1077,7 +1557,6 @@ impl HubRepository {
         let successful = request.restarted
             && request.health_checked
             && request.collector_version == update.version
-            && request.signed_evidence.signature_verified
             && request.signed_evidence.version == update.version
             && protocol.is_supported();
         let now = now_utc();
@@ -1142,13 +1621,19 @@ impl HubRepository {
                     "Machine was archived while completing its update",
                 ));
             }
+        } else {
+            tx.execute(
+                "UPDATE machines SET desired_version = (SELECT previous_desired_version FROM fleet_update_nodes WHERE update_id = ?1 AND machine_id = ?2), state_revision = state_revision + 1 WHERE machine_id = ?2 AND archived_at IS NULL",
+                params![update_id, machine_id],
+            )
+            .map_err(HubError::internal)?;
         }
         tx.commit().map_err(HubError::internal)?;
         drop(_guard);
         self.finish_update_if_terminal(update_id)
     }
 
-    fn finish_update_if_terminal(&self, update_id: &str) -> HubResult<FleetUpdateRun> {
+    pub(crate) fn finish_update_if_terminal(&self, update_id: &str) -> HubResult<FleetUpdateRun> {
         let update = self.fleet_update(update_id)?;
         if update
             .nodes
@@ -1172,6 +1657,7 @@ impl HubRepository {
         self.fleet_update(update_id)
     }
 
+    #[allow(dead_code)]
     fn validate_evidence(&self, update_id: &str, evidence: &FleetUpdateEvidence) -> HubResult<()> {
         let update = self.fleet_update(update_id)?;
         if evidence.version != update.version
@@ -1183,7 +1669,7 @@ impl HubRepository {
             || !evidence
                 .manifest_sha256
                 .eq_ignore_ascii_case(&update.manifest_sha256)
-            || !evidence.signature_verified
+            || !evidence.publisher_verified
         {
             return Err(HubError::unprocessable(
                 "signed-update-evidence-mismatch",
@@ -1406,22 +1892,24 @@ fn update_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetUpdateR
 }
 
 fn update_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetUpdateNode> {
-    let evidence_json: Option<String> = row.get(11)?;
+    let evidence_json: Option<String> = row.get(13)?;
     Ok(FleetUpdateNode {
         update_id: row.get(0)?,
         machine_id: row.get(1)?,
         status: row.get(2)?,
         previous_version: row.get(3)?,
-        snapshot_at: row.get(4)?,
-        update_started_at: row.get(5)?,
-        restarted_at: row.get(6)?,
-        health_checked_at: row.get(7)?,
-        rolled_back_at: row.get(8)?,
-        failure_reason: row.get(9)?,
-        collector_protocol_version: row.get(10)?,
-        evidence: evidence_json.and_then(|value| serde_json::from_str(&value).ok()),
-        attempts: row.get(12)?,
-        state_revision: row.get(13)?,
+        previous_desired_version: row.get(4)?,
+        previous_runtime_generation: row.get(5)?,
+        snapshot_at: row.get(6)?,
+        update_started_at: row.get(7)?,
+        restarted_at: row.get(8)?,
+        health_checked_at: row.get(9)?,
+        rolled_back_at: row.get(10)?,
+        failure_reason: row.get(11)?,
+        collector_protocol_version: row.get(12)?,
+        receipt: evidence_json.and_then(|value| serde_json::from_str(&value).ok()),
+        attempts: row.get(14)?,
+        state_revision: row.get(15)?,
     })
 }
 
@@ -1506,8 +1994,10 @@ impl<E: FleetUpdateExecutor> FleetUpdateCoordinator<E> {
         self.execute_evidence(&evidence, target_version, nodes)
     }
 
-    #[cfg(test)]
-    pub(crate) fn execute_for_test(
+    /// Execute an already server-verified plan. Production callers obtain
+    /// `FleetUpdateEvidence` only from a configured publisher policy; this
+    /// method is also the seam used by deterministic executor tests.
+    pub fn execute_verified_evidence(
         &mut self,
         evidence: &FleetUpdateEvidence,
         target_version: &str,
@@ -1522,7 +2012,7 @@ impl<E: FleetUpdateExecutor> FleetUpdateCoordinator<E> {
         target_version: &str,
         nodes: &[FleetUpdateRequestNode],
     ) -> AnyResult<FleetUpdateReport> {
-        if !evidence.signature_verified || evidence.version != target_version {
+        if !evidence.publisher_verified || evidence.version != target_version {
             bail!("fleet update requires signed evidence for the requested version");
         }
         self.executor.snapshot_hub(evidence)?;

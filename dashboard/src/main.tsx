@@ -16,7 +16,8 @@ import {
   Settings,
   ShieldCheck,
   Terminal,
-  Zap
+  Zap,
+  type LucideIcon
 } from "lucide-react";
 import "./styles.css";
 
@@ -139,7 +140,7 @@ const workspaces: {
   label: string;
   command: string;
   tabs: string[];
-  icon: React.ComponentType<{ size?: number; "aria-hidden"?: string | boolean }>;
+  icon: LucideIcon;
 }[] = [
   { id: "ledger", label: "Ledger", command: "daily", tabs: ["daily", "sessions", "inspector"], icon: Gauge },
   { id: "sources", label: "Sources", command: "matrix", tabs: ["matrix", "imports", "freshness"], icon: HardDrive },
@@ -233,8 +234,10 @@ function App() {
     async function loadDaySessions() {
       setDayLoading(true);
       try {
+        const day = selectedDay;
+        if (!day) return;
         const rows = await fetchJson<SessionSummary[]>(
-          `/api/days/${encodeURIComponent(selectedDay)}/sessions`
+          `/api/days/${encodeURIComponent(day)}/sessions`
         );
         if (active) {
           setDaySessions(rows);
@@ -350,6 +353,7 @@ function App() {
     }
 
     function onKeyDown(event: KeyboardEvent) {
+      if (document.querySelector('[aria-modal="true"]')) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       // Keep native Tab order. Workspace tablists implement roving focus for
       // arrow/Home/End while Tab remains the user's escape hatch through the
@@ -491,7 +495,7 @@ function App() {
         </div>
       </aside>
 
-      <section className="dashboard">
+      <section className="dashboard" aria-busy={loading}>
         <header className="command-bar">
           <div className="command-line" aria-label="Command context">
             <span className="prompt">:</span>
@@ -531,6 +535,7 @@ function App() {
             </div>
           </div>
           <Tabs
+            workspaceId={activeWorkspace}
             tabs={activeConfig.tabs}
             activeTab={activeTab}
             onSelect={(tab) =>
@@ -542,6 +547,14 @@ function App() {
         {loading ? <Skeleton /> : null}
         {error ? <Notice tone="danger" text={error} /> : null}
         {!loading && !error ? (
+          <section
+            id={`workspace-panel-${activeWorkspace}-${activeTab}`}
+            role="tabpanel"
+            tabIndex={0}
+            aria-labelledby={`workspace-tab-${activeWorkspace}-${activeTab}`}
+            aria-busy={loading}
+            className="workspace-panel"
+          >
           <Workspace
             activeWorkspace={activeWorkspace}
             activeTab={activeTab}
@@ -565,6 +578,7 @@ function App() {
             pricing={pricing}
             doctor={doctor}
           />
+          </section>
         ) : null}
       </section>
 
@@ -1427,10 +1441,12 @@ function DoctorOps({ doctor }: { doctor: DoctorReport | null }) {
 }
 
 function Tabs({
+  workspaceId,
   tabs,
   activeTab,
   onSelect
 }: {
+  workspaceId: WorkspaceId;
   tabs: string[];
   activeTab: string;
   onSelect: (tab: string) => void;
@@ -1470,9 +1486,11 @@ function Tabs({
         {tabs.map((tab, index) => (
           <button
             key={tab}
-            ref={(element) => { tabRefs.current[index] = element; }}
+            id={`workspace-tab-${workspaceId}-${tab}`}
+            ref={(element: HTMLButtonElement | null) => { tabRefs.current[index] = element; }}
             type="button"
             role="tab"
+            aria-controls={activeTab === tab ? `workspace-panel-${workspaceId}-${tab}` : undefined}
             aria-selected={activeTab === tab}
             tabIndex={activeTab === tab ? 0 : -1}
             className={activeTab === tab ? "active" : ""}
@@ -1515,7 +1533,7 @@ function Status({ value, tone }: { value: string; tone: Tone }) {
   return <span className={`status ${tone}`}>{value}</span>;
 }
 
-function Notice({ text, tone }: { text: string; tone: "good" | "warn" | "danger" }) {
+function Notice({ text, tone }: { text: string; tone: "good" | "warn" | "danger"; key?: React.Key }) {
   return <div className={`notice ${tone}`}>{text}</div>;
 }
 
@@ -1630,7 +1648,7 @@ function ShortcutOverlay({ onClose }: { onClose: () => void }) {
 
 function Skeleton() {
   return (
-    <div className="ledger-grid">
+    <div className="ledger-grid" role="status" aria-live="polite" aria-label="Loading dashboard">
       <div className="skeleton pane" />
       <div className="skeleton pane" />
       <div className="skeleton pane" />

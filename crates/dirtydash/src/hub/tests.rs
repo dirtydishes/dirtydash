@@ -135,6 +135,7 @@ fn ingest_request(protocol_version: u32) -> IngestBatchRequest {
         sync_run: SyncRunInput {
             sync_run_id: "sync-1".to_string(),
             collector_version: Some("collector-1.0.0".to_string()),
+            runtime_generation: None,
             started_at: "2026-03-09T09:59:00Z".to_string(),
             finished_at: "2026-03-09T10:01:00Z".to_string(),
         },
@@ -999,7 +1000,7 @@ async fn collector_rotation_uses_non_secret_instruction_and_secret_free_hub_pers
                 .body(Body::from(
                     json!({
                         "command_id": "rotation-command",
-                        "result": {"credential_token": replacement_secret}
+                        "result": {"type": "rejected", "reason": "credential token rejected"}
                     })
                     .to_string(),
                 ))
@@ -1019,7 +1020,7 @@ async fn collector_rotation_uses_non_secret_instruction_and_secret_free_hub_pers
                 .body(Body::from(
                     json!({
                         "command_id": "rotation-command",
-                        "result": {"status": "rotation-staged"}
+                        "result": {"type": "credential-rotation-staged"}
                     })
                     .to_string(),
                 ))
@@ -2192,7 +2193,7 @@ async fn collector_command_endpoints_poll_and_ack_typed_owner_commands() {
                 .body(Body::from(
                     json!({
                         "command_id": "command-refresh-1",
-                        "result": {"status": "queued"}
+                        "result": {"type": "refreshed", "batch_id": null}
                     })
                     .to_string(),
                 ))
@@ -2216,7 +2217,7 @@ async fn collector_command_endpoints_poll_and_ack_typed_owner_commands() {
                 .body(Body::from(
                     json!({
                         "command_id": "command-refresh-1",
-                        "result": {"status": "queued"}
+                        "result": {"type": "refreshed", "batch_id": null}
                     })
                     .to_string(),
                 ))
@@ -2240,7 +2241,7 @@ async fn collector_command_endpoints_poll_and_ack_typed_owner_commands() {
                 .body(Body::from(
                     json!({
                         "command_id": "command-refresh-1",
-                        "result": {"status": "different"}
+                        "result": {"type": "repaired", "batch_id": null}
                     })
                     .to_string(),
                 ))
@@ -2248,7 +2249,7 @@ async fn collector_command_endpoints_poll_and_ack_typed_owner_commands() {
         )
         .await
         .unwrap();
-    assert_eq!(conflicting_ack.status(), StatusCode::CONFLICT);
+    assert_eq!(conflicting_ack.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -2314,7 +2315,7 @@ async fn collector_long_poll_wakes_without_holding_database_lock() {
                     format!("Bearer {}", credential.token),
                 )
                 .body(Body::from(
-                    json!({"command_id": "wake-1", "result": {"status": "done"}}).to_string(),
+                    json!({"command_id": "wake-1", "result": {"type": "diagnostics", "diagnostics": {"machine_id": "machine-a", "parser_versions": [], "pending_outbox": 0, "last_reconciliation_at": null, "watcher": {"enabled": true, "degraded": false, "last_error": null, "hint_pending": false, "debounce_until": null, "next_reconciliation_at": "2026-07-15T00:00:00Z"}, "credential_configured": true, "credential_rotation_pending": false, "terminal_outbox": 0, "outbox_diagnostics": []}}}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -2584,7 +2585,7 @@ fn update_evidence() -> FleetUpdateEvidence {
         publisher_key_id: "release-key".to_string(),
         publisher_fingerprint: format!("sha256:{}", "b".repeat(64)),
         manifest_sha256: "c".repeat(64),
-        signature_verified: true,
+        publisher_verified: true,
     }
 }
 
@@ -2778,7 +2779,7 @@ fn fleet_coordinator_snapshots_hub_first_and_rolls_back_one_node_only() {
         ..Default::default()
     });
     let report = coordinator
-        .execute_for_test(
+        .execute_verified_evidence(
             &evidence,
             "2.0.0",
             &[

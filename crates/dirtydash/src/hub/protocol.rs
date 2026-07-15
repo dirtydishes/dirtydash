@@ -34,6 +34,12 @@ pub(crate) fn validate_ingest_batch(
             .as_deref()
             .map(|value| validate_non_empty(value, "collector_version"))
             .transpose()?,
+        runtime_generation: request
+            .sync_run
+            .runtime_generation
+            .as_deref()
+            .map(|value| validate_identifier(value, "runtime_generation"))
+            .transpose()?,
         started_at: normalize_utc_timestamp(&request.sync_run.started_at)?,
         finished_at: normalize_utc_timestamp(&request.sync_run.finished_at)?,
     };
@@ -202,16 +208,6 @@ pub(crate) fn validate_command_has_no_secret(value: &serde_json::Value) -> Resul
         return Err(HubError::unprocessable(
             "collector-command-secret-forbidden",
             "collector commands must contain only non-secret rotation instructions",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_ack_result_has_no_secret(value: &serde_json::Value) -> Result<(), HubError> {
-    if command_value_contains_secret(value, true) {
-        return Err(HubError::unprocessable(
-            "collector-command-secret-forbidden",
-            "collector command acknowledgements must not contain credentials",
         ));
     }
     Ok(())

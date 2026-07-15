@@ -112,20 +112,12 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
         .route("/api/v1/admin/updates/:update_id", get(admin_get_update))
         .route("/api/v1/admin/updates/plan", post(admin_plan_update))
         .route(
-            "/api/v1/admin/updates/:update_id/snapshot",
-            post(admin_snapshot_update),
+            "/api/v1/admin/updates/:update_id/execute",
+            post(admin_execute_update),
         )
         .route(
-            "/api/v1/admin/updates/:update_id/health",
-            post(admin_health_update),
-        )
-        .route(
-            "/api/v1/admin/updates/:update_id/collectors/:machine_id/start",
-            post(admin_start_collector_update),
-        )
-        .route(
-            "/api/v1/admin/updates/:update_id/collectors/:machine_id/complete",
-            post(admin_complete_collector_update),
+            "/api/v1/admin/updates/:update_id/reconcile",
+            post(admin_reconcile_update),
         )
         .route(
             "/api/v1/admin/enrollment",
@@ -160,6 +152,10 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             post(admin_enrollment_execute),
         )
         .route(
+            "/api/v1/admin/enrollment/:enrollment_id/cleanup",
+            post(admin_enrollment_cleanup),
+        )
+        .route(
             "/api/v1/admin/enrollments/:enrollment_id/trust",
             post(admin_enrollment_trust),
         )
@@ -175,10 +171,18 @@ pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) ->
             "/api/v1/admin/enrollments/:enrollment_id/execute",
             post(admin_enrollment_execute),
         )
+        .route(
+            "/api/v1/admin/enrollments/:enrollment_id/cleanup",
+            post(admin_enrollment_cleanup),
+        )
         .route("/api/v1/collector/commands", get(collector_poll_command))
         .route(
             "/api/v1/collector/commands/ack",
             post(collector_ack_command),
+        )
+        .route(
+            "/api/v1/collector/updates/receipt",
+            post(collector_update_receipt),
         )
         .route(
             "/api/v1/collector/credentials/rotation/activate",
@@ -519,48 +523,29 @@ async fn admin_plan_update(
     Ok(Json(state.repo.create_fleet_update(request)?))
 }
 
-async fn admin_snapshot_update(
+async fn admin_execute_update(
     State(state): State<HubState>,
     headers: HeaderMap,
     AxumPath(update_id): AxumPath<String>,
-    Json(evidence): Json<FleetUpdateEvidence>,
-) -> Result<Json<FleetUpdateSnapshotResponse>, HubError> {
-    let _session = require_owner_session(&state, &headers, true)?;
-    Ok(Json(state.repo.record_hub_snapshot(&update_id, &evidence)?))
-}
-
-async fn admin_health_update(
-    State(state): State<HubState>,
-    headers: HeaderMap,
-    AxumPath(update_id): AxumPath<String>,
-    Json(request): Json<FleetHubHealthRequest>,
 ) -> Result<Json<FleetUpdateRun>, HubError> {
     let _session = require_owner_session(&state, &headers, true)?;
-    Ok(Json(state.repo.record_hub_health(&update_id, request)?))
-}
-
-async fn admin_start_collector_update(
-    State(state): State<HubState>,
-    headers: HeaderMap,
-    AxumPath((update_id, machine_id)): AxumPath<(String, String)>,
-) -> Result<Json<MachineActionResponse>, HubError> {
-    let _session = require_owner_session(&state, &headers, true)?;
-    Ok(Json(
-        state.repo.start_collector_update(&update_id, &machine_id)?,
-    ))
-}
-
-async fn admin_complete_collector_update(
-    State(state): State<HubState>,
-    headers: HeaderMap,
-    AxumPath((update_id, machine_id)): AxumPath<(String, String)>,
-    Json(request): Json<FleetUpdateNodeCompletion>,
-) -> Result<Json<FleetUpdateRun>, HubError> {
-    let _session = require_owner_session(&state, &headers, true)?;
-    Ok(Json(state.repo.complete_collector_update(
+    Ok(Json(state.repo.execute_server_fleet_update(
         &update_id,
-        &machine_id,
-        request,
+        state.config.fleet_update_artifact_dir.as_ref(),
+        state.config.fleet_update_target.as_ref(),
+        state.config.fleet_update_service_manager.as_deref(),
+    )?))
+}
+
+async fn admin_reconcile_update(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(update_id): AxumPath<String>,
+) -> Result<Json<FleetUpdateRun>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    Ok(Json(state.repo.reconcile_server_fleet_update(
+        &update_id,
+        state.config.fleet_update_target.as_ref(),
     )?))
 }
 
@@ -845,6 +830,26 @@ async fn admin_enrollment_review(
         .map_err(|error| HubError::internal(error.to_string()))
 }
 
+async fn admin_enrollment_cleanup(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    AxumPath(enrollment_id): AxumPath<String>,
+    Json(request): Json<EnrollmentStepRequest>,
+) -> Result<Json<EnrollmentDraft>, HubError> {
+    let _session = require_owner_session(&state, &headers, true)?;
+    let draft = enrollment_store(&state)
+        .load(&enrollment_id)
+        .map_err(|error| HubError::not_found("enrollment-not-found", error.to_string()))?;
+    let mut workflow = enrollment_workflow(&state, &draft)?;
+    workflow
+        .retry_cleanup(&enrollment_id, &request.secrets.materialize())
+        .map_err(enrollment_step_error)?;
+    enrollment_store(&state)
+        .load(&enrollment_id)
+        .map(Json)
+        .map_err(|error| HubError::internal(error.to_string()))
+}
+
 async fn admin_enrollment_execute(
     State(state): State<HubState>,
     headers: HeaderMap,
@@ -924,6 +929,17 @@ async fn collector_ack_command(
     let auth = collector_auth(&state.repo, &headers)?;
     state.repo.acknowledge_collector_command(&auth, request)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn collector_update_receipt(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorUpdateReceiptRequest>,
+) -> Result<Json<FleetUpdateRun>, HubError> {
+    let auth = collector_auth(&state.repo, &headers)?;
+    Ok(Json(
+        state.repo.record_collector_update_receipt(&auth, request)?,
+    ))
 }
 
 async fn collector_activate_credential_rotation(
@@ -1118,12 +1134,20 @@ fn trusted_tailscale_identity(
     match config.trust_mode {
         ListenerTrustMode::Public | ListenerTrustMode::LoopbackHttp => Ok(None),
         ListenerTrustMode::PrivateTailscale => {
-            // Production Hub sockets are loopback-only in private mode; the
-            // Tailscale Serve process is the transport-authenticated peer.
-            // Keep a missing peer usable for the in-process router seam, but
-            // never accept a forged header from a concrete non-loopback peer.
-            if peer.is_some_and(|peer| !peer.ip().is_loopback()) {
-                return Ok(None);
+            // Private mode is a transport-authenticated boundary.  A router
+            // without ConnectInfo is only an in-process composition seam and
+            // must never become a production identity-injection path.
+            let Some(peer) = peer else {
+                return Err(HubError::unauthorized(
+                    "trusted-tailscale-peer-required",
+                    "private Tailscale identity requires transport connection information",
+                ));
+            };
+            if !peer.ip().is_loopback() {
+                return Err(HubError::unauthorized(
+                    "trusted-tailscale-peer-untrusted",
+                    "private Tailscale requests must arrive through the loopback Serve boundary",
+                ));
             }
             let Some(login) = exact_header_value(headers, TAILSCALE_USER_LOGIN)? else {
                 return Ok(None);

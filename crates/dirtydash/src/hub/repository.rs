@@ -1,3 +1,4 @@
+use super::fleet::fleet_update_command_id;
 use super::*;
 use chrono::NaiveDate;
 use chrono_tz::Tz;
@@ -56,7 +57,7 @@ impl HubRepository {
             .map_err(HubError::internal)?;
         } else {
             tx.execute(
-                "INSERT INTO machines(machine_id, display_name, enrolled_at, last_seen_at, state_revision) VALUES (?1, ?2, ?3, ?3, 0)",
+                "INSERT INTO machines(machine_id, display_name, enrolled_at, last_seen_at, state_revision) VALUES (?1, ?2, ?3, ?3, 1)",
                 params![machine_id, display_name, now],
             )
             .map_err(HubError::internal)?;
@@ -93,8 +94,13 @@ impl HubRepository {
     ) -> Result<(), HubError> {
         let machine_id = validate_identifier(&request.machine_id, "machine_id")?;
         let credential_id = validate_identifier(&request.credential_id, "credential_id")?;
-        let conn = self.db.connection().map_err(HubError::internal)?;
-        let changed = conn
+        let now = now_utc();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let changed = tx
             .execute(
                 r#"
                 UPDATE collector_credentials
@@ -103,7 +109,7 @@ impl HubRepository {
                     AND credential_id = ?2
                     AND revoked_at IS NULL
                 "#,
-                params![machine_id, credential_id, now_utc()],
+                params![machine_id, credential_id, now],
             )
             .map_err(HubError::internal)?;
         if changed == 0 {
@@ -112,7 +118,19 @@ impl HubRepository {
                 "collector credential was not found or is already revoked",
             ));
         }
-        Ok(())
+        let machine_changed = tx
+            .execute(
+                "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL",
+                params![machine_id],
+            )
+            .map_err(HubError::internal)?;
+        if machine_changed == 0 {
+            return Err(HubError::not_found(
+                "machine-not-found",
+                "collector credential target Machine was not found",
+            ));
+        }
+        tx.commit().map_err(HubError::internal)
     }
 
     pub(crate) fn authenticate_collector_bearer(
@@ -285,6 +303,11 @@ impl HubRepository {
             params![rotation_id, auth.machine_id, auth.credential_id, label, now],
         )
         .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND revoked_at IS NULL AND archived_at IS NULL",
+            params![auth.machine_id],
+        )
+        .map_err(HubError::internal)?;
         tx.commit().map_err(HubError::internal)?;
         Ok(CollectorCredentialRotationResponse {
             machine_id,
@@ -365,6 +388,11 @@ impl HubRepository {
                 params![rotation_id, now],
             )
             .map_err(HubError::internal)?;
+            tx.execute(
+                "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND revoked_at IS NULL AND archived_at IS NULL",
+                params![auth.machine_id],
+            )
+            .map_err(HubError::internal)?;
         }
         tx.commit().map_err(HubError::internal)?;
         Ok(CollectorCredentialRotationResponse {
@@ -424,11 +452,19 @@ impl HubRepository {
         if newer_exists {
             return Ok(());
         }
-        tx.execute(
-            "UPDATE collector_credentials SET revoked_at = ?3 WHERE machine_id = ?1 AND credential_label = ?2 AND revoked_at IS NULL AND rowid < ?4",
-            params![machine_id, label, now_utc(), row_id],
-        )
-        .map_err(HubError::internal)?;
+        let revoked = tx
+            .execute(
+                "UPDATE collector_credentials SET revoked_at = ?3 WHERE machine_id = ?1 AND credential_label = ?2 AND revoked_at IS NULL AND rowid < ?4",
+                params![machine_id, label, now_utc(), row_id],
+            )
+            .map_err(HubError::internal)?;
+        if revoked > 0 {
+            tx.execute(
+                "UPDATE machines SET state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL",
+                params![machine_id],
+            )
+            .map_err(HubError::internal)?;
+        }
         Ok(())
     }
 
@@ -496,13 +532,14 @@ impl HubRepository {
         }
 
         tx.execute(
-            "UPDATE machines SET last_seen_at = ?2, last_sync_at = ?3, collector_version = ?4, collector_protocol_version = ?5 WHERE machine_id = ?1 AND archived_at IS NULL AND revoked_at IS NULL",
+            "UPDATE machines SET last_seen_at = ?2, last_sync_at = ?3, collector_version = ?4, collector_protocol_version = ?5, collector_runtime_generation = COALESCE(?6, collector_runtime_generation), state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL AND revoked_at IS NULL",
             params![
                 validated.machine_id,
                 committed_at,
                 validated.sync_run.finished_at,
                 validated.sync_run.collector_version,
                 validated.protocol_version,
+                validated.sync_run.runtime_generation,
             ],
         )
         .map_err(HubError::internal)?;
@@ -654,8 +691,18 @@ impl HubRepository {
                 validate_identifier(rotation_id, "rotation_id")?;
             }
             OwnerCommand::ApprovedUpdate {
-                version, sha256, ..
+                update_id,
+                version,
+                sha256,
+                ..
+            }
+            | OwnerCommand::RollbackUpdate {
+                update_id,
+                version,
+                sha256,
+                ..
             } => {
+                validate_identifier(update_id, "update_id")?;
                 if version.is_empty()
                     || !version.chars().all(|character| {
                         character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
@@ -678,6 +725,12 @@ impl HubRepository {
         let command = serde_json::to_value(&request.command).map_err(HubError::internal)?;
         validate_command_has_no_secret(&command)?;
         let command_json = serde_json::to_string(&command).map_err(HubError::internal)?;
+        if command_json.len() > 4096 {
+            return Err(HubError::unprocessable(
+                "collector-command-too-large",
+                "Collector commands are limited to the typed allowlist size",
+            ));
+        }
         let now = now_utc();
         let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let mut conn = self.db.connection().map_err(HubError::internal)?;
@@ -824,24 +877,24 @@ impl HubRepository {
         request: CollectorCommandAckRequest,
     ) -> Result<(), HubError> {
         let command_id = validate_identifier(&request.command_id, "command_id")?;
-        validate_ack_result_has_no_secret(&request.result)?;
+        request.result.validate()?;
         let result_json = serde_json::to_string(&request.result).map_err(HubError::internal)?;
-        let diagnostics_result = request
-            .result
-            .get("Diagnostics")
-            .or_else(|| request.result.get("diagnostics"))
-            .cloned();
+        let diagnostics_result = match &request.result {
+            CollectorCommandResult::Diagnostics { diagnostics } => Some(diagnostics.clone()),
+            _ => None,
+        };
         let write_guard = self.write_guard.lock().expect("hub write mutex poisoned");
         let conn = self.db.connection().map_err(HubError::internal)?;
         let existing = conn
             .query_row(
-                "SELECT machine_id, acknowledged_at, result_json FROM collector_commands WHERE command_id = ?1",
+                "SELECT machine_id, acknowledged_at, result_json, command_json FROM collector_commands WHERE command_id = ?1",
                 params![command_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -859,6 +912,21 @@ impl HubRepository {
                 "collector command was not found or belongs to another Machine",
             ));
         }
+        let command: OwnerCommand =
+            serde_json::from_str(&existing.3).map_err(HubError::internal)?;
+        if !request.result.matches_command(&command) {
+            return Err(HubError::unprocessable(
+                "collector-command-result-mismatch",
+                "Collector acknowledgement does not match the issued command",
+            ));
+        }
+        let rejected_update = match (&command, &request.result) {
+            (
+                OwnerCommand::ApprovedUpdate { update_id, .. },
+                CollectorCommandResult::Rejected { reason },
+            ) => Some((update_id.clone(), reason.clone())),
+            _ => None,
+        };
         if let Some(existing_result) = existing.2 {
             let same_result = serde_json::from_str::<serde_json::Value>(&existing_result).ok()
                 == serde_json::from_str::<serde_json::Value>(&result_json).ok();
@@ -872,24 +940,267 @@ impl HubRepository {
             // successful replay, not a not-found error.
             drop(conn);
             drop(write_guard);
+            if let Some((update_id, reason)) = rejected_update.as_ref() {
+                self.record_collector_update_rejection(auth, update_id, reason)?;
+            }
             self.prove_collector_credential(auth)?;
             return Ok(());
         }
-        conn.execute(
-            r#"
-            UPDATE collector_commands
-            SET acknowledged_at = ?3, result_json = ?4
-            WHERE command_id = ?1 AND machine_id = ?2 AND acknowledged_at IS NULL
-            "#,
-            params![command_id, auth.machine_id, now_utc(), result_json],
-        )
-        .map_err(HubError::internal)?;
+        let changed = conn
+            .execute(
+                r#"
+                UPDATE collector_commands
+                SET acknowledged_at = ?3, result_json = ?4
+                WHERE command_id = ?1 AND machine_id = ?2 AND acknowledged_at IS NULL
+                "#,
+                params![command_id, auth.machine_id, now_utc(), result_json],
+            )
+            .map_err(HubError::internal)?;
+        if changed == 0 {
+            return Err(HubError::conflict(
+                "collector-command-ack-conflict",
+                "collector command acknowledgement was changed concurrently",
+            ));
+        }
         drop(conn);
         drop(write_guard);
         if let Some(diagnostics) = diagnostics_result {
             self.record_collector_diagnostics(&auth.machine_id, &diagnostics)?;
         }
+        if let Some((update_id, reason)) = rejected_update.as_ref() {
+            self.record_collector_update_rejection(auth, update_id, reason)?;
+        }
         self.prove_collector_credential(auth)?;
+        Ok(())
+    }
+
+    fn record_collector_update_rejection(
+        &self,
+        auth: &AuthenticatedCollector,
+        update_id: &str,
+        reason: &str,
+    ) -> Result<(), HubError> {
+        let update_id = validate_identifier(update_id, "update_id")?;
+        let now = now_utc();
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let node: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT status, previous_desired_version FROM fleet_update_nodes WHERE update_id = ?1 AND machine_id = ?2",
+                params![update_id, auth.machine_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((status, previous_desired_version)) = node else {
+            return Err(HubError::not_found(
+                "update-machine-not-found",
+                "Collector rejection is not part of a fleet update",
+            ));
+        };
+        if matches!(status.as_str(), "succeeded" | "rolled-back") {
+            tx.commit().map_err(HubError::internal)?;
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE fleet_update_nodes SET status = 'rolled-back', rolled_back_at = ?3, failure_reason = ?4, attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND machine_id = ?2 AND status IN ('queued', 'updating')",
+            params![update_id, auth.machine_id, now, reason],
+        )
+        .map_err(HubError::internal)?;
+        tx.execute(
+            "UPDATE machines SET desired_version = ?2, state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL",
+            params![auth.machine_id, previous_desired_version],
+        )
+        .map_err(HubError::internal)?;
+        tx.commit().map_err(HubError::internal)?;
+        drop(_guard);
+        self.finish_update_if_terminal(&update_id).map(|_| ())
+    }
+
+    pub(crate) fn record_collector_update_receipt(
+        &self,
+        auth: &AuthenticatedCollector,
+        request: CollectorUpdateReceiptRequest,
+    ) -> std::result::Result<FleetUpdateRun, HubError> {
+        let receipt = request.receipt;
+        CollectorCommandResult::UpdateApplied {
+            update_id: receipt.update_id.clone(),
+            command_id: receipt.command_id.clone(),
+            version: receipt.version.clone(),
+            sha256: receipt.sha256.clone(),
+        }
+        .validate()?;
+        validate_update_receipt(&receipt)?;
+        Self::validate_update_receipt_timestamps(&receipt)?;
+        let _guard = self.write_guard.lock().expect("hub write mutex poisoned");
+        let mut conn = self.db.connection().map_err(HubError::internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(HubError::internal)?;
+        let update: Option<(String, String, String, String, String, String)> = tx
+            .query_row(
+                "SELECT version, artifact_sha256, status, publisher_key_id, publisher_fingerprint, manifest_sha256 FROM fleet_update_runs WHERE update_id = ?1",
+                params![receipt.update_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((version, sha256, status, _, _, _)) = update else {
+            return Err(HubError::not_found(
+                "update-not-found",
+                "fleet update was not found",
+            ));
+        };
+        if status != "collectors-queued" {
+            return Err(HubError::conflict(
+                "collector-update-order",
+                "Collector receipts are accepted only after the Hub health gate",
+            ));
+        }
+        if version != receipt.version || !sha256.eq_ignore_ascii_case(&receipt.sha256) {
+            return Err(HubError::unprocessable(
+                "collector-update-receipt-mismatch",
+                "Collector receipt does not match the signed fleet update",
+            ));
+        }
+        let expected_command_id = fleet_update_command_id(&receipt.update_id, &auth.machine_id);
+        if expected_command_id != receipt.command_id {
+            return Err(HubError::unprocessable(
+                "collector-update-receipt-mismatch",
+                "Collector receipt is not bound to the durable update command",
+            ));
+        }
+        let command_record: Option<(String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT machine_id, acknowledged_at, result_json FROM collector_commands WHERE command_id = ?1",
+                params![receipt.command_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((command_machine_id, acknowledged_at, result_json)) = command_record else {
+            return Err(HubError::conflict(
+                "collector-update-command-missing",
+                "Collector update receipt requires the durable command acknowledgement",
+            ));
+        };
+        if command_machine_id != auth.machine_id || acknowledged_at.is_none() {
+            return Err(HubError::conflict(
+                "collector-update-command-unacknowledged",
+                "Collector update receipt requires an acknowledged command for this Machine",
+            ));
+        }
+        let Some(result_json) = result_json else {
+            return Err(HubError::conflict(
+                "collector-update-command-unacknowledged",
+                "Collector update command has no authenticated result",
+            ));
+        };
+        let result: CollectorCommandResult =
+            serde_json::from_str(&result_json).map_err(HubError::internal)?;
+        let command_result_matches = matches!(
+            result,
+            CollectorCommandResult::UpdateApplied { ref update_id, ref command_id, ref version, ref sha256 }
+                if update_id == &receipt.update_id
+                    && command_id == &receipt.command_id
+                    && version == &receipt.version
+                    && sha256.eq_ignore_ascii_case(&receipt.sha256)
+        );
+        if !command_result_matches {
+            return Err(HubError::conflict(
+                "collector-update-command-result-mismatch",
+                "Collector update receipt does not match the authenticated command result",
+            ));
+        }
+        let node: Option<(String, i64, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT status, state_revision, previous_runtime_generation, evidence_json FROM fleet_update_nodes WHERE update_id = ?1 AND machine_id = ?2",
+                params![receipt.update_id, auth.machine_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(HubError::internal)?;
+        let Some((node_status, node_revision, previous_runtime_generation, previous_receipt)) =
+            node
+        else {
+            return Err(HubError::not_found(
+                "update-machine-not-found",
+                "Collector is not in this fleet update",
+            ));
+        };
+        if node_status == "succeeded" {
+            let same = previous_receipt
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<CollectorUpdateReceipt>(value).ok())
+                .is_some_and(|existing| existing == receipt);
+            if same {
+                tx.commit().map_err(HubError::internal)?;
+                return self.fleet_update(&receipt.update_id);
+            }
+            return Err(HubError::conflict(
+                "collector-update-receipt-conflict",
+                "Collector update receipt conflicts with the durable receipt",
+            ));
+        }
+        if previous_runtime_generation
+            .as_deref()
+            .is_some_and(|previous| previous == receipt.runtime_generation)
+        {
+            return Err(HubError::unprocessable(
+                "collector-update-receipt-mismatch",
+                "Collector receipt did not prove a new runtime generation",
+            ));
+        }
+        if node_status != "updating" {
+            return Err(HubError::conflict(
+                "collector-update-state",
+                "Collector update is not awaiting an authenticated receipt",
+            ));
+        }
+        let evidence_json = serde_json::to_string(&receipt).map_err(HubError::internal)?;
+        let now = now_utc();
+        let node_changed = tx
+            .execute(
+                "UPDATE fleet_update_nodes SET status = 'succeeded', restarted_at = ?3, health_checked_at = ?4, collector_protocol_version = ?5, evidence_json = ?6, attempts = attempts + 1, state_revision = state_revision + 1 WHERE update_id = ?1 AND machine_id = ?2 AND status = 'updating' AND state_revision = ?7",
+                params![receipt.update_id, auth.machine_id, receipt.restarted_at, receipt.health_checked_at, receipt.protocol_version, evidence_json, node_revision],
+            )
+            .map_err(HubError::internal)?;
+        if node_changed == 0 {
+            return Err(HubError::conflict(
+                "collector-update-state",
+                "Collector update changed while committing its receipt",
+            ));
+        }
+        let machine_changed = tx
+            .execute(
+                "UPDATE machines SET collector_version = ?2, collector_protocol_version = ?3, collector_runtime_generation = ?4, desired_version = NULL, last_seen_at = ?5, state_revision = state_revision + 1 WHERE machine_id = ?1 AND archived_at IS NULL AND revoked_at IS NULL",
+                params![auth.machine_id, receipt.collector_version, receipt.protocol_version, receipt.runtime_generation, now],
+            )
+            .map_err(HubError::internal)?;
+        if machine_changed == 0 {
+            return Err(HubError::conflict(
+                "machine-state-conflict",
+                "Machine was archived while committing its Collector receipt",
+            ));
+        }
+        tx.commit().map_err(HubError::internal)?;
+        self.finish_update_if_terminal(&receipt.update_id)
+    }
+
+    fn validate_update_receipt_timestamps(
+        receipt: &CollectorUpdateReceipt,
+    ) -> std::result::Result<(), HubError> {
+        let restarted_at = parse_utc_timestamp(&receipt.restarted_at)?;
+        let health_checked_at = parse_utc_timestamp(&receipt.health_checked_at)?;
+        if health_checked_at < restarted_at {
+            return Err(HubError::unprocessable(
+                "collector-update-receipt-mismatch",
+                "Collector health proof must follow its restart proof",
+            ));
+        }
         Ok(())
     }
 

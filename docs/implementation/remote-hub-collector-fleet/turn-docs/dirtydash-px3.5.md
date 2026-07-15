@@ -45,7 +45,7 @@ The implementation session is sole mutable owner. The coordinator owns Beads, in
 ## Adaptations
 
 - The phase PR targets the integration branch rather than `main`.
-- Administrative actions require tablet/desktop affordances; smaller screens may remain read-only rather than compressing destructive controls unsafely.
+- The bounded PR #12 repair pass keeps administrative actions available at compact widths. Container-responsive layout messaging and wrapping replace viewport-width authorization or hidden controls.
 
 ## Discoveries And Decisions
 
@@ -53,21 +53,24 @@ The implementation session is sole mutable owner. The coordinator owns Beads, in
 - Archive/remove revokes credentials while retaining the Machine root and history. Permanent deletion is separate, requires exact `DELETE <display_name>` confirmation plus revision/name checks, and cascades inside one transaction.
 - Hosted enrollment reuses the Phase 4 `EnrollmentWorkflow`, `SshEnrollmentBackend`, managed known-hosts, and `DeploymentRunner` seams. Drafts persist sanitized state only; secrets remain request-scoped.
 - Fleet updates require an anchored Ed25519 signed manifest, persist Hub snapshot/update/health before Collector nodes, and record independent node receipts/rollback states. Only current and previous Collector protocols are accepted.
+- The PR #12 repair pass makes command/result and update-receipt payloads typed and bounded, binds acknowledgements to issued command variants, and accepts completion only from an authenticated Collector after a new runtime generation proves restart and health.
+- Hub restart reconciliation remains resumable across the old/new process boundary; the browser can request execution/reconciliation but cannot submit health, signature, or receipt evidence.
 - `.pi-subagents/` was removed before closeout; no mutable harness/session artifacts are part of the worktree.
 
 ## Implementation And Delegation Evidence
 
-The bound implementation checkout contains the Hub fleet repository/router, additive schema migration, Collector repair command, hosted enrollment endpoints, signed rollout persistence/coordinator, and Machines workspace. The dashboard uses native Tab order, tablist arrow/Home/End navigation, explicit icon-plus-text states, focus-visible styling, reduced-motion support, desktop/tablet action gating, and typed deletion confirmation. The focused contract test covers stepper/status/dialog/read-only/focus/reduced-motion vocabulary.
+The bound implementation checkout contains the Hub fleet repository/router, additive schema migration, Collector repair command, hosted enrollment endpoints, signed rollout persistence/coordinator, and Machines workspace. The repair pass adds typed bounded command/receipt schemas, deterministic update commands, transactional lifecycle revisions, rollback desired-version/runtime state, server-owned restart reconciliation, cleanup retry, and fail-closed private Tailscale identity handling. The dashboard uses native Tab order, tablist arrow/Home/End navigation, explicit icon-plus-text states, focus-visible styling, reduced-motion support, container-responsive controls, modal focus/inert behavior, mutation/load error separation, and server-owned receipt rendering. Contract and rendered axe/focus tests cover the repaired surface.
 
 ## Changed Behavior And Files
 
 - Backend: `crates/dirtydash/src/hub/fleet.rs`, `hub/router.rs`, `hub/repository.rs`, `hub/auth.rs`, `hub/mod.rs`, `hub/protocol.rs`, `db.rs`, `config.rs`, `enrollment.rs`, and `collector.rs`.
-- Frontend: `dashboard/src/machines.tsx`, `dashboard/src/main.tsx`, `dashboard/src/styles.css`, generated `dashboard/dist` assets, and `dashboard/tests/machines-contract.test.mjs`.
-- Documentation: this turn document and the existing phase loop-state handoff.
+- Frontend: `dashboard/src/machines.tsx`, `dashboard/src/main.tsx`, `dashboard/src/styles.css`, `dashboard/tests/machines-contract.test.mjs`, and `dashboard/tests/machines-a11y.test.tsx`.
+- Dashboard tooling: `dashboard/package.json`, `dashboard/package-lock.json`, and `dashboard/vite.config.ts` add strict TypeScript types plus rendered Vitest/jsdom/axe coverage.
+- Documentation: this turn document and the existing phase loop-state handoff. Protected committed `dashboard/dist` artifacts were not regenerated into the repair diff.
 
 ## Review
 
-No separate review session was run in this bounded checkout. Local correctness evidence is the full Rust test suite, strict Clippy, formatting/diff checks, dashboard production build, and Machines contract test listed below.
+This bounded repair pass addresses the independent PR #12 security/correctness and accessibility findings in the same implementation checkout. A fresh external browser/tailnet review remains an integration gate; local rendered modal/axe coverage and typed backend tests provide the available evidence.
 
 ## CI And Gates
 
@@ -81,12 +84,14 @@ Evidence:
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - `cargo test --all-targets --all-features` passed: 115 unit/integration tests plus collector/CLI suites.
 - `npm --prefix dashboard run build` passed.
+- `npm --prefix dashboard run test` passed: 2 rendered modal focus/inert/axe tests.
 - `npm --prefix dashboard run test:contract` passed: `Machines DOM/a11y contract: passed`.
+- `npm --prefix dashboard exec tsc -- --noEmit` passed with dashboard-local React typings.
 - `git diff --check` passed.
 
 ## PR And Commits
 
-Commit `d2ace45` pushed from `lavender/remote-hub-collector-fleet-5-fleet`; PR #12 targets `lavender/remote-hub-collector-fleet-implementation`.
+Base implementation commit `d2ace45` remains the PR #12 base. The bounded repair commit is recorded after local validation; PR #12 continues to target `lavender/remote-hub-collector-fleet-implementation`.
 
 ## Beads Updates And Follow-Ups
 
@@ -102,4 +107,4 @@ Archive and permanent deletion are deliberately separate operations. Hosted sign
 
 ## Closeout
 
-Implementation and local validation are complete. `.pi-subagents/` is absent, commit `d2ace45` is pushed, and the single integration-targeted PR is #12.
+The bounded repair implementation and local validation are complete. `.pi-subagents/` is absent, protected generated dashboard artifacts are unchanged, and the repair commit/push evidence is recorded above. External CI, browser, and real-tailnet checks remain integration-owned.

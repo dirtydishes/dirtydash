@@ -23,7 +23,8 @@ import {
   UploadCloud,
   Wifi,
   Wrench,
-  XCircle
+  XCircle,
+  type LucideIcon
 } from "lucide-react";
 
 export type MachineHealth =
@@ -93,7 +94,7 @@ export interface FleetUpdateEvidence {
   publisher_key_id: string;
   publisher_fingerprint: string;
   manifest_sha256: string;
-  signature_verified: boolean;
+  publisher_verified: boolean;
 }
 
 export interface FleetUpdateNode {
@@ -108,7 +109,17 @@ export interface FleetUpdateNode {
   rolled_back_at?: string | null;
   failure_reason?: string | null;
   collector_protocol_version?: number | null;
-  evidence?: FleetUpdateEvidence | null;
+  receipt?: {
+    update_id: string;
+    command_id: string;
+    version: string;
+    sha256: string;
+    collector_version: string;
+    protocol_version: number;
+    runtime_generation: string;
+    restarted_at: string;
+    health_checked_at: string;
+  } | null;
   attempts: number;
   state_revision: number;
 }
@@ -134,6 +145,7 @@ export interface FleetUpdateRun {
 }
 
 type ApiError = Error & { status?: number; code?: string };
+type MutationFailure = { message: string; retry: () => void };
 
 type Action = "refresh" | "repair" | "diagnostics" | "rotate";
 
@@ -145,7 +157,7 @@ const enrollmentSteps = [
   ["execute-verify-receipt", "execute + receipt"]
 ] as const;
 
-const healthIcon: Record<MachineHealth, React.ComponentType<{ size?: number; "aria-hidden"?: boolean }>> = {
+const healthIcon: Record<MachineHealth, LucideIcon> = {
   online: Wifi,
   syncing: RefreshCw,
   stale: Clock3,
@@ -178,10 +190,6 @@ export function machineHealthLabel(status: MachineHealth) {
 
 export function protocolCompatibilityLabel(status: ProtocolCompatibility) {
   return protocolLabel[status];
-}
-
-export function isMachineAdminWidth(width: number) {
-  return width >= 760;
 }
 
 function StatusBadge({ status }: { status: MachineHealth }) {
@@ -219,16 +227,15 @@ function Busy({ label }: { label: string }) {
   );
 }
 
-function InlineError({ message, onRetry }: { message: string; onRetry?: () => void }) {
+function InlineError({ message, onRetry, onDismiss }: { message: string; onRetry?: () => void; onDismiss?: () => void }) {
   return (
     <div className="machine-error" role="alert">
       <CircleAlert size={17} aria-hidden="true" />
       <span>{message}</span>
-      {onRetry ? (
-        <button type="button" className="button subtle" onClick={onRetry}>
-          retry
-        </button>
-      ) : null}
+      <span className="machine-error-actions">
+        {onRetry ? <button type="button" className="button subtle" onClick={onRetry}>retry</button> : null}
+        {onDismiss ? <button type="button" className="button subtle" onClick={onDismiss}>dismiss</button> : null}
+      </span>
     </div>
   );
 }
@@ -286,21 +293,22 @@ function postJson<T>(url: string, body: unknown, csrf: string) {
   });
 }
 
-function useDesktopAdmin() {
-  const [desktop, setDesktop] = useState(() =>
-    typeof window === "undefined" ? true : isMachineAdminWidth(window.innerWidth)
-  );
-  useEffect(() => {
-    const update = () => setDesktop(isMachineAdminWidth(window.innerWidth));
-    update();
-    window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
-  }, []);
-  return desktop;
-}
-
 export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
-  const desktopAdmin = useDesktopAdmin();
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const [compactLayout, setCompactLayout] = useState(false);
+  // Layout capability is measured from the actual workspace container. It is
+  // never an authorization decision; every mutation still requires the Hub
+  // session, CSRF token, and server-side revision checks.
+  useEffect(() => {
+    const element = workspaceRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      setCompactLayout(entry.contentRect.width < 820);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const desktopAdmin = true;
   const [machines, setMachines] = useState<MachineRecord[]>([]);
   const [updates, setUpdates] = useState<FleetUpdateRun[]>([]);
   const [enrollments, setEnrollments] = useState<EnrollmentDraft[]>([]);
@@ -309,11 +317,12 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
   const [authenticated, setAuthenticated] = useState(true);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [mutationError, setMutationError] = useState<MutationFailure | null>(null);
 
-  const refresh = async () => {
+  const refresh = async (): Promise<ApiError | null> => {
     setLoading(true);
-    setError(null);
+    setLoadError(null);
     try {
       const csrfResponse = await api<{ csrf_token: string }>("/api/v1/admin/session/csrf");
       setCsrf(csrfResponse.csrf_token);
@@ -326,15 +335,18 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
       setUpdates(updateRows);
       setEnrollments(enrollmentRows);
       setAuthenticated(true);
+      setMutationError(null);
       setSelectedMachineId((current) =>
         current && machineRows.some((machine) => machine.machine_id === current)
           ? current
           : machineRows[0]?.machine_id ?? null
       );
+      return null;
     } catch (loadError) {
       const typed = loadError as ApiError;
       setAuthenticated(typed.status !== 401 && typed.status !== 403);
-      setError(typed.message);
+      setLoadError(typed.message);
+      return typed;
     } finally {
       setLoading(false);
     }
@@ -347,45 +359,48 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
   const selectedMachine = machines.find((machine) => machine.machine_id === selectedMachineId) ?? null;
 
   async function runAction(machine: MachineRecord, action: Action) {
-    if (!desktopAdmin) return;
     setWorking(true);
-    setError(null);
+    setMutationError(null);
     try {
       await postJson<unknown>(
         `/api/v1/admin/machines/${encodeURIComponent(machine.machine_id)}/${action}`,
         { expected_state_revision: machine.state_revision },
         csrf
       );
-      await refresh();
+      const refreshError = await refresh();
+      if (refreshError) {
+        setMutationError({ message: `${action} succeeded, but the refreshed fleet state is unavailable: ${refreshError.message}`, retry: () => void refresh() });
+      }
     } catch (actionError) {
-      setError((actionError as Error).message);
+      setMutationError({ message: (actionError as Error).message, retry: () => void runAction(machine, action) });
     } finally {
       setWorking(false);
     }
   }
 
   async function archiveMachine(machine: MachineRecord, remove = false) {
-    if (!desktopAdmin) return;
     setWorking(true);
-    setError(null);
+    setMutationError(null);
     try {
       await postJson<MachineRecord>(
         `/api/v1/admin/machines/${encodeURIComponent(machine.machine_id)}/${remove ? "remove" : "archive"}`,
         { expected_state_revision: machine.state_revision, display_name: machine.display_name },
         csrf
       );
-      await refresh();
+      const refreshError = await refresh();
+      if (refreshError) {
+        setMutationError({ message: `${remove ? "remove" : "archive"} succeeded, but the refreshed fleet state is unavailable: ${refreshError.message}`, retry: () => void refresh() });
+      }
     } catch (actionError) {
-      setError((actionError as Error).message);
+      setMutationError({ message: (actionError as Error).message, retry: () => void archiveMachine(machine, remove) });
     } finally {
       setWorking(false);
     }
   }
 
   async function deleteMachine(machine: MachineRecord) {
-    if (!desktopAdmin) return;
     setWorking(true);
-    setError(null);
+    setMutationError(null);
     try {
       await postJson<unknown>(
         `/api/v1/admin/machines/${encodeURIComponent(machine.machine_id)}/delete`,
@@ -397,9 +412,12 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
         csrf
       );
       setSelectedMachineId(null);
-      await refresh();
+      const refreshError = await refresh();
+      if (refreshError) {
+        setMutationError({ message: `delete succeeded, but the refreshed fleet state is unavailable: ${refreshError.message}`, retry: () => void refresh() });
+      }
     } catch (actionError) {
-      setError((actionError as Error).message);
+      setMutationError({ message: (actionError as Error).message, retry: () => void deleteMachine(machine) });
     } finally {
       setWorking(false);
     }
@@ -410,7 +428,7 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
   }
 
   return (
-    <div className="machines-workspace">
+    <div ref={workspaceRef} className={`machines-workspace${compactLayout ? " compact-layout" : ""}`} aria-busy={loading}>
       <header className="machines-header">
         <div>
           <div className="section-kicker"><Server size={14} aria-hidden="true" /> hosted Hub / Machines</div>
@@ -424,15 +442,16 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
           </button>
         </div>
       </header>
-      {!desktopAdmin ? (
+      {compactLayout ? (
         <div className="read-only-notice" role="note">
-          <Monitor size={17} aria-hidden="true" /> <strong>read-only at this width</strong>
-          <span>Use a tablet or desktop to enroll, repair, rotate, archive, delete, or update Machines.</span>
+          <Monitor size={17} aria-hidden="true" /> <strong>compact workspace</strong>
+          <span>Actions remain protected by the authenticated Hub; the layout is condensed to fit this container.</span>
         </div>
       ) : null}
-      {error ? <InlineError message={error} onRetry={() => void refresh()} /> : null}
+      {loadError ? <InlineError message={loadError} onRetry={() => void refresh()} /> : null}
+      {mutationError ? <InlineError message={mutationError.message} onRetry={mutationError.retry} onDismiss={() => setMutationError(null)} /> : null}
       {loading ? <MachineSkeleton /> : null}
-      {!loading && !error && activeTab === "fleet" ? (
+      {!loading && !loadError && activeTab === "fleet" ? (
         <FleetTab
           machines={machines}
           selectedMachine={selectedMachine}
@@ -445,7 +464,7 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
           onDelete={(machine) => void deleteMachine(machine)}
         />
       ) : null}
-      {!loading && !error && activeTab === "enroll" ? (
+      {!loading && !loadError && activeTab === "enroll" ? (
         <EnrollmentTab
           csrf={csrf}
           desktopAdmin={desktopAdmin}
@@ -453,17 +472,17 @@ export function MachinesWorkspace({ activeTab }: { activeTab: string }) {
           onChange={() => void refresh()}
         />
       ) : null}
-      {!loading && !error && activeTab === "updates" ? (
+      {!loading && !loadError && activeTab === "updates" ? (
         <UpdatesTab csrf={csrf} desktopAdmin={desktopAdmin} updates={updates} machines={machines} onChange={() => void refresh()} />
       ) : null}
-      {!loading && !error && activeTab === "history" ? <UpdateHistory updates={updates} /> : null}
+      {!loading && !loadError && activeTab === "history" ? <UpdateHistory updates={updates} /> : null}
     </div>
   );
 }
 
 function MachineSkeleton() {
   return (
-    <div className="machine-skeleton" aria-label="Loading Machines">
+    <div className="machine-skeleton" role="status" aria-live="polite" aria-label="Loading Machines">
       <div />
       <div />
       <div />
@@ -594,37 +613,20 @@ function MachineDetail({
   onRemove: (machine: MachineRecord) => void;
   onDelete: (machine: MachineRecord) => void;
 }) {
-  const [archiveOpen, setArchiveOpen] = useState(false);
-  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [openDialog, setOpenDialog] = useState<"archive" | "delete" | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const archiveButtonRef = useRef<HTMLButtonElement>(null);
   const deleteButtonRef = useRef<HTMLButtonElement>(null);
-  const archiveConfirmRef = useRef<HTMLButtonElement>(null);
-  const deleteInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
-    setArchiveOpen(false);
-    setDeleteOpen(false);
+    setOpenDialog(null);
     setDeleteConfirmation("");
   }, [machine?.machine_id]);
-  useEffect(() => { if (archiveOpen) archiveConfirmRef.current?.focus(); }, [archiveOpen]);
-  useEffect(() => { if (deleteOpen) deleteInputRef.current?.focus(); }, [deleteOpen]);
-  useEffect(() => {
-    if (!archiveOpen && !deleteOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      if (archiveOpen) {
-        setArchiveOpen(false);
-        archiveButtonRef.current?.focus();
-      } else {
-        setDeleteOpen(false);
-        setDeleteConfirmation("");
-        deleteButtonRef.current?.focus();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [archiveOpen, deleteOpen]);
+  const closeDialog = () => {
+    const trigger = openDialog === "archive" ? archiveButtonRef : deleteButtonRef;
+    setOpenDialog(null);
+    setDeleteConfirmation("");
+    requestAnimationFrame(() => trigger.current?.focus());
+  };
   if (!machine) {
     return <aside className="machine-detail pane"><InlineEmpty title="Select a Machine" detail="The detail pane keeps lifecycle evidence and destructive actions separate from the fleet table." /></aside>;
   }
@@ -652,18 +654,96 @@ function MachineDetail({
         <button type="button" className="button" disabled={!desktopAdmin || working || machine.lifecycle === "archived"} onClick={() => onAction(machine, "rotate")}><RotateCw size={15} aria-hidden="true" /> rotate credentials</button>
       </div>
       <div className="lifecycle-disclosures desktop-admin">
-        <div className="disclosure-block">
-          <button ref={archiveButtonRef} type="button" className="disclosure-trigger" disabled={!desktopAdmin || working || machine.lifecycle === "archived"} aria-expanded={archiveOpen} aria-controls="archive-confirmation" onClick={() => setArchiveOpen((open) => !open)}><Archive size={15} aria-hidden="true" /> archive Machine</button>
-          {archiveOpen ? <div id="archive-confirmation" className="inline-confirm" role="dialog" aria-modal="true" aria-labelledby="archive-title"><strong id="archive-title">Archive, do not delete</strong><p>Revokes active Collector credentials and retains credentials plus history. This is reversible only by a new explicit enrollment.</p><div><button ref={archiveConfirmRef} type="button" className="button danger" disabled={working} onClick={() => { onArchive(machine); setArchiveOpen(false); archiveButtonRef.current?.focus(); }}>archive and revoke</button><button type="button" className="button subtle" onClick={() => { setArchiveOpen(false); archiveButtonRef.current?.focus(); }}>cancel</button></div></div> : null}
-        </div>
-        <div className="disclosure-block">
-          <button ref={deleteButtonRef} type="button" className="disclosure-trigger destructive" disabled={!desktopAdmin || working || machine.lifecycle !== "archived"} aria-expanded={deleteOpen} aria-controls="delete-confirmation" onClick={() => setDeleteOpen((open) => !open)}><Trash2 size={15} aria-hidden="true" /> permanently delete</button>
-          {deleteOpen ? <div id="delete-confirmation" className="inline-confirm danger-box" role="dialog" aria-modal="true" aria-labelledby="delete-title"><strong id="delete-title">Permanent deletion</strong><p>Deletes this archived Machine, credentials, commands, update records, and usage history in one transaction. Type confirmation is required by the Hub.</p><code>DELETE {machine.display_name}</code><label>type confirmation<input ref={deleteInputRef} value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} aria-describedby="delete-title" /></label><div><button ref={deleteConfirmRef} type="button" className="button danger" disabled={working || deleteConfirmation !== `DELETE ${machine.display_name}`} onClick={() => { onDelete(machine); setDeleteOpen(false); setDeleteConfirmation(""); deleteButtonRef.current?.focus(); }}>delete permanently</button><button type="button" className="button subtle" onClick={() => { setDeleteOpen(false); setDeleteConfirmation(""); deleteButtonRef.current?.focus(); }}>cancel</button></div></div> : null}
-        </div>
-        <button type="button" className="disclosure-trigger" disabled={!desktopAdmin || working || machine.lifecycle === "archived"} onClick={() => onRemove(machine)}><Undo2 size={15} aria-hidden="true" /> remove / revoke (retain history)</button>
+        <button ref={archiveButtonRef} type="button" className="disclosure-trigger" disabled={working || machine.lifecycle === "archived"} aria-expanded={openDialog === "archive"} aria-controls="archive-confirmation" onClick={() => setOpenDialog("archive")}><Archive size={15} aria-hidden="true" /> archive Machine</button>
+        <button ref={deleteButtonRef} type="button" className="disclosure-trigger destructive" disabled={working || machine.lifecycle !== "archived"} aria-expanded={openDialog === "delete"} aria-controls="delete-confirmation" onClick={() => setOpenDialog("delete")}><Trash2 size={15} aria-hidden="true" /> permanently delete</button>
+        <button type="button" className="disclosure-trigger" disabled={working || machine.lifecycle === "archived"} onClick={() => onRemove(machine)}><Undo2 size={15} aria-hidden="true" /> remove / revoke (retain history)</button>
       </div>
+      {openDialog === "archive" ? <DestructiveModal id="archive-confirmation" titleId="archive-title" title="Archive, do not delete" onClose={closeDialog}>
+        <p>Revokes active Collector credentials and retains credentials plus history. This is reversible only by a new explicit enrollment.</p>
+        <div className="modal-actions"><button type="button" data-modal-autofocus className="button danger" disabled={working} onClick={() => { onArchive(machine); closeDialog(); }}>archive and revoke</button><button type="button" className="button subtle" onClick={closeDialog}>cancel</button></div>
+      </DestructiveModal> : null}
+      {openDialog === "delete" ? <DestructiveModal id="delete-confirmation" titleId="delete-title" title="Permanent deletion" danger onClose={closeDialog}>
+        <p>Deletes this archived Machine, credentials, commands, update records, and usage history in one transaction. Type confirmation is required by the Hub.</p>
+        <code>DELETE {machine.display_name}</code>
+        <label>type confirmation<input data-modal-autofocus value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} aria-describedby="delete-title" /></label>
+        <div className="modal-actions"><button type="button" className="button danger" disabled={working || deleteConfirmation !== `DELETE ${machine.display_name}`} onClick={() => { onDelete(machine); closeDialog(); }}>delete permanently</button><button type="button" className="button subtle" onClick={closeDialog}>cancel</button></div>
+      </DestructiveModal> : null}
     </aside>
   );
+}
+
+export function DestructiveModal({
+  id,
+  titleId,
+  title,
+  danger = false,
+  onClose,
+  children
+}: {
+  id: string;
+  titleId: string;
+  title: string;
+  danger?: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const layer = dialog.parentElement;
+    const background = layer?.parentElement;
+    const inertSiblings: HTMLElement[] = [];
+    if (background && layer) {
+      Array.from(background.children).forEach((child) => {
+        if (child !== layer && child instanceof HTMLElement) {
+          (child as HTMLElement & { inert?: boolean }).inert = true;
+          inertSiblings.push(child);
+        }
+      });
+    }
+    const first = dialog.querySelector<HTMLElement>("[data-modal-autofocus]") ?? dialog;
+    first.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+        "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex=\"-1\"])"
+      ));
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const current = document.activeElement;
+      const index = focusable.indexOf(current as HTMLElement);
+      const next = event.shiftKey
+        ? focusable[(index <= 0 ? focusable.length : index) - 1]
+        : focusable[(index + 1) % focusable.length];
+      if (index === -1 || (event.shiftKey && index === 0) || (!event.shiftKey && index === focusable.length - 1)) {
+        event.preventDefault();
+        next?.focus();
+      }
+    };
+    dialog.addEventListener("keydown", onKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", onKeyDown);
+      inertSiblings.forEach((sibling) => { (sibling as HTMLElement & { inert?: boolean }).inert = false; });
+      previouslyFocused?.focus();
+    };
+  }, []);
+  return <div className="modal-layer" role="presentation">
+    <button type="button" className="modal-backdrop" aria-label="Close confirmation" onClick={onClose} />
+    <section ref={dialogRef} id={id} className={`modal-dialog${danger ? " danger-box" : ""}`} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onKeyDown={(event) => event.stopPropagation()}>
+      <h3 id={titleId}>{title}</h3>
+      {children}
+    </section>
+  </div>;
 }
 
 function DiagnosticsSummary({ diagnostics }: { diagnostics: MachineDiagnostics }) {
@@ -673,29 +753,56 @@ function DiagnosticsSummary({ diagnostics }: { diagnostics: MachineDiagnostics }
 
 function EnrollmentTab({ csrf, desktopAdmin, drafts, onChange }: { csrf: string; desktopAdmin: boolean; drafts: EnrollmentDraft[]; onChange: () => void }) {
   const [selectedId, setSelectedId] = useState<string | null>(drafts[0]?.id ?? null);
-  const [form, setForm] = useState({ id: "machine-draft", machine_id: "machine-", display_name: "", alias: "", user: "", host: "", port: "22", auth: "password" });
+  const [form, setForm] = useState({ id: "machine-draft", machine_id: "machine-", display_name: "", alias: "", user: "", host: "", port: "22", auth: "password", key_path: "" });
   const [secrets, setSecrets] = useState({ password: "", key_passphrase: "", sudo_password: "" });
   const [confirmFingerprint, setConfirmFingerprint] = useState("");
   const [artifact, setArtifact] = useState({ manifest: "", bytes: "", seed: "" });
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState<(() => void) | null>(null);
   const selected = drafts.find((draft) => draft.id === selectedId) ?? null;
   useEffect(() => { if (!selectedId && drafts[0]) setSelectedId(drafts[0].id); }, [drafts, selectedId]);
-  async function submitCreate(event: FormEvent) {
-    event.preventDefault();
-    if (!desktopAdmin) return;
-    setWorking(true); setError(null);
+  async function submitCreate(event?: FormEvent) {
+    event?.preventDefault();
+    const alias = form.alias.trim();
+    const manualParts = [form.user.trim(), form.host.trim()];
+    const hasManual = manualParts.some(Boolean);
+    if ((alias && hasManual) || (!alias && !manualParts.every(Boolean))) {
+      setError("Choose exactly one target: an SSH alias or a complete user + host target.");
+      return;
+    }
+    const port = Number(form.port);
+    if (!alias && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+      setError("Manual SSH targets need a port from 1 to 65535.");
+      return;
+    }
+    if (form.auth === "key" && !form.key_path.trim()) {
+      setError("A custom SSH key path is required when key authentication is selected.");
+      return;
+    }
+    setWorking(true); setError(null); setRetry(null);
     try {
-      const connection = form.alias ? { kind: "alias", alias: form.alias } : { kind: "manual", user: form.user, host: form.host, port: Number(form.port) };
-      const auth = form.auth === "password" ? "password" : { "key-path": { path: form.auth } };
+      const connection = alias ? { kind: "alias", alias } : { kind: "manual", user: form.user.trim(), host: form.host.trim(), port };
+      const auth = form.auth === "password" ? "password" : { "key-path": { path: form.key_path.trim() } };
       const draft = await postJson<EnrollmentDraft>("/api/v1/admin/enrollment", { id: form.id, machine_id: form.machine_id, display_name: form.display_name, connection, auth }, csrf);
       setSelectedId(draft.id); onChange();
-    } catch (createError) { setError((createError as Error).message); } finally { setWorking(false); }
+    } catch (createError) {
+      setError((createError as Error).message);
+      setRetry(() => () => void submitCreate());
+    } finally { setWorking(false); }
   }
   async function step(path: string, body: unknown) {
-    if (!selected || !desktopAdmin) return;
-    setWorking(true); setError(null);
-    try { await postJson<unknown>(`/api/v1/admin/enrollment/${encodeURIComponent(selected.id)}/${path}`, body, csrf); onChange(); } catch (stepError) { setError((stepError as Error).message); } finally { setWorking(false); }
+    if (!selected) return;
+    setWorking(true); setError(null); setRetry(null);
+    try {
+      await postJson<unknown>(`/api/v1/admin/enrollment/${encodeURIComponent(selected.id)}/${path}`, body, csrf);
+      setSecrets({ password: "", key_passphrase: "", sudo_password: "" });
+      setConfirmFingerprint("");
+      onChange();
+    } catch (stepError) {
+      setError((stepError as Error).message);
+      setRetry(() => () => void step(path, body));
+    } finally { setWorking(false); }
   }
   const secretBody = { password: secrets.password || undefined, key_passphrase: secrets.key_passphrase || undefined, sudo_password: secrets.sudo_password || undefined };
   return (
@@ -706,12 +813,12 @@ function EnrollmentTab({ csrf, desktopAdmin, drafts, onChange }: { csrf: string;
           <label>draft id<input value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} required /></label>
           <label>Machine id<input value={form.machine_id} onChange={(event) => setForm({ ...form, machine_id: event.target.value })} required /></label>
           <label>display name<input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} required /></label>
-          <fieldset><legend>connection</legend><label>SSH alias<input value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} placeholder="workstation" /></label><span className="or-line">or manual target</span><div className="field-row"><label>user<input value={form.user} onChange={(event) => setForm({ ...form, user: event.target.value })} /></label><label>host<input value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} /></label><label>port<input type="number" min="1" max="65535" value={form.port} onChange={(event) => setForm({ ...form, port: event.target.value })} /></label></div></fieldset>
-          <label>authentication<select value={form.auth} onChange={(event) => setForm({ ...form, auth: event.target.value })}><option value="password">password + sudo as needed</option><option value="~/.ssh/id_ed25519">key path: ~/.ssh/id_ed25519</option></select></label>
-          <label>SSH password<input type="password" value={secrets.password} onChange={(event) => setSecrets({ ...secrets, password: event.target.value })} autoComplete="off" /></label>
+          <fieldset><legend>connection <small>(choose one)</small></legend><label>SSH alias<input value={form.alias} onChange={(event) => setForm({ ...form, alias: event.target.value })} placeholder="workstation" aria-describedby="target-help" /></label><span id="target-help" className="or-line">or complete manual target</span><div className="field-row"><label>user<input value={form.user} onChange={(event) => setForm({ ...form, user: event.target.value })} /></label><label>host<input value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} /></label><label>port<input type="number" min="1" max="65535" value={form.port} onChange={(event) => setForm({ ...form, port: event.target.value })} /></label></div></fieldset>
+          <label>authentication<select value={form.auth} onChange={(event) => setForm({ ...form, auth: event.target.value })}><option value="password">password + sudo as needed</option><option value="key">encrypted or unencrypted SSH key</option></select></label>
+          {form.auth === "key" ? <><label>SSH key path<input value={form.key_path} onChange={(event) => setForm({ ...form, key_path: event.target.value })} placeholder="/home/me/.ssh/id_ed25519" required /></label><label>key passphrase<input type="password" value={secrets.key_passphrase} onChange={(event) => setSecrets({ ...secrets, key_passphrase: event.target.value })} autoComplete="off" /></label></> : <label>SSH password<input type="password" value={secrets.password} onChange={(event) => setSecrets({ ...secrets, password: event.target.value })} autoComplete="off" /></label>}
           <label>sudo password<input type="password" value={secrets.sudo_password} onChange={(event) => setSecrets({ ...secrets, sudo_password: event.target.value })} autoComplete="off" /></label>
-          {error ? <InlineError message={error} /> : null}
-          <button type="submit" className="button primary" disabled={!desktopAdmin || working}>{working ? <Busy label="saving draft" /> : <><ArrowDownToLine size={15} aria-hidden="true" /> create draft</>}</button>
+          {error ? <InlineError message={error} onRetry={retry ?? undefined} onDismiss={() => { setError(null); setRetry(null); }} /> : null}
+          <button type="submit" className="button primary" disabled={working}>{working ? <Busy label="saving draft" /> : <><ArrowDownToLine size={15} aria-hidden="true" /> create draft</>}</button>
         </form>
         <div className="draft-list" aria-label="Saved enrollment drafts"><strong>saved drafts</strong>{drafts.length ? drafts.map((draft) => <button type="button" key={draft.id} className={draft.id === selectedId ? "draft-row selected" : "draft-row"} onClick={() => setSelectedId(draft.id)}><code>{draft.id}</code><span>{draft.display_name ?? draft.state}</span><small>{draft.blocker !== "none" ? draft.blocker : draft.execution_substate}</small></button>) : <p className="muted-line">No saved drafts.</p>}</div>
       </section>
@@ -724,6 +831,7 @@ function EnrollmentTab({ csrf, desktopAdmin, drafts, onChange }: { csrf: string;
           <div className="enrollment-live" role="status" aria-live="polite">state: <strong>{selected.state}</strong> / {selected.execution_substate}{selected.blocker !== "none" ? ` / blocker: ${selected.blocker}` : ""}</div>
           {selected.host_fingerprint ? <div className="fingerprint-box"><FileKey2 size={16} aria-hidden="true" /><span>observed host fingerprint</span><code>{selected.host_fingerprint}</code>{selected.blocker === "unknown-host-key" ? <div className="inline-form"><label>type fingerprint to trust<input value={confirmFingerprint} onChange={(event) => setConfirmFingerprint(event.target.value)} /></label><button type="button" className="button" disabled={!desktopAdmin || working} onClick={() => void step("trust", { ...secretBody, confirm_fingerprint: confirmFingerprint })}>confirm + authenticate</button></div> : null}</div> : null}
           {selected.last_error ? <InlineError message={selected.last_error} /> : null}
+          {!selected.cleanup_complete ? <div className="cleanup-recovery" role="alert"><strong>remote cleanup needs attention</strong><span>{selected.blocker === "manual-recovery-required" ? "An operator must restore the retained rollback snapshot." : "Secrets are requested again and cleared after a successful cleanup retry."}</span>{selected.blocker !== "manual-recovery-required" ? <button type="button" className="button" disabled={working} onClick={() => void step("cleanup", secretBody)}><Wrench size={15} aria-hidden="true" /> retry cleanup</button> : null}</div> : null}
           <div className="enrollment-actions desktop-admin">
             {selected.state === "target-draft" || selected.state === "host-trust-auth" ? <button type="button" className="button primary" disabled={!desktopAdmin || working} onClick={() => void step("trust", { ...secretBody, confirm_fingerprint: confirmFingerprint || undefined })}><KeyRound size={15} aria-hidden="true" /> observe host + authenticate</button> : null}
             {selected.state === "host-trust-auth" ? <button type="button" className="button" disabled={!desktopAdmin || working} onClick={() => void step("probe", secretBody)}><ArrowDownToLine size={15} aria-hidden="true" /> probe + plan</button> : null}
@@ -751,31 +859,97 @@ function UpdatesTab({ csrf, desktopAdmin, updates, machines, onChange }: { csrf:
   const [form, setForm] = useState({ version: "", sha256: "", key_id: "", fingerprint: "", manifest_sha256: "", manifest: "", machine_ids: "" });
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState<(() => void) | null>(null);
   const active = updates[0] ?? null;
-  const evidence = active ? { version: active.version, artifact_sha256: active.artifact_sha256, publisher_key_id: active.publisher_key_id, publisher_fingerprint: active.publisher_fingerprint, manifest_sha256: active.manifest_sha256, signature_verified: true } : null;
+  const onChangeRef = useRef(onChange);
+  useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
+  useEffect(() => {
+    if (!active || !["hub-updating", "collectors-queued"].includes(active.status)) return;
+    let cancelled = false;
+    const reconcile = async () => {
+      try {
+        await postJson(`/api/v1/admin/updates/${encodeURIComponent(active.update_id)}/reconcile`, {}, csrf);
+        if (!cancelled) onChangeRef.current();
+      } catch {
+        // A transient restart boundary or network failure is shown by the next
+        // durable refresh; it must not be replaced with client-authored proof.
+      }
+    };
+    void reconcile();
+    const timer = window.setInterval(() => void reconcile(), 4000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [active?.status, active?.update_id, csrf]);
   async function plan(event: FormEvent) {
-    event.preventDefault(); if (!desktopAdmin) return;
-    setWorking(true); setError(null);
-    try { await postJson("/api/v1/admin/updates/plan", { version: form.version, artifact_sha256: form.sha256, publisher_key_id: form.key_id, publisher_fingerprint: form.fingerprint, manifest_sha256: form.manifest_sha256, signed_manifest: parseJson(form.manifest), machine_ids: form.machine_ids.split(",").map((id) => id.trim()).filter(Boolean) }, csrf); onChange(); } catch (planError) { setError((planError as Error).message); } finally { setWorking(false); }
+    event.preventDefault();
+    setWorking(true); setError(null); setRetry(null);
+    try {
+      await postJson("/api/v1/admin/updates/plan", {
+        version: form.version,
+        artifact_sha256: form.sha256,
+        publisher_key_id: form.key_id,
+        publisher_fingerprint: form.fingerprint,
+        manifest_sha256: form.manifest_sha256,
+        signed_manifest: parseJson(form.manifest),
+        machine_ids: form.machine_ids.split(",").map((id) => id.trim()).filter(Boolean)
+      }, csrf);
+      onChange();
+    } catch (planError) {
+      setError((planError as Error).message);
+      setRetry(() => () => void plan(event));
+    } finally { setWorking(false); }
   }
-  async function update(path: string, body: unknown = {}) {
-    if (!active || !desktopAdmin) return;
-    setWorking(true); setError(null);
-    try { await postJson(`/api/v1/admin/updates/${encodeURIComponent(active.update_id)}/${path}`, body, csrf); onChange(); } catch (updateError) { setError((updateError as Error).message); } finally { setWorking(false); }
+  async function execute() {
+    if (!active) return;
+    const path = active.status === "planned" ? "execute" : "reconcile";
+    setWorking(true); setError(null); setRetry(null);
+    try {
+      await postJson(`/api/v1/admin/updates/${encodeURIComponent(active.update_id)}/${path}`, {}, csrf);
+      onChange();
+    } catch (updateError) {
+      setError((updateError as Error).message);
+      setRetry(() => () => void execute());
+    } finally { setWorking(false); }
   }
   return <div className="updates-layout">
-    <section className="update-plan pane" aria-labelledby="update-plan-title"><div className="pane-title"><h2 id="update-plan-title">signed fleet update</h2><span>Hub gate first / isolate nodes</span></div><form className="update-form" onSubmit={plan}><label>target version<input value={form.version} onChange={(event) => setForm({ ...form, version: event.target.value })} required /></label><label>artifact SHA-256<input value={form.sha256} onChange={(event) => setForm({ ...form, sha256: event.target.value })} minLength={64} required /></label><label>publisher key id<input value={form.key_id} onChange={(event) => setForm({ ...form, key_id: event.target.value })} required /></label><label>publisher fingerprint<input value={form.fingerprint} onChange={(event) => setForm({ ...form, fingerprint: event.target.value })} placeholder="sha256:…" required /></label><label>manifest SHA-256<input value={form.manifest_sha256} onChange={(event) => setForm({ ...form, manifest_sha256: event.target.value })} minLength={64} required /></label><label>signed manifest JSON<textarea value={form.manifest} onChange={(event) => setForm({ ...form, manifest: event.target.value })} rows={4} required /></label><label>Machine IDs <span className="muted-line">(blank = all active)</span><input value={form.machine_ids} onChange={(event) => setForm({ ...form, machine_ids: event.target.value })} placeholder={machines.map((machine) => machine.machine_id).join(", ")} /></label>{error ? <InlineError message={error} /> : null}<button type="submit" className="button primary" disabled={!desktopAdmin || working}>{working ? <Busy label="persisting plan" /> : <><FileKey2 size={15} aria-hidden="true" /> verify + plan</>}</button></form></section>
-    <section className="update-run pane" aria-labelledby="update-run-title"><div className="pane-title"><h2 id="update-run-title">rollout state</h2><span>{active ? <><code>{active.version}</code> / <UpdateStatusBadge status={active.status} /> / attempt {active.attempts}</> : "no persisted run"}</span></div>{!active ? <InlineEmpty title="No update run" detail="A signed plan will show its Hub snapshot, health gate, and independent Collector receipts here." /> : <><div className="update-gate"><UpdateStep icon={<Archive size={15} aria-hidden="true" />} label="Hub snapshot" state={active.hub_snapshot_at ? "complete" : active.status === "planned" ? "ready" : "waiting"} /><UpdateStep icon={<Server size={15} aria-hidden="true" />} label="Hub update + health" state={active.hub_health_at ? "complete" : active.status === "hub-updating" ? "ready" : "waiting"} /><UpdateStep icon={<UploadCloud size={15} aria-hidden="true" />} label="Collectors" state={active.status === "collectors-queued" || active.status.startsWith("completed") ? "ready" : "waiting"} /></div><div className="update-controls desktop-admin"><button type="button" className="button" disabled={!desktopAdmin || working || active.status !== "planned"} onClick={() => void update("snapshot", evidence)}><Archive size={15} aria-hidden="true" /> snapshot Hub</button><button type="button" className="button" disabled={!desktopAdmin || working || active.status !== "hub-updating"} onClick={() => void update("health", { expected_state_revision: active.state_revision, healthy: true, restarted: true, health_checked: true, hub_version: active.version, evidence })}><ShieldCheck size={15} aria-hidden="true" /> confirm Hub health</button></div><div className="collector-rollout"><strong>Collector receipts / independent rollback</strong>{active.nodes.map((node) => <CollectorUpdateRow key={node.machine_id} node={node} update={active} desktopAdmin={desktopAdmin} working={working} evidence={evidence} onStart={() => void update(`collectors/${encodeURIComponent(node.machine_id)}/start`)} onComplete={(body) => void update(`collectors/${encodeURIComponent(node.machine_id)}/complete`, body)} />)}</div></>}</section>
+    <section className="update-plan pane" aria-labelledby="update-plan-title">
+      <div className="pane-title"><h2 id="update-plan-title">signed fleet update</h2><span>server-owned execution / isolate nodes</span></div>
+      <form className="update-form" onSubmit={plan}>
+        <label>target version<input value={form.version} onChange={(event) => setForm({ ...form, version: event.target.value })} required /></label>
+        <label>artifact SHA-256<input value={form.sha256} onChange={(event) => setForm({ ...form, sha256: event.target.value })} minLength={64} required /></label>
+        <label>publisher key id<input value={form.key_id} onChange={(event) => setForm({ ...form, key_id: event.target.value })} required /></label>
+        <label>publisher fingerprint<input value={form.fingerprint} onChange={(event) => setForm({ ...form, fingerprint: event.target.value })} placeholder="sha256:…" required /></label>
+        <label>manifest SHA-256<input value={form.manifest_sha256} onChange={(event) => setForm({ ...form, manifest_sha256: event.target.value })} minLength={64} required /></label>
+        <label>signed manifest JSON<textarea value={form.manifest} onChange={(event) => setForm({ ...form, manifest: event.target.value })} rows={4} required /></label>
+        <label>Machine IDs <span className="muted-line">(blank = all active)</span><input value={form.machine_ids} onChange={(event) => setForm({ ...form, machine_ids: event.target.value })} placeholder={machines.map((machine) => machine.machine_id).join(", ")} /></label>
+        {error ? <InlineError message={error} onRetry={retry ?? undefined} onDismiss={() => { setError(null); setRetry(null); }} /> : null}
+        <button type="submit" className="button primary" disabled={working}>{working ? <Busy label="persisting plan" /> : <><FileKey2 size={15} aria-hidden="true" /> verify + plan</>}</button>
+      </form>
+    </section>
+    <section className="update-run pane" aria-labelledby="update-run-title">
+      <div className="pane-title"><h2 id="update-run-title">rollout state</h2><span>{active ? <><code>{active.version}</code> / <UpdateStatusBadge status={active.status} /> / attempt {active.attempts}</> : "no persisted run"}</span></div>
+      {!active ? <InlineEmpty title="No update run" detail="A signed plan will show its Hub snapshot, restart proof, and authenticated Collector receipts here." /> : <>
+        <div className="server-verification" role="status"><ShieldCheck size={15} aria-hidden="true" /><span>Publisher trust and artifact binding are verified by the Hub; this UI cannot author verification.</span></div>
+        <div className="update-gate"><UpdateStep icon={<Archive size={15} aria-hidden="true" />} label="Hub snapshot" state={active.hub_snapshot_at ? "complete" : active.status === "planned" ? "ready" : "waiting"} /><UpdateStep icon={<Server size={15} aria-hidden="true" />} label="Hub restart + health proof" state={active.hub_health_at ? "complete" : active.status === "hub-updating" ? "ready" : "waiting"} /><UpdateStep icon={<UploadCloud size={15} aria-hidden="true" />} label="Collectors" state={active.status === "collectors-queued" || active.status.startsWith("completed") ? "ready" : "waiting"} /></div>
+        <div className="update-controls desktop-admin"><button type="button" className="button primary" disabled={working || (active.status !== "planned" && active.status !== "hub-updating" && active.status !== "collectors-queued")} onClick={() => void execute()}>{working ? <Busy label="Hub is executing the signed rollout" /> : <><UploadCloud size={15} aria-hidden="true" /> {active.status === "planned" ? "start server-owned rollout" : "reconcile rollout"}</>}</button></div>
+        <div className="collector-rollout"><strong>Authenticated Collector receipts / independent rollback</strong>{active.nodes.map((node) => <CollectorUpdateRow key={node.machine_id} node={node} update={active} />)}</div>
+      </>}</section>
   </div>;
 }
 
 function UpdateStep({ icon, label, state }: { icon: React.ReactNode; label: string; state: "complete" | "ready" | "waiting" }) { return <div className={`update-step ${state}`}><span>{icon}</span><strong>{label}</strong><StatusText state={state} /></div>; }
 function StatusText({ state }: { state: string }) { return <span className="update-state"><span aria-hidden="true">{state === "complete" ? "✓" : state === "ready" ? "→" : "·"}</span> {state}</span>; }
 
-function CollectorUpdateRow({ node, update, desktopAdmin, working, evidence, onStart, onComplete }: { node: FleetUpdateNode; update: FleetUpdateRun; desktopAdmin: boolean; working: boolean; evidence: FleetUpdateEvidence | null; onStart: () => void; onComplete: (body: unknown) => void }) {
-  const [checks, setChecks] = useState({ restarted: false, health_checked: false, collector_version: update.version, protocol_version: String(node.collector_protocol_version ?? 1) });
-  const canComplete = node.status === "updating" && evidence;
-  return <div className="collector-update-row"><div><code>{node.machine_id}</code><span className={`update-node-status ${node.status}`}><CircleDot size={14} aria-hidden="true" /> {node.status}</span></div><small>previous {node.previous_version ?? "unknown"} / protocol {node.collector_protocol_version ?? "unknown"}</small>{node.failure_reason ? <p className="danger-text"><CircleAlert size={14} aria-hidden="true" /> {node.failure_reason}</p> : null}{node.status === "queued" ? <button type="button" className="button" disabled={!desktopAdmin || working} onClick={onStart}><ArrowUpCircle size={15} aria-hidden="true" /> snapshot + update Collector</button> : null}{canComplete ? <div className="receipt-checks"><label><input type="checkbox" checked={checks.restarted} onChange={(event) => setChecks({ ...checks, restarted: event.target.checked })} /> service restarted</label><label><input type="checkbox" checked={checks.health_checked} onChange={(event) => setChecks({ ...checks, health_checked: event.target.checked })} /> health verified</label><button type="button" className="button" disabled={!desktopAdmin || working || !checks.restarted || !checks.health_checked} onClick={() => onComplete({ expected_state_revision: node.state_revision, collector_version: checks.collector_version, protocol_version: Number(checks.protocol_version), restarted: checks.restarted, health_checked: checks.health_checked, signed_evidence: evidence })}><CheckCircle2 size={15} aria-hidden="true" /> record Collector receipt</button></div> : null}{node.status === "succeeded" ? <span className="success-text"><CheckCircle2 size={15} aria-hidden="true" /> restart, version, health, and signed evidence verified</span> : null}{node.status === "rolled-back" ? <span className="danger-text"><Undo2 size={15} aria-hidden="true" /> this node rolled back; fleet remains available</span> : null}</div>;
+function CollectorUpdateRow({ node, update }: { node: FleetUpdateNode; update: FleetUpdateRun }) {
+  const receipt = node.receipt;
+  return <div className="collector-update-row">
+    <div><code>{node.machine_id}</code><span className={`update-node-status ${node.status}`}><CircleDot size={14} aria-hidden="true" /> {node.status}</span></div>
+    <small>previous {node.previous_version ?? "unknown"} / observed protocol {receipt?.protocol_version ?? node.collector_protocol_version ?? "unknown"}</small>
+    {node.failure_reason ? <p className="danger-text"><CircleAlert size={14} aria-hidden="true" /> {node.failure_reason}</p> : null}
+    {node.status === "updating" ? <span className="pending-line"><LoaderCircle size={14} aria-hidden="true" /> waiting for the authenticated Collector runtime receipt</span> : null}
+    {node.status === "succeeded" && receipt ? <div className="success-text"><CheckCircle2 size={15} aria-hidden="true" /> Collector receipt verified by Hub: version {receipt.collector_version}, restart {formatAbsolute(receipt.restarted_at)}, health {formatAbsolute(receipt.health_checked_at)}</div> : null}
+    {node.status === "rolled-back" ? <span className="danger-text"><Undo2 size={15} aria-hidden="true" /> this node rolled back; fleet remains available</span> : null}
+    {node.status === "queued" ? <span className="muted-line">server will issue this node's deterministic command after the Hub gate</span> : null}
+  </div>;
 }
 
 function UpdateHistory({ updates }: { updates: FleetUpdateRun[] }) { return <section className="update-history pane"><div className="pane-title"><h2>update history</h2><span>{updates.length} persisted runs</span></div>{updates.length ? <table className="machine-table"><thead><tr><th>run</th><th>version</th><th>state</th><th>Hub gate</th><th>Collectors</th><th>failure isolation</th></tr></thead><tbody>{updates.map((update) => <tr key={update.update_id}><td><code>{update.update_id}</code></td><td><code>{update.version}</code></td><td><UpdateStatusBadge status={update.status} /></td><td>{update.hub_health_at ? <span className="success-text"><CheckCircle2 size={14} aria-hidden="true" /> healthy</span> : <span className="muted-line">not passed</span>}</td><td>{update.nodes.filter((node) => node.status === "succeeded").length} passed / {update.nodes.filter((node) => node.status === "rolled-back").length} rolled back</td><td>{update.nodes.some((node) => node.status === "rolled-back") ? "fleet available; node isolated" : "none recorded"}</td></tr>)}</tbody></table> : <InlineEmpty title="No update history" detail="Signed update attempts and per-Collector rollback receipts will remain here." />}</section>; }
