@@ -98,7 +98,10 @@ Evidence:
 
 ## PR And Commits
 
-Pending commit/push/PR for branch `lavender/remote-hub-collector-fleet-2-foundation` into `lavender/remote-hub-collector-fleet-implementation`.
+- Commit: `b071bac` — `Add hub protocol and auth foundation`
+- PR: #9 — `Phase 2: add hub protocol and auth foundation`
+- Branch: `lavender/remote-hub-collector-fleet-2-foundation`
+- Target: `lavender/remote-hub-collector-fleet-implementation`
 
 ## Beads Updates And Follow-Ups
 
@@ -114,4 +117,4 @@ Phase 1 must establish the canonical domain and ADRs first.
 
 ## Closeout
 
-Not started.
+Implementation ownership complete for this pass. Local gates pass, the phase branch is pushed, and PR #9 is open for the coordinator's independent review/CI path.
