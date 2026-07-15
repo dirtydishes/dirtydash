@@ -115,6 +115,7 @@ Evidence:
 - Base implementation commit `1c84e3c` (`feat: add signed hub deployment and ssh enrollment`).
 - Repair commit `c6aeb38` (`fix: harden phase 4 deployment and enrollment`).
 - Final release-blocker repair commit `55c7ec3` (`fix: close phase 4 release blockers`).
+- Final review repair commit `7a10159` (`fix: close final phase 4 review blockers`).
 - Phase PR: [#11](https://github.com/dirtydishes/dirtydash/pull/11), head `lavender/remote-hub-collector-fleet-4-deployment`, base `lavender/remote-hub-collector-fleet-implementation`.
 - Branch pushed to `origin`; merge remains coordinator-owned.
 
