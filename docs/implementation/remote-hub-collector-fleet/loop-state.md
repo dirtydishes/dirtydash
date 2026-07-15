@@ -14,15 +14,15 @@ Harness: `pi`
 
 Adapter contract: `dirtyloops-harness/1`
 
-Current phase: 1 — Documentation and tracker reset
+Current phase: none; Phase 2 is ready but not yet claimed
 
-Current Beads issue: `dirtydash-px3.1`
+Current Beads issue: none
 
-Current PR: pending from `lavender/remote-hub-collector-fleet-1-docs` into `lavender/remote-hub-collector-fleet-implementation`
+Current PR: none
 
-Current execution strategy: durable implementation session followed by an independent review session; coordinator owns Beads and CI
+Current execution strategy: none between phases
 
-Last completed phase: none
+Last completed phase: 1 — Documentation and tracker reset (`dirtydash-px3.1`, PR #8)
 
 Blocked: no
 
@@ -44,7 +44,7 @@ Blocked: no
 
 | Phase | Beads Issue | Status | PR | Turn Doc |
 |---|---|---|---|---|
-| 1 | `dirtydash-px3.1` | in progress | pending | `turn-docs/dirtydash-px3.1.md` |
+| 1 | `dirtydash-px3.1` | closed | #8 merged (`98f3453`) | `turn-docs/dirtydash-px3.1.md` |
 | 2 | `dirtydash-px3.2` | open | none | `turn-docs/dirtydash-px3.2.md` |
 | 3 | `dirtydash-px3.3` | open | none | `turn-docs/dirtydash-px3.3.md` |
 | 4 | `dirtydash-px3.4` | open | none | `turn-docs/dirtydash-px3.4.md` |
@@ -54,4 +54,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Phase 1 claimed. The integration and phase branches are attached and verified; the orchestration brief is recorded before delegated implementation.
+Phase 1 closed after repair and independent re-review. PR #8 merged into the integration branch; Phase 2 is ready for selection.

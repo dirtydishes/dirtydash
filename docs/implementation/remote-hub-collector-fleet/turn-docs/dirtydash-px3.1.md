@@ -111,34 +111,45 @@ The coordinator owns Beads, phase advancement, CI resolution, and the integratio
 
 ## Review
 
-Pending. The orchestration brief still requires an independent review session; this implementation session did not claim review completion.
+Approved.
+
+- The first independent `thermo-nuclear-code-quality-review` session returned `changes-required`: old refresh-loop prompts and phase records still provided runnable SSH-pull and stale `main` instructions.
+- Repair commit `3d42714` hard-stopped every old run, selection, review, PR, phase, and turn-doc surface while retaining historical evidence.
+- A focused read-only `pi-subagents` verification scout found no remaining blockers and confirmed redirects consistently target `dirtydash-px3`.
+- A fresh independent re-review approved the repair. It found no active SSH-pull/main execution path, no broken redirect, and no scope widening.
+- Residual review risk: very low; the coordinator independently reran the shell-based gates unavailable to the tool-constrained reviewer.
 
 ## CI And Gates
 
-Owner: coordinator / later independent review session
+Owner: coordinator
 
-State: unresolved
+State: `ci-unavailable-with-evidence`
 
 Evidence:
 
-- Environment verified before mutation: `pwd`, `git rev-parse --show-toplevel`, `git symbolic-ref --short HEAD`, `git status --short --branch` all matched the bound worktree and branch.
-- Comprehensive link check passed via a `python3` local-link validation over the touched Markdown set, including the old stream redirects and this active turn doc.
-- Stale-direction and terminology scan passed via targeted `grep` over `docs/implementation/refresh-remote-harness-layout-theme/`, `README.md`, `PRODUCT.md`, and the active stream docs to ensure no old runnable surface still directs actors toward agentless SSH-pull implementation or stale `main` PR targeting.
-- Documentation integrity check passed via `git diff --check`.
-- `cargo test` and `npm --prefix dashboard run build` were intentionally not run because no executable or generated product surfaces changed in this docs-only phase.
-- Repair-pass commands recorded in this session included environment verification, scout-artifact review, targeted reads of superseded run surfaces, link validation, stale-direction `grep` scans, `git diff --check`, `git status --short --branch`, `git diff --name-only`, `git add`, `git commit`, and `git push`.
+- GitHub reported an empty `statusCheckRollup` for PR #8; no repository CI checks were configured for this PR.
+- Coordinator reran `git diff --check origin/lavender/remote-hub-collector-fleet-implementation...HEAD`: passed.
+- Coordinator verified hard-stop banners on all 19 historical runnable surfaces: passed.
+- Coordinator ran relative Markdown-link validation across all 35 changed Markdown files: passed.
+- Independent implementation and review terminology scans found no active agentless SSH-pull or stale `main` execution path: passed.
+- `cargo test` and `npm --prefix dashboard run build` were intentionally not run because no executable or generated product surfaces changed.
 
 ## PR And Commits
 
-- Commit: `b1f1483` — `docs: define remote hub collector phase-1 canon`
-- Repair commit on this branch: `docs: hard-stop superseded refresh loop`
-- Branch pushed: `lavender/remote-hub-collector-fleet-1-docs`
-- PR: #8 — `dirtydash-px3.1: define remote hub/collector docs canon`
+- Initial implementation: `b1f1483` — `docs: define remote hub collector phase-1 canon`
+- Handoff evidence: `dfae71f` — `docs: record phase-1 handoff evidence`
+- Review repair: `3d42714` — `docs: hard-stop superseded refresh loop`
+- PR #8: `dirtydash-px3.1: define remote hub/collector docs canon`
 - PR URL: https://github.com/dirtydishes/dirtydash/pull/8
+- PR target: `lavender/remote-hub-collector-fleet-implementation`
+- Merged: 2026-07-15 at merge commit `98f3453`.
 
 ## Beads Updates And Follow-Ups
 
-Loop creation established the issue and dependency graph. This session intentionally did not mutate Beads because the coordinator retains Beads ownership.
+- Beads metadata records the user-overridden integration-branch policy.
+- `dirtydash-px3.1` closed after acceptance, independent review, gate evidence, and PR merge.
+- Phase 2 (`dirtydash-px3.2`) is now ready.
+- No Phase 1 follow-up issues were required.
 
 ## Plan Amendments
 
@@ -149,8 +160,8 @@ None. The work stayed within phase-1 documentation/tracker-record scope.
 - The old remote-pull roadmap is superseded, but its historical docs remain useful evidence once clearly marked non-runnable.
 - `CONTEXT.md`, `API_V1_INVARIANTS.md`, and the four ADRs are the canonical phase-1 records that later phases should cite instead of restating the same decisions.
 - The completed read-only `pi-subagents` scout checklist should be treated as supporting evidence for the PR #8 repair, not as a mutable source artifact to commit.
-- Review, CI state, and Beads closeout remain coordinator-owned after this implementation handoff.
+- The orchestrator launches separate durable implementation and independent review sessions; bounded `pi-subagents` scouts may support either session with read-only evidence.
 
 ## Closeout
 
-Implementation session complete for the bounded phase-1 scope: docs committed, branch pushed, and exactly one PR opened against `lavender/remote-hub-collector-fleet-implementation`. Review, CI closeout, Beads mutation, and phase advancement remain coordinator-owned.
+Phase 1 complete. Acceptance evidence is present, the original review blocker was repaired, independent re-review approved, local gates passed, unavailable CI is documented, Beads is closed, and PR #8 is merged into `lavender/remote-hub-collector-fleet-implementation`.
