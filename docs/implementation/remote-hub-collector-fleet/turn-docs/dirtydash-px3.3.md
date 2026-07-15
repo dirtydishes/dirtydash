@@ -91,13 +91,13 @@ Evidence:
 - Focused Hub suite passes 31 tests, including overlap activation/proof, idempotent retries, command JSON/ack secret rejection, all-table raw-token scan, and legacy command migration cleanup.
 - `cargo fmt --all -- --check` passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
-- `cargo test --workspace --all-targets --all-features` passed before the final migration-test addition; the final full gate is rerun at closeout.
+- `cargo test --workspace --all-targets --all-features` passed: 54 unit tests, 6 CLI tests, and 14 Collector integration tests.
 - `git diff --check` passed.
 
 ## PR And Commits
 
 - Implementation commits: `cfe13e4` (`feat: add durable outbound collector runtime`) and `b87597d` (removed-source tombstones/manifest completeness).
-- Repair commit(s): final hash recorded at closeout after the focused re-review repair gates pass.
+- Repair commit: `eb8a614` (`repair collector refresh idempotency and secret-free rotation`).
 - Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`, state open.
 - Coordinator retains integration/merge ownership; this session does not mutate Beads or merge the PR.
 
