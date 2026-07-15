@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -161,6 +162,7 @@ impl Database {
     pub fn connection(&self) -> Result<Connection> {
         let conn = Connection::open(&self.path)
             .with_context(|| format!("opening SQLite database {}", self.path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
@@ -264,6 +266,7 @@ impl Database {
                 ON usage_events(pricing_mode);
             "#,
         )?;
+        self.migrate_hub_schema(&conn)?;
         Ok(())
     }
 
@@ -281,6 +284,158 @@ impl Database {
         if !columns.iter().any(|column| column == "reasoning_effort") {
             conn.execute("ALTER TABLE usage_events ADD COLUMN reasoning_effort TEXT", [])?;
         }
+        if !columns.iter().any(|column| column == "machine_id") {
+            conn.execute("ALTER TABLE usage_events ADD COLUMN machine_id TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "agent") {
+            conn.execute("ALTER TABLE usage_events ADD COLUMN agent TEXT", [])?;
+        }
+        if !columns.iter().any(|column| column == "collector_event_fingerprint") {
+            conn.execute(
+                "ALTER TABLE usage_events ADD COLUMN collector_event_fingerprint TEXT",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|column| column == "ingest_batch_id") {
+            conn.execute("ALTER TABLE usage_events ADD COLUMN ingest_batch_id TEXT", [])?;
+        }
+        conn.execute(
+            "UPDATE usage_events SET machine_id = machine WHERE machine_id IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE usage_events SET agent = source WHERE agent IS NULL",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE usage_events SET collector_event_fingerprint = raw_event_hash WHERE collector_event_fingerprint IS NULL",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_hub_schema(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS machines (
+                machine_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                enrolled_at TEXT NOT NULL,
+                revoked_at TEXT,
+                last_seen_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS collector_credentials (
+                credential_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                credential_label TEXT NOT NULL,
+                secret_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                rotated_at TEXT NOT NULL,
+                revoked_at TEXT,
+                last_used_at TEXT,
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_collector_credentials_machine
+                ON collector_credentials(machine_id, revoked_at);
+
+            CREATE TABLE IF NOT EXISTS ingest_batches (
+                batch_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                protocol_version INTEGER NOT NULL,
+                credential_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                event_count INTEGER NOT NULL,
+                source_manifest_count INTEGER NOT NULL DEFAULT 0,
+                checkpoint_count INTEGER NOT NULL DEFAULT 0,
+                sync_run_id TEXT,
+                committed_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'committed',
+                UNIQUE(machine_id, batch_id),
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE,
+                FOREIGN KEY(credential_id) REFERENCES collector_credentials(credential_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS ingest_checkpoints (
+                machine_id TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                checkpoint_key TEXT NOT NULL,
+                checkpoint_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(machine_id, agent, checkpoint_key),
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_runs (
+                machine_id TEXT NOT NULL,
+                sync_run_id TEXT NOT NULL,
+                collector_version TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0,
+                batch_id TEXT,
+                PRIMARY KEY(machine_id, sync_run_id),
+                FOREIGN KEY(machine_id) REFERENCES machines(machine_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS source_manifests (
+                machine_id TEXT NOT NULL,
+                sync_run_id TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                display_path TEXT NOT NULL,
+                item_count INTEGER NOT NULL DEFAULT 0,
+                cursor TEXT,
+                manifest_fingerprint TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY(machine_id, sync_run_id, source_key),
+                FOREIGN KEY(machine_id, sync_run_id) REFERENCES sync_runs(machine_id, sync_run_id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS owners (
+                owner_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                time_zone TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                password_updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS owner_sessions (
+                session_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                csrf_token_hash TEXT NOT NULL,
+                trusted_tailscale_user TEXT,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked_at TEXT,
+                FOREIGN KEY(owner_id) REFERENCES owners(owner_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner
+                ON owner_sessions(owner_id, revoked_at, expires_at);
+
+            CREATE TABLE IF NOT EXISTS backup_metadata (
+                backup_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                storage_kind TEXT NOT NULL,
+                metadata_json TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_machine_agent_fingerprint
+                ON usage_events(machine_id, agent, collector_event_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_usage_events_ingest_batch
+                ON usage_events(ingest_batch_id);
+
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (2, datetime('now'));
+            "#,
+        )
+        .context("applying hub schema migrations")?;
         Ok(())
     }
 

@@ -14,13 +14,13 @@ Harness: `pi`
 
 Adapter contract: `dirtyloops-harness/1`
 
-Current phase: none; Phase 2 is ready but not yet claimed
+Current phase: 2 — Storage and protocol foundation
 
-Current Beads issue: none
+Current Beads issue: `dirtydash-px3.2`
 
-Current PR: none
+Current PR: pending from `lavender/remote-hub-collector-fleet-2-foundation` into `lavender/remote-hub-collector-fleet-implementation`
 
-Current execution strategy: none between phases
+Current execution strategy: durable implementation and independent review sessions supported by parent-mediated read-only pi-subagents scouts
 
 Last completed phase: 1 — Documentation and tracker reset (`dirtydash-px3.1`, PR #8)
 
@@ -45,7 +45,7 @@ Blocked: no
 | Phase | Beads Issue | Status | PR | Turn Doc |
 |---|---|---|---|---|
 | 1 | `dirtydash-px3.1` | closed | #8 merged (`98f3453`) | `turn-docs/dirtydash-px3.1.md` |
-| 2 | `dirtydash-px3.2` | open | none | `turn-docs/dirtydash-px3.2.md` |
+| 2 | `dirtydash-px3.2` | in progress | pending | `turn-docs/dirtydash-px3.2.md` |
 | 3 | `dirtydash-px3.3` | open | none | `turn-docs/dirtydash-px3.3.md` |
 | 4 | `dirtydash-px3.4` | open | none | `turn-docs/dirtydash-px3.4.md` |
 | 5 | `dirtydash-px3.5` | open | none | `turn-docs/dirtydash-px3.5.md` |
@@ -54,4 +54,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Phase 1 closed after repair and independent re-review. PR #8 merged into the integration branch; Phase 2 is ready for selection.
+Phase 2 claimed. Its attached worktree and symbolic branch are verified, and the orchestration brief is recorded before implementation.
