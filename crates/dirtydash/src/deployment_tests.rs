@@ -537,6 +537,13 @@ fn health_and_service_restart_verify_hub_and_collector_independently() {
     assert!(restart.contains("is-active --quiet dirtydash-collector.service"));
     assert!(health.contains("/healthz"));
     assert!(health.contains("dirtydash-collector.service"));
+    let launchd_health = action_command(&RemoteAction::HealthCheck {
+        port: 4599,
+        platform: ServicePlatform::Launchd,
+    })
+    .unwrap();
+    assert!(launchd_health.contains("state = running"));
+    assert!(launchd_health.contains("pid = [1-9]"));
 }
 
 #[test]
@@ -726,6 +733,42 @@ fn ssh_remote_executor_uses_binary_safe_control_socket_transfer_and_redacts_fail
 
 #[cfg(unix)]
 #[test]
+fn systemd_quiesce_skips_not_found_units_but_propagates_stop_failures() {
+    let dir = tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    executable_script(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$*" in
+  *show*) printf 'LoadState=%s\n' "${SYSTEMD_UNIT_STATE:-not-found}" ;;
+  *stop*) exit 92 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let command = action_command(&RemoteAction::QuiesceServices {
+        platform: ServicePlatform::Systemd,
+    })
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    assert!(Command::new("sh")
+        .args(["-c", &command])
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(!Command::new("sh")
+        .args(["-c", &command])
+        .env("PATH", &path)
+        .env("SYSTEMD_UNIT_STATE", "loaded")
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
 fn fresh_seeded_host_rolls_back_to_absent_database_and_unloaded_services() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
@@ -741,6 +784,7 @@ fn fresh_seeded_host_rolls_back_to_absent_database_and_unloaded_services() {
         r#"#!/bin/sh
 case "$*" in
   *show*) printf 'LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\n' ;;
+  *stop*) exit 91 ;;
   *is-active*) exit 3 ;;
   *) exit 0 ;;
 esac
@@ -781,6 +825,17 @@ exit 0
             .trim(),
         "inactive"
     );
+    let quiesce = action_command(&RemoteAction::QuiesceServices {
+        platform: ServicePlatform::Systemd,
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &quiesce])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .status()
+        .unwrap()
+        .success());
 
     let prepare = action_command(&RemoteAction::PreparePaths {
         paths: paths.clone(),
@@ -884,6 +939,196 @@ exit 0
         .success());
     assert!(!Path::new(&paths.release_dir).exists());
     assert!(!Path::new(&format!("{}/deployment-rollback", paths.state_dir)).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_restores_loaded_inactive_launchd_jobs_without_starting_them() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut remote_facts = facts();
+    remote_facts.platform = TargetPlatform {
+        os: ArtifactOs::Macos,
+        arch: ArtifactArch::X86_64,
+    };
+    remote_facts.home = home.display().to_string();
+    remote_facts.current_release = Some(format!("{}/old", home.display()));
+    let paths = DeploymentPaths::for_facts(&remote_facts, "0.1.2-test").unwrap();
+    let old_release = PathBuf::from(remote_facts.current_release.clone().unwrap());
+    fs::create_dir_all(&old_release).unwrap();
+    fs::write(old_release.join("dirtydash"), b"old-artifact").unwrap();
+    fs::create_dir_all(Path::new(&paths.current).parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&old_release, &paths.current).unwrap();
+    fs::create_dir_all(&paths.service_dir).unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dev.dirtydash.hub.plist"),
+        b"old-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dev.dirtydash.collector.plist"),
+        b"old-collector",
+    )
+    .unwrap();
+
+    let bin = dir.path().join("bin");
+    let state = dir.path().join("launchd-state");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    executable_script(
+        &bin.join("launchctl"),
+        r#"#!/bin/sh
+set -eu
+state=${LAUNCHD_TEST_STATE:?}
+command=$1
+case "$command" in
+  print)
+    job=$2
+    service=$(basename "$job")
+    if [ ! -f "$state/$service.loaded" ]; then exit 3; fi
+    cat "$state/$service.output"
+    ;;
+  bootout)
+    job=$2
+    service=$(basename "$job")
+    printf 'bootout %s\n' "$service" >> "$state/log"
+    if [ ! -f "$state/$service.loaded" ]; then exit 3; fi
+    rm -f "$state/$service.loaded"
+    ;;
+  bootstrap)
+    plist=$3
+    service=$(basename "$plist" .plist)
+    printf 'bootstrap %s\n' "$service" >> "$state/log"
+    : > "$state/$service.loaded"
+    printf 'state = waiting\n' > "$state/$service.output"
+    ;;
+  kickstart)
+    job=$3
+    service=$(basename "$job")
+    printf 'kickstart %s\n' "$service" >> "$state/log"
+    printf 'state = running\npid = 1234\n' > "$state/$service.output"
+    ;;
+  kill)
+    job=$3
+    service=$(basename "$job")
+    printf 'kill %s\n' "$service" >> "$state/log"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    executable_script(
+        &bin.join("tailscale"),
+        r#"#!/bin/sh
+if [ "$1" = serve ] && [ "$2" = status ] && [ "$3" = --json ]; then printf '{}'; exit 0; fi
+exit 0
+"#,
+    );
+    for service in ["dev.dirtydash.hub", "dev.dirtydash.collector"] {
+        fs::write(state.join(format!("{service}.loaded")), b"").unwrap();
+        fs::write(
+            state.join(format!("{service}.output")),
+            b"state = waiting\n",
+        )
+        .unwrap();
+    }
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let snapshot = action_command(&RemoteAction::SnapshotRollbackState {
+        paths: paths.clone(),
+        platform: ServicePlatform::Launchd,
+        listener: ListenerPlan::default(),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &snapshot])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .env("LAUNCHD_TEST_STATE", &state)
+        .status()
+        .unwrap()
+        .success());
+    let snapshot_dir = PathBuf::from(format!("{}/deployment-rollback", paths.state_dir));
+    for service in ["dev.dirtydash.hub", "dev.dirtydash.collector"] {
+        assert_eq!(
+            fs::read_to_string(snapshot_dir.join(format!("{service}.loaded")))
+                .unwrap()
+                .trim(),
+            "loaded"
+        );
+        assert_eq!(
+            fs::read_to_string(snapshot_dir.join(format!("{service}.active")))
+                .unwrap()
+                .trim(),
+            "inactive"
+        );
+        fs::write(
+            state.join(format!("{service}.output")),
+            b"state = running\npid = 1234\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        Path::new(&paths.service_dir).join("dev.dirtydash.hub.plist"),
+        b"replacement-hub",
+    )
+    .unwrap();
+    fs::write(
+        Path::new(&paths.service_dir).join("dev.dirtydash.collector.plist"),
+        b"replacement-collector",
+    )
+    .unwrap();
+    fs::create_dir_all(&paths.release_dir).unwrap();
+    fs::write(
+        Path::new(&paths.release_dir).join("dirtydash"),
+        b"new-artifact",
+    )
+    .unwrap();
+    fs::remove_file(&paths.current).unwrap();
+    std::os::unix::fs::symlink(&paths.release_dir, &paths.current).unwrap();
+
+    let rollback = action_command(&RemoteAction::Rollback {
+        current: paths.current.clone(),
+        previous: Some(old_release.display().to_string()),
+        database_path: None,
+        database_backup: None,
+        database_wal_backup: None,
+        database_shm_backup: None,
+        config_path: Some(paths.config_file.clone()),
+        service_dir: Some(paths.service_dir.clone()),
+        platform: ServicePlatform::Launchd,
+        listener: Some(ListenerPlan::default()),
+        snapshot_dir: Some(snapshot_dir.display().to_string()),
+    })
+    .unwrap();
+    assert!(Command::new("sh")
+        .args(["-c", &rollback])
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .env("LAUNCHD_TEST_STATE", &state)
+        .status()
+        .unwrap()
+        .success());
+
+    for service in ["dev.dirtydash.hub", "dev.dirtydash.collector"] {
+        assert!(state.join(format!("{service}.loaded")).exists());
+        assert_eq!(
+            fs::read_to_string(state.join(format!("{service}.output"))).unwrap(),
+            "state = waiting\n"
+        );
+    }
+    assert_eq!(
+        fs::read(Path::new(&paths.service_dir).join("dev.dirtydash.hub.plist")).unwrap(),
+        b"old-hub"
+    );
+    assert_eq!(
+        fs::read(Path::new(&paths.service_dir).join("dev.dirtydash.collector.plist")).unwrap(),
+        b"old-collector"
+    );
+    let log = fs::read_to_string(state.join("log")).unwrap();
+    assert!(log.matches("bootout ").count() >= 4);
+    assert_eq!(log.matches("bootstrap ").count(), 2);
+    assert!(!log.contains("kickstart "));
 }
 
 #[cfg(unix)]

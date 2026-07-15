@@ -89,6 +89,16 @@ The bounded post-review repair returned to the same mutable owner and addresses 
 
 Protected conversion/migration artifacts remain byte-identical to the phase baseline; all new tests use isolated temporary directories and do not mutate repository docs. No Beads state was mutated, no merge was performed, and the coordinator still owns integration.
 
+## Final Service-State Repair Pass
+
+The final narrow PR #11 service-state repair keeps the phase scope bounded:
+
+1. Systemd quiesce now queries each user unit's `LoadState`, skips only `not-found`, and propagates real stop/manager failures under `set -eu`. Fresh Linux snapshot, quiesce, seed, and rollback coverage uses a fake unit whose stop would fail if called; a focused test also proves loaded-unit stop failures remain fatal.
+2. Launchd rollback now bootouts replacement jobs before restoration, bootstraps a prior plist only when it was loaded, kickstarts only when it was running, and leaves loaded/inactive jobs loaded but inactive. Loaded and running checks are separate: `launchctl print` success proves loaded, while the printed running state/PID proves running.
+3. Launchd restart/health verification uses the same separate loaded/running checks. A stateful isolated rollback test starts with loaded/inactive prior jobs, simulates running replacements, and verifies exact loaded/inactive restoration with no kickstart.
+
+The production enrollment rollback assertion now accepts either successful cleanup of the snapshot after absent-unit repair or retained snapshot evidence when another rollback step is unavailable. No Beads state was mutated, no merge was performed, and the coordinator still owns integration.
+
 ## Review
 
 Pending independent fresh review of this repair pass. Live signing keys, real SSH hosts/managers, public certificates, and tailnet consent remain unavailable external gates; no evidence is fabricated.
@@ -103,8 +113,8 @@ Evidence:
 
 - `cargo fmt --all`: passed.
 - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
-- Thermo-nuclear repair validation covers persisted reviewed plans, durable publisher anchoring/replacement rejection, canonical SSH/host-key trust, controlled live-PTY password/sudo success/failure/redaction, secret snapshots/permissions, no-sqlite3 byte-level valid/malformed/WAL paths, actual listener/service/current-pointer rollback, old Hub/Collector rollback health, manual-recovery status, listener CIDRs/peer trust, execution restart, and redaction.
-- `cargo test --all-targets --all-features`: passed (103 unit tests, 9 CLI tests, 14 Collector integration tests).
+- Thermo-nuclear repair validation covers persisted reviewed plans, durable publisher anchoring/replacement rejection, canonical SSH/host-key trust, controlled live-PTY password/sudo success/failure/redaction, secret snapshots/permissions, no-sqlite3 byte-level valid/malformed/WAL paths, actual listener/service/current-pointer rollback, old Hub/Collector rollback health, manual-recovery status, listener CIDRs/peer trust, execution restart, redaction, absent-systemd quiesce, and loaded-inactive launchd rollback.
+- `cargo test --all-targets --all-features`: passed (105 unit tests, 9 CLI tests, 14 Collector integration tests).
 - `npm --prefix dashboard run build`: passed with Vite production output.
 - Local Hub smoke: `target/debug/dirtydash serve --hub --listener public --host 127.0.0.1 --port 4598` started a real connect-info router and `/healthz` returned `{"service":"dirtydash-hub","status":"ok"}`.
 - `git diff --check` and allowed-path/protected-artifact checks: passed; protected conversion/migration artifacts are byte-identical to `HEAD`.

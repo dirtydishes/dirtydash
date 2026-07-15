@@ -89,7 +89,7 @@ impl ServiceSpec {
     pub fn restart_action(&self) -> &'static str {
         match self.platform {
             ServicePlatform::Systemd => "set -eu; systemctl --user daemon-reload; systemctl --user restart dirtydash-hub.service; systemctl --user restart dirtydash-collector.service; systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service",
-            ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null; launchctl print \"$collector\" >/dev/null",
+            ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null 2>&1; launchctl print \"$hub\" 2>/dev/null | grep -Eq '(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)'; launchctl print \"$collector\" >/dev/null 2>&1; launchctl print \"$collector\" 2>/dev/null | grep -Eq '(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)'",
         }
     }
 }
@@ -259,6 +259,8 @@ mod tests {
         assert!(!launchd.contains("bootstrap gui/$(id -u) 2>/dev/null || true"));
         assert!(launchd.contains("launchctl print \"$hub\""));
         assert!(launchd.contains("launchctl print \"$collector\""));
+        assert!(launchd.contains("state = running"));
+        assert!(launchd.contains("pid = [1-9]"));
     }
 
     #[test]

@@ -2588,6 +2588,17 @@ fn sqlite_header_command(path: &str) -> String {
     )
 }
 
+const LAUNCHD_RUNNING_PATTERN: &str = r"(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)";
+const SYSTEMD_STOP_IF_PRESENT_COMMAND: &str =
+    "state=$(systemctl --user show \"$service\" --property=LoadState --no-pager 2>/dev/null); case \"$state\" in *LoadState=not-found*) :;; *) systemctl --user stop \"$service\";; esac";
+
+fn launchd_running_check(job: &str) -> String {
+    format!(
+        "launchctl print {job} 2>/dev/null | grep -Eq '{LAUNCHD_RUNNING_PATTERN}'",
+        job = job,
+    )
+}
+
 fn snapshot_command(
     paths: &DeploymentPaths,
     platform: ServicePlatform,
@@ -2614,7 +2625,9 @@ fn snapshot_command(
             "for service in dirtydash-hub.service dirtydash-collector.service; do if state=$(systemctl --user show \"$service\" --property=LoadState --property=ActiveState --property=UnitFileState --no-pager 2>/dev/null); then printf '%s\\n' \"$state\" > \"$snapshot_tmp/$service.state\"; load=$(printf '%s\\n' \"$state\" | sed -n 's/^LoadState=//p' | head -n 1); active=$(printf '%s\\n' \"$state\" | sed -n 's/^ActiveState=//p' | head -n 1); unit=$(printf '%s\\n' \"$state\" | sed -n 's/^UnitFileState=//p' | head -n 1); case \"$load\" in loaded) printf 'loaded\\n' > \"$snapshot_tmp/$service.loaded\";; *) printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\";; esac; case \"$active\" in active) printf 'active\\n' > \"$snapshot_tmp/$service.active\";; *) printf 'inactive\\n' > \"$snapshot_tmp/$service.active\";; esac; printf '%s\\n' \"$unit\" > \"$snapshot_tmp/$service.enabled\"; else printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\"; printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; printf 'disabled\\n' > \"$snapshot_tmp/$service.enabled\"; printf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=disabled\\n' > \"$snapshot_tmp/$service.state\"; fi; done".to_string()
         }
         ServicePlatform::Launchd => {
-            "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do if state=$(launchctl print \"$domain/$service\" 2>/dev/null); then printf '%s\\n' \"$state\" > \"$snapshot_tmp/$service.state\"; printf 'loaded\\n' > \"$snapshot_tmp/$service.loaded\"; if printf '%s\\n' \"$state\" | grep -Eq 'state = running|pid = [0-9]'; then printf 'active\\n' > \"$snapshot_tmp/$service.active\"; else printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; fi; else printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\"; printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; : > \"$snapshot_tmp/$service.state\"; fi; done".to_string()
+            format!(
+                "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do if state=$(launchctl print \"$domain/$service\" 2>/dev/null); then printf '%s\\n' \"$state\" > \"$snapshot_tmp/$service.state\"; printf 'loaded\\n' > \"$snapshot_tmp/$service.loaded\"; if printf '%s\\n' \"$state\" | grep -Eq '{LAUNCHD_RUNNING_PATTERN}'; then printf 'active\\n' > \"$snapshot_tmp/$service.active\"; else printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; fi; else printf 'unloaded\\n' > \"$snapshot_tmp/$service.loaded\"; printf 'inactive\\n' > \"$snapshot_tmp/$service.active\"; : > \"$snapshot_tmp/$service.state\"; fi; done"
+            )
         }
     };
     Ok(format!(
@@ -2646,9 +2659,13 @@ fn snapshot_restore_command(
     let config = config_path
         .map(shell_quote)
         .unwrap_or_else(|| "\"$HOME/.config/dirtydash/config.toml\"".to_string());
-    let service_dir = service_dir
-        .map(shell_quote)
-        .unwrap_or_else(|| "\"$HOME/.config/dirtydash/systemd/user\"".to_string());
+    let service_dir = service_dir.map(shell_quote).unwrap_or_else(|| {
+        match platform {
+            ServicePlatform::Systemd => "\"$HOME/.config/dirtydash/systemd/user\"",
+            ServicePlatform::Launchd => "\"$HOME/Library/LaunchAgents\"",
+        }
+        .to_string()
+    });
     let config_parent = config_path
         .and_then(|path| Path::new(path).parent())
         .map(|path| shell_quote(&path.display().to_string()))
@@ -2732,15 +2749,21 @@ fn rollback_service_restart_command(
         return service_restart_command(platform).to_string();
     };
     let snapshot = shell_quote(snapshot);
-    let service_dir = service_dir
-        .map(shell_quote)
-        .unwrap_or_else(|| "\"$HOME/.config/dirtydash/systemd/user\"".to_string());
+    let service_dir = service_dir.map(shell_quote).unwrap_or_else(|| {
+        match platform {
+            ServicePlatform::Systemd => "\"$HOME/.config/dirtydash/systemd/user\"",
+            ServicePlatform::Launchd => "\"$HOME/Library/LaunchAgents\"",
+        }
+        .to_string()
+    });
     match platform {
         ServicePlatform::Systemd => format!(
-            "systemctl --user daemon-reload; for service in dirtydash-hub.service dirtydash-collector.service; do if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then unit=$(cat {snapshot}/$service.enabled); case \"$unit\" in enabled*) systemctl --user enable \"$service\";; *) systemctl --user disable \"$service\" 2>/dev/null || true;; esac; if grep -qx active {snapshot}/$service.active 2>/dev/null; then systemctl --user start \"$service\"; systemctl --user is-active --quiet \"$service\"; else systemctl --user stop \"$service\" 2>/dev/null || true; if systemctl --user is-active --quiet \"$service\"; then exit 141; fi; fi; else systemctl --user stop \"$service\" 2>/dev/null || true; systemctl --user disable \"$service\" 2>/dev/null || true; systemctl --user reset-failed \"$service\" 2>/dev/null || true; if systemctl --user is-active --quiet \"$service\"; then exit 142; fi; fi; done",
+            "systemctl --user daemon-reload; for service in dirtydash-hub.service dirtydash-collector.service; do if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then unit=$(cat {snapshot}/$service.enabled); case \"$unit\" in enabled*) systemctl --user enable \"$service\";; *) systemctl --user disable \"$service\" 2>/dev/null || true;; esac; if grep -qx active {snapshot}/$service.active 2>/dev/null; then systemctl --user start \"$service\"; systemctl --user is-active --quiet \"$service\"; else {systemd_stop_if_present}; if systemctl --user is-active --quiet \"$service\"; then exit 141; fi; fi; else {systemd_stop_if_present}; systemctl --user disable \"$service\" 2>/dev/null || true; systemctl --user reset-failed \"$service\" 2>/dev/null || true; if systemctl --user is-active --quiet \"$service\"; then exit 142; fi; fi; done",
+            systemd_stop_if_present = SYSTEMD_STOP_IF_PRESENT_COMMAND,
         ),
         ServicePlatform::Launchd => format!(
-            "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do plist={service_dir}/$service.plist; if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then if ! launchctl print \"$domain/$service\" >/dev/null 2>&1; then launchctl bootstrap \"$domain\" \"$plist\"; fi; if grep -qx active {snapshot}/$service.active 2>/dev/null; then launchctl kickstart -k \"$domain/$service\"; fi; launchctl print \"$domain/$service\" >/dev/null; else launchctl bootout \"$domain/$service\" 2>/dev/null || true; if launchctl print \"$domain/$service\" >/dev/null 2>&1; then exit 143; fi; fi; done",
+            "domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do plist={service_dir}/$service.plist; job=\"$domain/$service\"; if ! launchctl bootout \"$job\" 2>/dev/null; then if launchctl print \"$job\" >/dev/null 2>&1; then exit 143; fi; fi; if launchctl print \"$job\" >/dev/null 2>&1; then exit 144; fi; if grep -qx loaded {snapshot}/$service.loaded 2>/dev/null; then launchctl bootstrap \"$domain\" \"$plist\"; if ! launchctl print \"$job\" >/dev/null 2>&1; then exit 145; fi; if grep -qx active {snapshot}/$service.active 2>/dev/null; then launchctl kickstart -k \"$job\"; if ! {running_check}; then exit 146; fi; else if {running_check}; then launchctl kill TERM \"$job\" 2>/dev/null || true; fi; if {running_check}; then exit 147; fi; fi; else if {running_check}; then exit 148; fi; fi; done",
+            running_check = launchd_running_check("\"$job\""),
         ),
     }
 }
@@ -2774,27 +2797,31 @@ fn rollback_health_command(
             ServicePlatform::Systemd => {
                 "systemctl --user is-active --quiet dirtydash-hub.service".to_string()
             }
-            ServicePlatform::Launchd => {
-                "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.hub\" >/dev/null"
-                    .to_string()
-            }
+            ServicePlatform::Launchd => format!(
+                "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.hub\" >/dev/null 2>&1; {}",
+                launchd_running_check("\"$domain/dev.dirtydash.hub\""),
+            )
         };
         let collector_active = match platform {
             ServicePlatform::Systemd => "systemctl --user is-active --quiet dirtydash-collector.service".to_string(),
-            ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.collector\" >/dev/null".to_string(),
+            ServicePlatform::Launchd => format!(
+                "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.collector\" >/dev/null 2>&1; {}",
+                launchd_running_check("\"$domain/dev.dirtydash.collector\""),
+            ),
         };
         let inactive_hub_check = match platform {
             ServicePlatform::Systemd => {
                 "systemctl --user is-active --quiet dirtydash-hub.service".to_string()
             }
-            ServicePlatform::Launchd => {
-                "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.hub\" >/dev/null 2>&1"
-                    .to_string()
-            }
+            ServicePlatform::Launchd => launchd_running_check("\"$domain/dev.dirtydash.hub\""),
         };
         let inactive_collector_check = match platform {
-            ServicePlatform::Systemd => "systemctl --user is-active --quiet dirtydash-collector.service".to_string(),
-            ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.collector\" >/dev/null 2>&1".to_string(),
+            ServicePlatform::Systemd => {
+                "systemctl --user is-active --quiet dirtydash-collector.service".to_string()
+            }
+            ServicePlatform::Launchd => {
+                launchd_running_check("\"$domain/dev.dirtydash.collector\"")
+            }
         };
         format!(
             "if grep -qx active {snapshot}/dirtydash-hub.service.active 2>/dev/null; then {hub_active}; command -v curl >/dev/null; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:\"$port\"/healthz >/dev/null; else if {inactive_hub_check}; then exit 144; fi; fi; if grep -qx active {snapshot}/dirtydash-collector.service.active 2>/dev/null; then test -x {current}/dirtydash; {current}/dirtydash --config {config} --db {database} collector diagnostics --json >/dev/null; {collector_active}; else if {inactive_collector_check}; then exit 145; fi; fi; ",
@@ -2926,10 +2953,8 @@ fn action_command(action: &RemoteAction) -> Result<String> {
             platform,
             listener,
         } => snapshot_command(paths, *platform, listener),
-        RemoteAction::QuiesceServices { platform } => Ok(match platform {
-            ServicePlatform::Systemd => "set -eu; systemctl --user stop dirtydash-hub.service; systemctl --user stop dirtydash-collector.service".to_string(),
-            ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); launchctl kill TERM \"$domain/dev.dirtydash.hub\" 2>/dev/null || true; launchctl kill TERM \"$domain/dev.dirtydash.collector\" 2>/dev/null || true".to_string(),
-        }),
+        RemoteAction::QuiesceServices { platform } =>
+            Ok(service_quiesce_command(*platform).to_string()),
         RemoteAction::AtomicallyActivate { current, release, platform } => {
             let temp = format!("{current}.next-{}", std::process::id());
             let move_command = match platform {
@@ -2984,7 +3009,7 @@ fn action_command(action: &RemoteAction) -> Result<String> {
         }
         RemoteAction::RestartServices { platform } => Ok(match platform {
             ServicePlatform::Systemd => "set -eu; systemctl --user daemon-reload; systemctl --user enable dirtydash-hub.service dirtydash-collector.service; systemctl --user restart dirtydash-hub.service; systemctl --user restart dirtydash-collector.service; systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service".to_string(),
-            ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null; launchctl print \"$collector\" >/dev/null".to_string(),
+            ServicePlatform::Launchd => service_restart_command(*platform).to_string(),
         }),
         RemoteAction::HealthCheck { port, platform } => Ok(format!(
             "set -eu; command -v curl >/dev/null; curl --fail --silent --show-error --max-time 10 http://127.0.0.1:{port}/healthz >/dev/null; {}",
@@ -3086,21 +3111,21 @@ fn listener_restore_command(plan: &ListenerPlan) -> String {
 fn service_health_command(platform: ServicePlatform) -> &'static str {
     match platform {
         ServicePlatform::Systemd => "systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service",
-        ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.hub\" >/dev/null; launchctl print \"$domain/dev.dirtydash.collector\" >/dev/null",
+        ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl print \"$domain/dev.dirtydash.hub\" >/dev/null 2>&1; launchctl print \"$domain/dev.dirtydash.hub\" 2>/dev/null | grep -Eq '(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)'; launchctl print \"$domain/dev.dirtydash.collector\" >/dev/null 2>&1; launchctl print \"$domain/dev.dirtydash.collector\" 2>/dev/null | grep -Eq '(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)'",
     }
 }
 
 fn service_quiesce_command(platform: ServicePlatform) -> &'static str {
     match platform {
-        ServicePlatform::Systemd => "systemctl --user stop dirtydash-hub.service; systemctl --user stop dirtydash-collector.service",
-        ServicePlatform::Launchd => "domain=gui/$(id -u); launchctl kill TERM \"$domain/dev.dirtydash.hub\" 2>/dev/null || true; launchctl kill TERM \"$domain/dev.dirtydash.collector\" 2>/dev/null || true",
+        ServicePlatform::Systemd => "set -eu; for service in dirtydash-hub.service dirtydash-collector.service; do state=$(systemctl --user show \"$service\" --property=LoadState --no-pager 2>/dev/null); case \"$state\" in *LoadState=not-found*) :;; *) systemctl --user stop \"$service\";; esac; done",
+        ServicePlatform::Launchd => "set -eu; domain=gui/$(id -u); for service in dev.dirtydash.hub dev.dirtydash.collector; do launchctl kill TERM \"$domain/$service\" 2>/dev/null || true; if ! launchctl bootout \"$domain/$service\" 2>/dev/null; then if launchctl print \"$domain/$service\" >/dev/null 2>&1; then exit 149; fi; fi; if launchctl print \"$domain/$service\" >/dev/null 2>&1; then exit 150; fi; done",
     }
 }
 
 fn service_restart_command(platform: ServicePlatform) -> &'static str {
     match platform {
         ServicePlatform::Systemd => "systemctl --user daemon-reload; systemctl --user restart dirtydash-hub.service; systemctl --user restart dirtydash-collector.service; systemctl --user is-active --quiet dirtydash-hub.service; systemctl --user is-active --quiet dirtydash-collector.service",
-        ServicePlatform::Launchd => "domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null; launchctl print \"$collector\" >/dev/null",
+        ServicePlatform::Launchd => "domain=gui/$(id -u); hub=$domain/dev.dirtydash.hub; collector=$domain/dev.dirtydash.collector; if launchctl print \"$hub\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.hub.plist\"; fi; if launchctl print \"$collector\" >/dev/null 2>&1; then :; else launchctl bootstrap \"$domain\" \"$HOME/Library/LaunchAgents/dev.dirtydash.collector.plist\"; fi; launchctl kickstart -k \"$hub\"; launchctl kickstart -k \"$collector\"; launchctl print \"$hub\" >/dev/null 2>&1; launchctl print \"$hub\" 2>/dev/null | grep -Eq '(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)'; launchctl print \"$collector\" >/dev/null 2>&1; launchctl print \"$collector\" 2>/dev/null | grep -Eq '(^|[[:space:]])state = running([[:space:]]|$)|(^|[[:space:]])pid = [1-9][0-9]*([[:space:]]|$)'",
     }
 }
 
