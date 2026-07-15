@@ -14,15 +14,15 @@ Harness: `pi`
 
 Adapter contract: `dirtyloops-harness/1`
 
-Current phase: 3 — Collector runtime
+Current phase: none; Phase 4 is ready but not yet claimed
 
-Current Beads issue: `dirtydash-px3.3`
+Current Beads issue: none
 
-Current PR: pending from `lavender/remote-hub-collector-fleet-3-collector` into `lavender/remote-hub-collector-fleet-implementation`
+Current PR: none
 
-Current execution strategy: Luna-max durable implementation/review sessions supported by parent-mediated Sol-low pi-subagents scouts
+Current execution strategy: none between phases
 
-Last completed phase: 2 — Storage and protocol foundation (`dirtydash-px3.2`, PR #9)
+Last completed phase: 3 — Collector runtime (`dirtydash-px3.3`, PR #10)
 
 Blocked: no
 
@@ -46,7 +46,7 @@ Blocked: no
 |---|---|---|---|---|
 | 1 | `dirtydash-px3.1` | closed | #8 merged (`98f3453`) | `turn-docs/dirtydash-px3.1.md` |
 | 2 | `dirtydash-px3.2` | closed | #9 merged (`5dd6b70`) | `turn-docs/dirtydash-px3.2.md` |
-| 3 | `dirtydash-px3.3` | in progress | pending | `turn-docs/dirtydash-px3.3.md` |
+| 3 | `dirtydash-px3.3` | closed | #10 merged (`68e4e55`) | `turn-docs/dirtydash-px3.3.md` |
 | 4 | `dirtydash-px3.4` | open | none | `turn-docs/dirtydash-px3.4.md` |
 | 5 | `dirtydash-px3.5` | open | none | `turn-docs/dirtydash-px3.5.md` |
 | 6 | `dirtydash-px3.6` | open | none | `turn-docs/dirtydash-px3.6.md` |
@@ -54,4 +54,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Phase 3 claimed. Its attached worktree and symbolic branch are verified, and the orchestration brief is recorded before Collector implementation.
+Phase 3 closed after privacy/reliability review and three repair passes. PR #10 merged into the integration branch; Phase 4 is ready for selection.

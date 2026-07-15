@@ -80,27 +80,28 @@ The mutable implementation session incorporated both accepted read-only Sol-low 
 
 ## Review
 
-Focused independent re-review identified two confirmed blockers and no broader scope expansion. The earlier repair closed the canonical identity mismatch/durable delivery-state gap and removed raw credential material from command/ack persistence while preserving overlap fallback and crash replay. The final review found and repaired the acknowledgement-result migration omission described above. No merge was performed in this session.
+Approved after four independent `thermo-nuclear-code-quality-review` rounds and three bounded repair passes.
+
+- Initial review found the runtime was library-only, parser detection/privacy and identity were unsafe, pricing provenance was lost, credential/retry/command/update behavior was incomplete, and tests bypassed crash/watcher/long-poll states. Commit `ba27c4b` closed that set.
+- Focused review then found repeated Refresh outbox growth and plaintext rotation secrets in Hub command persistence. Commit `eb8a614` implemented durable canonical event state and secret-free locally generated rotation with activation/proof.
+- Migration review found legacy acknowledgement secrets were not scrubbed; `4d0456a` fixed production migration behavior.
+- Final test-fixture review approved `08f9cd5`, confirming isolated sentinels, all-table scans, preserved safe history, and idempotent double migration.
+- Final verdict: approved, no remaining blockers.
 
 ## CI And Gates
 
-Owner: current Phase 3 mutable owner; coordinator retains integration/merge ownership
+Owner: coordinator
 
-State: passed locally; PR #10 push/remote verification passed
+State: `ci-unavailable-with-evidence`
 
 Evidence:
 
-- The final red-capable migration regression initially failed with the sentinel still in `collector_commands.result_json`; it passes after the migration update.
-- Focused migration tests pass (2 tests): `cargo test -p dirtydash --lib hub::tests::migration_ -- --nocapture`.
-- Focused Hub security regression passes: `collector_rotation_uses_non_secret_instruction_and_secret_free_hub_persistence`.
-- Focused Collector suite passes 14 tests, including repeated startup/manual/owner Refresh before and after delivery, missing timestamps, tombstones, terminal outbox bounding, local rotation generation, fallback, proof retry, restart reclaim, atomic commit, and acknowledgement redaction.
-- Focused Hub suite passes 31 tests, including overlap activation/proof, idempotent retries, command JSON/ack secret rejection, all-table raw-token scan, and legacy command migration cleanup.
-- `cargo fmt --all -- --check` passed.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
-- `cargo test --workspace --all-targets --all-features` passed: 54 unit tests, 6 CLI tests, and 14 Collector integration tests.
-- `git diff --check` passed.
-- Runtime-artifact check found no `.sqlite3`, `.db`, WAL/SHM, log, or temporary files outside ignored build/tracker directories.
-- `git pull --rebase && git push` succeeded; the clean branch is up to date with `origin`, and PR #10 is open with the expected head/base refs.
+- GitHub reported no configured check runs for PR #10.
+- Coordinator reran `cargo fmt --all --check`: passed.
+- Coordinator reran `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- Coordinator reran `cargo test --all-targets`: passed (54 unit tests, 6 CLI tests, 14 Collector integration tests).
+- Coordinator reran `git diff --check origin/lavender/remote-hub-collector-fleet-implementation...HEAD`: passed.
+- Focused migration, Hub security, replay, parser, watcher, rotation, and command tests passed during implementation and repair.
 
 ## PR And Commits
 
@@ -108,13 +109,15 @@ Evidence:
 - Repair commit: `eb8a614` (`repair collector refresh idempotency and secret-free rotation`).
 - Final migration repair commit: `4d0456a` (`fix: scrub legacy collector command acknowledgements`).
 - Test-only closeout correction: `08f9cd5` (`test: isolate legacy migration credential fixtures`).
-- Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`, state open.
-- Coordinator retains integration/merge ownership; this session does not mutate Beads or merge the PR.
+- Phase PR: [#10](https://github.com/dirtydishes/dirtydash/pull/10), head `lavender/remote-hub-collector-fleet-3-collector`, base `lavender/remote-hub-collector-fleet-implementation`.
+- Merged: 2026-07-15 at merge commit `68e4e55`.
 
 
 ## Beads Updates And Follow-Ups
 
-Loop creation superseded old refresh, remote-sync, harness, and watcher issues with this phase where appropriate.
+- `dirtydash-px3.3` closed after acceptance, independent review, repair evidence, coordinator gates, and PR merge.
+- Phase 4 (`dirtydash-px3.4`) is now ready.
+- No follow-up issue was required; service installation and deployment wiring remain in the accepted Phase 4 scope.
 
 ## Plan Amendments
 
@@ -126,4 +129,4 @@ Metadata redaction and stable event identity are acceptance boundaries, not late
 
 ## Closeout
 
-Final review and the bounded migration repair are complete in the Phase 3 mutable worktree. Code, regression coverage, focused security/migration checks, all requested Rust gates, runtime-artifact cleanup, and PR #10 push verification are recorded here. The coordinator retains Beads and merge ownership.
+Phase 3 complete. The outbound Collector runtime, five-Agent parsing, durable delivery, watcher/reconciliation fallback, command channel, privacy boundaries, and secret-free rotation are implemented; all independent review blockers were repaired; final review approved; coordinator gates passed; unavailable CI is documented; Beads is closed; and PR #10 is merged into the integration branch.
