@@ -169,8 +169,9 @@ impl Database {
     }
 
     pub fn migrate(&self) -> Result<()> {
-        let conn = self.connection()?;
-        conn.execute_batch(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -257,8 +258,8 @@ impl Database {
             "#,
         )
         .context("applying SQLite migrations")?;
-        self.ensure_usage_event_columns(&conn)?;
-        conn.execute_batch(
+        self.ensure_usage_event_columns(&tx)?;
+        tx.execute_batch(
             r#"
             CREATE INDEX IF NOT EXISTS idx_usage_events_turn
                 ON usage_events(turn_id);
@@ -266,7 +267,8 @@ impl Database {
                 ON usage_events(pricing_mode);
             "#,
         )?;
-        self.migrate_hub_schema(&conn)?;
+        self.migrate_hub_schema(&tx)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -282,7 +284,10 @@ impl Database {
             )?;
         }
         if !columns.iter().any(|column| column == "reasoning_effort") {
-            conn.execute("ALTER TABLE usage_events ADD COLUMN reasoning_effort TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE usage_events ADD COLUMN reasoning_effort TEXT",
+                [],
+            )?;
         }
         if !columns.iter().any(|column| column == "machine_id") {
             conn.execute("ALTER TABLE usage_events ADD COLUMN machine_id TEXT", [])?;
@@ -290,14 +295,20 @@ impl Database {
         if !columns.iter().any(|column| column == "agent") {
             conn.execute("ALTER TABLE usage_events ADD COLUMN agent TEXT", [])?;
         }
-        if !columns.iter().any(|column| column == "collector_event_fingerprint") {
+        if !columns
+            .iter()
+            .any(|column| column == "collector_event_fingerprint")
+        {
             conn.execute(
                 "ALTER TABLE usage_events ADD COLUMN collector_event_fingerprint TEXT",
                 [],
             )?;
         }
         if !columns.iter().any(|column| column == "ingest_batch_id") {
-            conn.execute("ALTER TABLE usage_events ADD COLUMN ingest_batch_id TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE usage_events ADD COLUMN ingest_batch_id TEXT",
+                [],
+            )?;
         }
         conn.execute(
             "UPDATE usage_events SET machine_id = machine WHERE machine_id IS NULL",
@@ -419,6 +430,16 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_owner_sessions_owner
                 ON owner_sessions(owner_id, revoked_at, expires_at);
 
+            CREATE TABLE IF NOT EXISTS owner_tailscale_identities (
+                owner_id TEXT NOT NULL,
+                tailscale_identity TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(owner_id, tailscale_identity),
+                FOREIGN KEY(owner_id) REFERENCES owners(owner_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_owner_tailscale_identities_owner
+                ON owner_tailscale_identities(owner_id);
+
             CREATE TABLE IF NOT EXISTS backup_metadata (
                 backup_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
@@ -433,6 +454,8 @@ impl Database {
 
             INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES (2, datetime('now'));
+            INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+            VALUES (3, datetime('now'));
             "#,
         )
         .context("applying hub schema migrations")?;
