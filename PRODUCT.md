@@ -6,11 +6,11 @@ product
 
 ## Users
 
-Dirtydash is for technical developers who already live in terminals, SSH sessions, and local tooling. They are comfortable with CLI workflows, use multiple AI coding tools, and want a grounded way to understand token usage, cost, cache behavior, and session history without leaving their machine or trusting a remote SaaS dashboard.
+Dirtydash is for technical developers who already live in terminals, SSH sessions, and local tooling. They are comfortable with CLI workflows, use multiple AI coding tools, and want a grounded way to understand token usage, cost, cache behavior, and session history without trusting a remote SaaS dashboard. Some will stay fully local; others will want the same inspection posture across a self-hosted Hub and their own Machines.
 
 ## Product Purpose
 
-Dirtydash is a local-first dashboard for tracking AI coding activity across tools. It should make usage, cost, cache, and session history easier to inspect, compare, and reason about. Success means a developer can answer practical questions quickly: what was used, what it cost, what cached well, which sessions mattered, and whether the numbers are trustworthy.
+Dirtydash is a local-first dashboard for tracking AI coding activity across tools. It should make usage, cost, cache, and session history easier to inspect, compare, and reason about. Success means a developer can answer practical questions quickly: what was used, what it cost, what cached well, which sessions mattered, and whether the numbers are trustworthy. The product must preserve that posture in both loopback-local mode and the optional self-hosted Hub plus Collector fleet, with metadata-only sync rather than hosted surveillance.
 
 ## Brand Personality
 
@@ -25,6 +25,7 @@ Avoid generic AI SaaS gloss, childish kitchen gimmicks, crypto-dashboard panic, 
 - Prefer inspection over persuasion. The interface should help users verify what happened, not sell them on a narrative.
 - Make density usable. Compact layouts are welcome when hierarchy, alignment, and interaction states stay clear.
 - Keep trust visible. Show provenance, time ranges, assumptions, stale data, and uncertainty where they affect interpretation.
+- Preserve local ownership. The loopback experience must stay account-free, and the self-hosted fleet experience must keep privacy boundaries explicit.
 - Speak terminal-native. Copy, structure, and visual rhythm should respect users who already think in commands, logs, sessions, and files.
 - Use brand grit with restraint. The product can feel rough-edged and local, but never messy, childish, or imprecise.
 

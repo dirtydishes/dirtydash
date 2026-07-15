@@ -1,5 +1,7 @@
 # Refresh, Remote Sync, Harness, Layout, And Theme Roadmap
 
+> **Superseded roadmap:** preserved for historical context only. Active remote architecture planning moved to `docs/implementation/remote-hub-collector-fleet/` under Beads epic `dirtydash-px3`.
+
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
 
 ## Plan Source
@@ -8,7 +10,7 @@ Conversation attachment `PLAN (13).md`, normalized into this Beads-canonical dir
 
 ## Outcome
 
-Dirtydash gets one explicit refresh path used by dashboard launch, refresh button, and `r`; the Ledger workspace is reshaped around a larger chart; built-in themes are selectable and persisted; remote sync imports usage metadata agentlessly over SSH; and OpenCode/Hermes Agent support is hardened with fixtures. Live watcher/SSE remains future work.
+Historical outcome only: Dirtydash gets one explicit refresh path used by dashboard launch, refresh button, and `r`; the Ledger workspace is reshaped around a larger chart; built-in themes are selectable and persisted; remote sync imports usage metadata agentlessly over SSH; and OpenCode/Hermes Agent support is hardened with fixtures. The active remote direction now supersedes the SSH-pull portion with the Hub/Collector fleet. Live watcher/SSE remains future work.
 
 ## Phase Sequence
 

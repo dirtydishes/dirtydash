@@ -1,5 +1,7 @@
 # Phase 4: Agentless SSH Remote Sync
 
+> **Superseded phase record:** preserved for historical context only. The active remote implementation stream is the Hub/Collector fleet in `docs/implementation/remote-hub-collector-fleet/`.
+
 Canonical Beads issue: `dirtydash-refresh-loop.4`
 
 Epic: `dirtydash-refresh-loop`
@@ -8,7 +10,7 @@ Status is tracked in Beads. This doc is implementation context.
 
 ## Outcome
 
-Extend remote sync from file-count discovery to agentless remote usage import while preserving local-first behavior, remote provenance, and non-blocking dashboard freshness.
+Historical outcome only: extend remote sync from file-count discovery to agentless remote usage import while preserving local-first behavior, remote provenance, and non-blocking dashboard freshness.
 
 ## Scope
 

@@ -1,5 +1,7 @@
 # Phase 4 Turn Doc: Agentless SSH Remote Sync
 
+> **Superseded turn doc:** preserved for historical context only. Active remote implementation moved to `dirtydash-px3` and the Hub/Collector fleet stream.
+
 Beads issue: `dirtydash-refresh-loop.4`
 
 Phase doc: `docs/implementation/refresh-remote-harness-layout-theme/04-agentless-ssh-remote-sync.md`
@@ -8,7 +10,7 @@ This is the single Markdown turn doc for the phase.
 
 ## Phase Selection
 
-Not started. Blocked by `dirtydash-refresh-loop.3`.
+Not started in this historical stream. The remote direction was later superseded by `dirtydash-px3`.
 
 ## Scope
 

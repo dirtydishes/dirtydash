@@ -1,10 +1,12 @@
 # Loop State
 
+> **Superseded loop state:** preserved as a historical resume aid only. The active remote implementation stream is `dirtydash-px3` in `docs/implementation/remote-hub-collector-fleet/`.
+
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
 
 This file is a compact resume aid only. If this file disagrees with Beads, Beads wins.
 
-Status: active
+Status: superseded
 
 Stream: `refresh-remote-harness-layout-theme`
 
@@ -22,7 +24,7 @@ Blocked: no
 
 ## Decisions
 
-- In-scope phases are plan phases 1-5: refresh foundation, Ledger layout reshape, themes, agentless SSH remote sync, and OpenCode/Hermes harness support.
+- Historical in-scope phases were plan phases 1-5: refresh foundation, Ledger layout reshape, themes, agentless SSH remote sync, and OpenCode/Hermes harness support.
 - Plan phase 6, live watcher/SSE, is explicitly future scope and filed as `dirtydash-live-watcher-future`.
 - The run orchestrator must capture its own concrete Codex thread id before launching child threads.
 - Child-thread prompt templates use `RUNTIME_ORCHESTRATOR_THREAD_ID` until the run orchestrator replaces it with that concrete id.
@@ -49,4 +51,4 @@ Blocked: no
 
 ## Last Coordinator Update
 
-Loop scaffold created. Implementation has not started.
+Loop scaffold created. Remote sync planning in this stream was later superseded by the Hub/Collector fleet stream; preserve this file for history rather than execution.

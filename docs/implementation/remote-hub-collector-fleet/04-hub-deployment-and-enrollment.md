@@ -38,7 +38,7 @@ Out of scope:
 
 ## Settled Decisions
 
-Tailscale Serve is the default private entry point; public access uses fallback administrator login; SSH aliases and key paths resolve on the Hub host.
+Tailscale Serve is the default private entry point; public access uses fallback administrator login; SSH aliases and key paths resolve on the Hub host. See `ADR-0003: Tailscale And Fallback Administrator Authentication` for the canonical trust-mode boundary.
 
 ## Open Questions
 

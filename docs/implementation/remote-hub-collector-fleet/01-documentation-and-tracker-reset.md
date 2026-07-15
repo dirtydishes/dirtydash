@@ -50,7 +50,7 @@ None.
 ## Acceptance Evidence
 
 - Beads shows `dirtydash-px3` as the replacement for `dirtydash-refresh-loop` and its obsolete children.
-- `CONTEXT.md`, ADRs, product copy, and protocol/privacy invariants are cross-consistent.
+- `docs/implementation/remote-hub-collector-fleet/CONTEXT.md`, `docs/implementation/remote-hub-collector-fleet/adr/`, product copy, and `docs/implementation/remote-hub-collector-fleet/API_V1_INVARIANTS.md` are cross-consistent.
 - No active roadmap still directs implementation toward agentless SSH pull.
 
 ## Quality Gates

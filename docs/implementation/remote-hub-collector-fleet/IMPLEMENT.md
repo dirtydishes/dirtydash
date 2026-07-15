@@ -50,6 +50,9 @@ Non-goals: PostgreSQL adapter implementation; centrally stored prompts, response
 
 - Beads epic: `dirtydash-px3`
 - Accepted plan: user-supplied plan accepted 2026-07-12
+- Canonical glossary: `docs/implementation/remote-hub-collector-fleet/CONTEXT.md`
+- Protocol/privacy invariants: `docs/implementation/remote-hub-collector-fleet/API_V1_INVARIANTS.md`
+- Accepted ADRs: `docs/implementation/remote-hub-collector-fleet/adr/`
 - Roadmap: `docs/implementation/remote-hub-collector-fleet/00-roadmap.md`
 - Phase docs linked from Beads
 - Turn docs: `docs/implementation/remote-hub-collector-fleet/turn-docs/`
@@ -90,7 +93,7 @@ Non-goals: PostgreSQL adapter implementation; centrally stored prompts, response
 
 ## Branch And PR Constraints
 
-One active phase PR at a time, in phase order. Branches use `lavender/remote-hub-collector-fleet-<phase>` and target `main` on `origin`. Beads, review, CI, repairs, and PR state remain in the phase's single turn doc.
+One active phase PR at a time, in phase order. Branches use `lavender/remote-hub-collector-fleet-<phase>` and target `lavender/remote-hub-collector-fleet-implementation` on `origin` for this stream. Beads, review, CI, repairs, and PR state remain in the phase's single turn doc.
 
 ## Storyboard
 

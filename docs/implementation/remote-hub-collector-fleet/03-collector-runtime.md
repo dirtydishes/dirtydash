@@ -12,7 +12,7 @@ A durable outbound-only Collector parses supported local harness data, redacts i
 
 ## Why This Phase Exists
 
-Fleet freshness and privacy depend on moving parsing and provenance handling to each machine while making delivery durable and idempotent.
+Fleet freshness and privacy depend on moving parsing and provenance handling to each machine while making delivery durable and idempotent within the `CONTEXT.md` glossary and `/api/v1` privacy invariants.
 
 ## Scope
 

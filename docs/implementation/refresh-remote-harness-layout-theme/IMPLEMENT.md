@@ -1,5 +1,7 @@
 # Refresh, Remote Sync, Harness, Layout, And Theme Implementation Loop
 
+> **Superseded historical stream:** This loop is preserved for history only. The active remote implementation stream is `dirtydash-px3` in `docs/implementation/remote-hub-collector-fleet/`, which replaces the agentless SSH-pull direction with the accepted Hub/Collector fleet.
+
 Workflow: `orchestrator-callback`
 
 Canonical tracker: Beads epic `dirtydash-refresh-loop`
@@ -8,7 +10,7 @@ This stream is driven by Beads. These docs are execution context and resume aids
 
 ## Goal
 
-Build the finalized Dirtydash refresh, remote sync, harness, Ledger layout, and theme upgrade as a bounded five-phase stream. The stream implements explicit refresh first, then Ledger reshaping, themes, agentless SSH remote import, and OpenCode/Hermes harness support. Live watcher/SSE work is intentionally future scope and is tracked separately as `dirtydash-live-watcher-future`.
+Historical goal only: build the finalized Dirtydash refresh, remote sync, harness, Ledger layout, and theme upgrade as a bounded five-phase stream. This stream is superseded for remote architecture purposes; active implementation moved to the Hub/Collector fleet stream, while Live watcher/SSE remains future scope as `dirtydash-live-watcher-future`.
 
 ## Sources Of Truth
 
