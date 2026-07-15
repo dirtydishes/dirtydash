@@ -43,6 +43,10 @@ pub struct TrustedProxyConfig {
     pub identity_header: String,
     pub provenance_header: String,
     pub provenance_value: String,
+    /// Direct peer IPs or CIDRs allowed to supply the trusted proxy headers.
+    /// An empty policy fails closed.
+    #[serde(default)]
+    pub source_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -21,10 +21,19 @@ fn test_app(repo: HubRepository, trust_mode: ListenerTrustMode) -> Router {
 }
 
 fn test_app_with_config(repo: HubRepository, config: HubRouterConfig) -> Router {
-    build_router_with_config(repo, config).layer(Extension(ConnectInfo(SocketAddr::from((
-        [127, 0, 0, 1],
-        0,
-    )))))
+    test_app_with_peer(repo, config, Some(SocketAddr::from(([127, 0, 0, 1], 0))))
+}
+
+fn test_app_with_peer(
+    repo: HubRepository,
+    config: HubRouterConfig,
+    peer: Option<SocketAddr>,
+) -> Router {
+    let app = build_router_with_config(repo, config);
+    match peer {
+        Some(peer) => app.layer(Extension(ConnectInfo(peer))),
+        None => app,
+    }
 }
 
 fn test_repo() -> HubRepository {
@@ -375,13 +384,16 @@ async fn trusted_proxy_identity_requires_explicit_provenance_and_mapping() {
     let repo = test_repo();
     let config = HubRouterConfig::for_listener(ListenerTrustMode::TrustedProxy)
         .with_tailscale_mapping(TailscaleOwnerMapping::new("owner", "owner@example.com"))
-        .with_trusted_proxy(TrustedProxyConfig::new(
-            "x-tailscale-identity",
-            "x-dirtydash-proxy-provenance",
-            "proxy-verified",
-        ))
+        .with_trusted_proxy(
+            TrustedProxyConfig::new(
+                "x-tailscale-identity",
+                "x-dirtydash-proxy-provenance",
+                "proxy-verified",
+            )
+            .with_source_cidr("127.0.0.0/8"),
+        )
         .with_bootstrap_boundary(BootstrapBoundary::LoopbackOnly);
-    let app = test_app_with_config(repo, config);
+    let app = test_app_with_config(repo.clone(), config.clone());
     let bootstrap = app
         .clone()
         .oneshot(
@@ -417,6 +429,38 @@ async fn trusted_proxy_identity_requires_explicit_provenance_and_mapping() {
         .await
         .unwrap();
     assert_eq!(approved.status(), StatusCode::OK);
+    let approved_cookie = approved
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let current_session = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/session")
+                .header(header::COOKIE, &approved_cookie)
+                .header("x-tailscale-identity", "owner@example.com")
+                .header("x-dirtydash-proxy-provenance", "proxy-verified")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(current_session.status(), StatusCode::OK);
+    let current_body = json_response(current_session).await;
+    assert_eq!(current_body.get("authenticated").unwrap(), true);
+    assert_eq!(
+        current_body.get("trusted_tailscale_user").unwrap(),
+        "owner@example.com"
+    );
 
     let forged_direct = app
         .clone()
@@ -445,6 +489,59 @@ async fn trusted_proxy_identity_requires_explicit_provenance_and_mapping() {
         .await
         .unwrap();
     assert_eq!(wrong_provenance.status(), StatusCode::UNAUTHORIZED);
+
+    let direct_peer_app = test_app_with_peer(
+        repo.clone(),
+        config.clone(),
+        Some(SocketAddr::from(([192, 0, 2, 10], 0))),
+    );
+    let forged_direct_with_expected_headers = direct_peer_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/session/tailscale")
+                .header("x-tailscale-identity", "owner@example.com")
+                .header("x-dirtydash-proxy-provenance", "proxy-verified")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        forged_direct_with_expected_headers.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let forged_existing_session = direct_peer_app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/session")
+                .header(header::COOKIE, &approved_cookie)
+                .header("x-tailscale-identity", "owner@example.com")
+                .header("x-dirtydash-proxy-provenance", "proxy-verified")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged_existing_session.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_peer_app = test_app_with_peer(repo, config, None);
+    let missing_peer = missing_peer_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/session/tailscale")
+                .header("x-tailscale-identity", "owner@example.com")
+                .header("x-dirtydash-proxy-provenance", "proxy-verified")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_peer.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

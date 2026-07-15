@@ -54,10 +54,13 @@ async fn serve_async(db_path: PathBuf, args: ServeArgs) -> Result<()> {
         let _ = webbrowser::open(&url);
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("running dashboard server")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("running dashboard server")?;
     Ok(())
 }
 

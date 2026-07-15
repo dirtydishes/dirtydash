@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
@@ -14,7 +15,9 @@ mod router;
 #[cfg(test)]
 mod tests;
 
-pub use router::{build_router, build_router_with_config};
+pub use router::{
+    build_router, build_router_with_config, build_router_with_config_and_connect_info,
+};
 
 pub(crate) use errors::{
     hash_password, header_value, normalize_utc_timestamp, now_utc, parse_utc_timestamp,
@@ -84,6 +87,9 @@ pub struct TrustedProxyConfig {
     pub identity_header: String,
     pub provenance_header: String,
     pub provenance_value: String,
+    /// Direct peer IPs or CIDRs allowed to supply the trusted proxy headers.
+    /// An empty policy fails closed.
+    pub source_cidrs: Vec<String>,
 }
 
 impl TrustedProxyConfig {
@@ -96,8 +102,71 @@ impl TrustedProxyConfig {
             identity_header: identity_header.into(),
             provenance_header: provenance_header.into(),
             provenance_value: provenance_value.into(),
+            source_cidrs: Vec::new(),
         }
     }
+
+    pub fn with_source_cidr(mut self, source_cidr: impl Into<String>) -> Self {
+        self.source_cidrs.push(source_cidr.into());
+        self
+    }
+
+    pub fn with_source_cidrs<I, S>(mut self, source_cidrs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.source_cidrs
+            .extend(source_cidrs.into_iter().map(Into::into));
+        self
+    }
+
+    fn trusts_peer(&self, peer: SocketAddr) -> bool {
+        self.source_cidrs
+            .iter()
+            .any(|source_cidr| ip_matches_cidr(peer.ip(), source_cidr))
+    }
+}
+
+fn ip_matches_cidr(peer: IpAddr, source_cidr: &str) -> bool {
+    let Some((network, prefix)) = source_cidr.split_once('/') else {
+        return source_cidr.parse::<IpAddr>().ok() == Some(peer);
+    };
+    let Ok(network) = network.parse::<IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+
+    match (peer, network) {
+        (IpAddr::V4(peer), IpAddr::V4(network)) => {
+            masked_ip_matches(peer.octets(), network.octets(), prefix)
+        }
+        (IpAddr::V6(peer), IpAddr::V6(network)) => {
+            masked_ip_matches(peer.octets(), network.octets(), prefix)
+        }
+        _ => false,
+    }
+}
+
+fn masked_ip_matches<const N: usize>(peer: [u8; N], network: [u8; N], prefix: u8) -> bool {
+    let max_prefix = (N * 8) as u8;
+    if prefix > max_prefix {
+        return false;
+    }
+
+    let full_bytes = usize::from(prefix / 8);
+    if peer[..full_bytes] != network[..full_bytes] {
+        return false;
+    }
+    let remaining_bits = prefix % 8;
+    if remaining_bits == 0 {
+        return true;
+    }
+
+    let mask = u8::MAX << (8 - remaining_bits);
+    peer[full_bytes] & mask == network[full_bytes] & mask
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +262,7 @@ impl HubRouterConfig {
                 proxy.provenance_header.clone(),
                 proxy.provenance_value.clone(),
             )
+            .with_source_cidrs(proxy.source_cidrs.clone())
         });
         if let Some(setup_token) = &config.bootstrap_setup_token {
             router_config = router_config.with_bootstrap_setup_token(setup_token.clone());

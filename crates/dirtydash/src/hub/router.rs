@@ -1,5 +1,6 @@
 use super::*;
 
+use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -7,10 +8,25 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use std::net::SocketAddr;
 
-/// Backwards-compatible builder. Its defaults are HTTPS cookies and a loopback-only
-/// fresh-owner setup boundary; callers serving real sockets must provide connect info.
+/// Backwards-compatible router builder for composition and in-process tests.
+///
+/// Production callers serving real sockets must use
+/// [`build_router_with_config_and_connect_info`] so every request receives the
+/// transport-authenticated peer address.
 pub fn build_router(repo: HubRepository, trust_mode: ListenerTrustMode) -> Router {
     build_router_with_config(repo, HubRouterConfig::for_listener(trust_mode))
+}
+
+/// Build the production Hub service with transport-authenticated peer addresses.
+///
+/// The returned make-service is ready for `axum::serve`; using this seam makes
+/// `ConnectInfo<SocketAddr>` available to every request without trusting request
+/// headers for the peer identity.
+pub fn build_router_with_config_and_connect_info(
+    repo: HubRepository,
+    config: HubRouterConfig,
+) -> IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    build_router_with_config(repo, config).into_make_service_with_connect_info::<SocketAddr>()
 }
 
 pub fn build_router_with_config(repo: HubRepository, config: HubRouterConfig) -> Router {
@@ -77,15 +93,18 @@ async fn admin_login(
 
 async fn admin_tailscale_login(
     State(state): State<HubState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Response, HubError> {
     let trusted_identity =
-        trusted_tailscale_identity(&headers, &state.config)?.ok_or_else(|| {
-            HubError::unauthorized(
-                "trusted-tailscale-required",
-                "trusted Tailscale identity is required on this listener",
-            )
-        })?;
+        trusted_tailscale_identity(peer.map(|info| info.0), &headers, &state.config)?.ok_or_else(
+            || {
+                HubError::unauthorized(
+                    "trusted-tailscale-required",
+                    "trusted Tailscale identity is required on this listener",
+                )
+            },
+        )?;
     let session = state
         .repo
         .login_owner_via_tailscale(&trusted_identity, &state.config.tailscale_owner_mappings)?;
@@ -94,8 +113,11 @@ async fn admin_tailscale_login(
 
 async fn admin_session(
     State(state): State<HubState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Result<Json<CurrentSessionResponse>, HubError> {
+    let trusted_identity =
+        trusted_tailscale_identity(peer.map(|info| info.0), &headers, &state.config)?;
     if let Some(session_id) = owner_session_cookie(&headers) {
         let session = state.repo.authenticate_owner_session(&session_id)?;
         return Ok(Json(CurrentSessionResponse {
@@ -109,7 +131,7 @@ async fn admin_session(
         authenticated: false,
         owner_username: None,
         time_zone: None,
-        trusted_tailscale_user: trusted_tailscale_identity(&headers, &state.config)?,
+        trusted_tailscale_user: trusted_identity,
     }))
 }
 
@@ -275,6 +297,7 @@ fn owner_session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 fn trusted_tailscale_identity(
+    peer: Option<SocketAddr>,
     headers: &HeaderMap,
     config: &HubRouterConfig,
 ) -> Result<Option<String>, HubError> {
@@ -292,6 +315,18 @@ fn trusted_tailscale_identity(
                     "trusted proxy provenance is not configured",
                 ));
             };
+            let Some(peer) = peer else {
+                return Err(HubError::unauthorized(
+                    "trusted-proxy-peer-required",
+                    "trusted proxy identity requires transport connection information",
+                ));
+            };
+            if !proxy.trusts_peer(peer) {
+                return Err(HubError::unauthorized(
+                    "trusted-proxy-peer-untrusted",
+                    "the transport peer is not an approved trusted proxy source",
+                ));
+            }
             let provenance = exact_header_value(headers, &proxy.provenance_header)?;
             if provenance.as_deref() != Some(proxy.provenance_value.as_str()) {
                 return Ok(None);
