@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -742,6 +744,154 @@ fn restricted_updater_verifies_bytes_and_applies_atomically() {
         .apply_approved_update_artifact("0.1.2", &"0".repeat(64), b"unapproved")
         .is_err());
     assert_eq!(fs::read(&target).unwrap(), artifact);
+}
+
+#[test]
+fn local_update_command_requires_executable_artifact_and_rolls_back() {
+    let dir = tempdir().unwrap();
+    let artifact_dir = dir.path().join("artifacts");
+    fs::create_dir_all(&artifact_dir).unwrap();
+    let target = dir.path().join("installed/dirtydash");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let old = b"old executable";
+    let new = b"new executable";
+    fs::write(&target, old).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let artifact_path = artifact_dir.join("0.1.2.artifact");
+    fs::write(&artifact_path, new).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let digest = hex::encode(Sha256::digest(new));
+    let mut collector = Collector::with_databases(
+        Database::open(dir.path().join("usage.sqlite3")).unwrap(),
+        Database::open(dir.path().join("collector.sqlite3")).unwrap(),
+        CollectorOptions {
+            machine_id: Some("machine-update".to_string()),
+            credential_token: Some("ddcol_fixture.secret".to_string()),
+            approved_updates: vec![
+                ApprovedUpdate {
+                    version: "0.1.2".to_string(),
+                    sha256: digest.clone(),
+                },
+                ApprovedUpdate {
+                    version: "0.1.3".to_string(),
+                    sha256: "0".repeat(64),
+                },
+            ],
+            update_artifact_dir: Some(artifact_dir.clone()),
+            update_target: Some(target.clone()),
+            ..CollectorOptions::default()
+        },
+    )
+    .unwrap();
+
+    let rejected = collector
+        .handle_owner_command(
+            OwnerCommand::ApprovedUpdate {
+                command_id: "update-non-exec".to_string(),
+                update_id: "update-local".to_string(),
+                version: "0.1.2".to_string(),
+                sha256: digest.clone(),
+                expected_state_revision: 1,
+            },
+            at("2026-07-15T00:00:00Z"),
+        )
+        .unwrap();
+    assert!(matches!(rejected, CommandOutcome::Rejected { .. }));
+    assert_eq!(fs::read(&target).unwrap(), old);
+
+    #[cfg(unix)]
+    fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o755)).unwrap();
+    let applied = collector
+        .handle_owner_command(
+            OwnerCommand::ApprovedUpdate {
+                command_id: "update-exec".to_string(),
+                update_id: "update-local".to_string(),
+                version: "0.1.2".to_string(),
+                sha256: digest.clone(),
+                expected_state_revision: 1,
+            },
+            at("2026-07-15T00:00:01Z"),
+        )
+        .unwrap();
+    assert!(matches!(applied, CommandOutcome::UpdateApplied { .. }));
+    assert_eq!(fs::read(&target).unwrap(), new);
+    #[cfg(unix)]
+    assert_ne!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o111,
+        0
+    );
+
+    let oversized = artifact_dir.join("0.1.3.artifact");
+    fs::File::create(&oversized)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&oversized, fs::Permissions::from_mode(0o755)).unwrap();
+    let too_large = collector
+        .handle_owner_command(
+            OwnerCommand::ApprovedUpdate {
+                command_id: "update-too-large".to_string(),
+                update_id: "update-local".to_string(),
+                version: "0.1.3".to_string(),
+                sha256: "0".repeat(64),
+                expected_state_revision: 2,
+            },
+            at("2026-07-15T00:00:02Z"),
+        )
+        .unwrap();
+    assert!(matches!(too_large, CommandOutcome::Rejected { .. }));
+    assert_eq!(fs::read(&target).unwrap(), new);
+
+    let rolled_back = collector
+        .handle_owner_command(
+            OwnerCommand::RollbackUpdate {
+                command_id: "rollback-exec".to_string(),
+                update_id: "update-local".to_string(),
+                version: "0.1.2".to_string(),
+                sha256: digest,
+                expected_state_revision: 3,
+            },
+            at("2026-07-15T00:00:03Z"),
+        )
+        .unwrap();
+    assert!(matches!(
+        rolled_back,
+        CommandOutcome::UpdateRolledBack { .. }
+    ));
+    assert_eq!(fs::read(&target).unwrap(), old);
+    #[cfg(unix)]
+    assert_ne!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o111,
+        0
+    );
+}
+
+#[test]
+fn atomic_updater_rejects_preexisting_symlink_rollback_snapshot() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("installed/dirtydash");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let old = b"old-executable";
+    let new = b"new-executable";
+    fs::write(&target, old).unwrap();
+    let backup = target.with_extension("previous");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path().join("outside"), &backup).unwrap();
+    #[cfg(not(unix))]
+    fs::write(&backup, b"already exists").unwrap();
+    let updater = AtomicFileUpdater::new(&target);
+    let digest = hex::encode(Sha256::digest(new));
+
+    let result = updater.apply("0.1.2", &digest, new);
+    #[cfg(unix)]
+    assert!(result.is_err());
+    #[cfg(not(unix))]
+    assert!(result.is_ok());
+    #[cfg(unix)]
+    assert_eq!(fs::read(&target).unwrap(), old);
 }
 
 #[test]

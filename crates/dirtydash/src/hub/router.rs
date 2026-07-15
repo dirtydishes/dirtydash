@@ -11,7 +11,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::net::{IpAddr, SocketAddr};
 use zeroize::Zeroize;
 
@@ -24,7 +23,6 @@ use crate::enrollment::{
 use base64::Engine;
 use std::path::PathBuf;
 
-const MAX_FLEET_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 static DASHBOARD_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../dashboard/dist");
 
 /// Backwards-compatible router builder for composition and in-process tests.
@@ -1174,36 +1172,7 @@ async fn collector_update_artifact(
         ));
     };
     let path = directory.join(format!("{}.artifact", query.version));
-    let metadata = std::fs::metadata(&path).map_err(|_| {
-        HubError::not_found(
-            "fleet-artifact-unavailable",
-            "the signed update artifact is unavailable",
-        )
-    })?;
-    if metadata.len() > MAX_FLEET_ARTIFACT_BYTES {
-        return Err(HubError::unprocessable(
-            "fleet-artifact-too-large",
-            "the signed update artifact exceeds the bounded size limit",
-        ));
-    }
-    let bytes = std::fs::read(&path).map_err(|_| {
-        HubError::not_found(
-            "fleet-artifact-unavailable",
-            "the signed update artifact is unavailable",
-        )
-    })?;
-    if bytes.len() as u64 > MAX_FLEET_ARTIFACT_BYTES {
-        return Err(HubError::unprocessable(
-            "fleet-artifact-too-large",
-            "the signed update artifact exceeds the bounded size limit",
-        ));
-    }
-    if hex::encode(sha2::Sha256::digest(&bytes)) != query.sha256.to_ascii_lowercase() {
-        return Err(HubError::unprocessable(
-            "fleet-artifact-mismatch",
-            "the configured artifact does not match the durable update digest",
-        ));
-    }
+    let bytes = fleet::read_bounded_executable_update_artifact(&path, &query.sha256)?;
     let mut response = Response::new(Body::from(bytes));
     response.headers_mut().insert(
         header::CONTENT_TYPE,

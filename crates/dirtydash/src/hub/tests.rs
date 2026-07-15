@@ -18,16 +18,18 @@ use axum::http::header;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 use axum::{Extension, Router};
+use chrono::Utc;
 use ed25519_dalek::{Signer, SigningKey};
 use rusqlite::params;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use tempfile::tempdir;
 use tower::util::ServiceExt;
 
@@ -63,12 +65,16 @@ fn test_repo() -> HubRepository {
     HubRepository::new(db)
 }
 
-fn signed_collector_fixture(
+fn signed_update_fixture(
     release: &str,
     platform: TargetPlatform,
-) -> (PublisherTrustPolicy, VerifiedArtifact) {
+    bytes: Vec<u8>,
+) -> (
+    PublisherTrustPolicy,
+    VerifiedArtifact,
+    SignedArtifactManifest,
+) {
     let key = SigningKey::from_bytes(&[17_u8; 32]);
-    let bytes = b"dirtydash-hosted-collector-artifact".to_vec();
     let mut signed = SignedArtifactManifest {
         key_id: PublisherTrustPolicy::fingerprint(&key.verifying_key().to_bytes()).unwrap(),
         manifest: ArtifactManifest {
@@ -96,6 +102,18 @@ fn signed_collector_fixture(
         .unwrap()
         .verify_artifact(platform, bytes)
         .unwrap();
+    (policy, artifact, signed)
+}
+
+fn signed_collector_fixture(
+    release: &str,
+    platform: TargetPlatform,
+) -> (PublisherTrustPolicy, VerifiedArtifact) {
+    let (policy, artifact, _) = signed_update_fixture(
+        release,
+        platform,
+        b"dirtydash-hosted-collector-artifact".to_vec(),
+    );
     (policy, artifact)
 }
 
@@ -390,6 +408,127 @@ impl CollectorTransport for CommitThenResponseLossTransport {
         _wait: std::time::Duration,
     ) -> Result<Option<OwnerCommand>, TransportError> {
         Ok(None)
+    }
+}
+
+struct RepoUpdateTransport {
+    repo: HubRepository,
+    token: String,
+    artifact: Vec<u8>,
+    receipts: Vec<CollectorUpdateReceipt>,
+}
+
+impl RepoUpdateTransport {
+    fn auth(&self) -> Result<AuthenticatedCollector, TransportError> {
+        self.repo
+            .authenticate_collector_bearer(&self.token)
+            .map_err(|_| TransportError::new(RetryClass::Unauthorized, "Hub authentication failed"))
+    }
+}
+
+impl CollectorTransport for RepoUpdateTransport {
+    fn send_batch(
+        &mut self,
+        _credential_token: &str,
+        request: &IngestBatchRequest,
+    ) -> Result<IngestBatchResponse, TransportError> {
+        let auth = self.auth()?;
+        self.repo
+            .ingest_batch(&auth, request.clone())
+            .map_err(|_| TransportError::protocol("Hub ingest failed"))
+    }
+
+    fn poll_owner_command(
+        &mut self,
+        _credential_token: &str,
+        _machine_id: &str,
+        _wait: std::time::Duration,
+    ) -> Result<Option<OwnerCommand>, TransportError> {
+        let auth = self.auth()?;
+        self.repo
+            .poll_collector_command(&auth)
+            .map_err(|_| TransportError::protocol("Hub command poll failed"))
+    }
+
+    fn acknowledge_owner_command(
+        &mut self,
+        _credential_token: &str,
+        _machine_id: &str,
+        command_id: &str,
+        result: &CommandOutcome,
+    ) -> Result<(), TransportError> {
+        let auth = self.auth()?;
+        self.repo
+            .acknowledge_collector_command(
+                &auth,
+                CollectorCommandAckRequest {
+                    command_id: command_id.to_string(),
+                    result: result.clone(),
+                },
+            )
+            .map_err(|_| TransportError::protocol("Hub command acknowledgement failed"))
+    }
+
+    fn download_update_artifact(
+        &mut self,
+        _credential_token: &str,
+        _update_id: &str,
+        _version: &str,
+        _sha256: &str,
+    ) -> Result<Vec<u8>, TransportError> {
+        Ok(self.artifact.clone())
+    }
+
+    fn report_collector_update_receipt(
+        &mut self,
+        _credential_token: &str,
+        receipt: &CollectorUpdateReceipt,
+    ) -> Result<(), TransportError> {
+        let auth = self.auth()?;
+        self.repo
+            .record_collector_update_receipt(
+                &auth,
+                CollectorUpdateReceiptRequest {
+                    receipt: receipt.clone(),
+                },
+            )
+            .map_err(|_| TransportError::protocol("Hub update receipt failed"))?;
+        self.receipts.push(receipt.clone());
+        Ok(())
+    }
+}
+
+static PATH_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct PathEnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    original: Option<OsString>,
+}
+
+impl Drop for PathEnvGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
+fn prepend_test_path(path: &Path) -> PathEnvGuard {
+    let guard = PATH_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("PATH test mutex poisoned");
+    let original = std::env::var_os("PATH");
+    let mut paths = vec![path.to_path_buf()];
+    if let Some(existing) = original.as_ref() {
+        paths.extend(std::env::split_paths(existing));
+    }
+    let joined = std::env::join_paths(paths).unwrap();
+    std::env::set_var("PATH", joined);
+    PathEnvGuard {
+        _guard: guard,
+        original,
     }
 }
 
@@ -3093,6 +3232,71 @@ fn update_evidence() -> FleetUpdateEvidence {
     }
 }
 
+fn update_evidence_for_artifact(version: &str, artifact: &[u8]) -> FleetUpdateEvidence {
+    FleetUpdateEvidence {
+        version: version.to_string(),
+        artifact_sha256: hex::encode(Sha256::digest(artifact)),
+        publisher_key_id: "release-key".to_string(),
+        publisher_fingerprint: format!("sha256:{}", "b".repeat(64)),
+        manifest_sha256: "c".repeat(64),
+        publisher_verified: true,
+    }
+}
+
+fn enroll_machine_for_update(repo: &HubRepository, machine_id: &str) -> String {
+    let issued = repo
+        .rotate_collector_credential(RotateCollectorCredentialRequest {
+            machine_id: machine_id.to_string(),
+            display_name: machine_id.to_string(),
+            credential_label: "default".to_string(),
+        })
+        .unwrap();
+    let auth = repo.authenticate_collector_bearer(&issued.token).unwrap();
+    let mut request = ingest_request(API_V1_PROTOCOL_VERSION);
+    request.machine_id = machine_id.to_string();
+    request.batch_id = format!("batch-{machine_id}");
+    request.sync_run.sync_run_id = format!("sync-{machine_id}");
+    request.sync_run.collector_version = Some("1.0.0".to_string());
+    request.sync_run.runtime_generation = Some(format!("runtime-{machine_id}-old"));
+    repo.ingest_batch(&auth, request).unwrap();
+    issued.token.to_string()
+}
+
+fn create_update_for_machine(
+    repo: &HubRepository,
+    evidence: &FleetUpdateEvidence,
+    machine_id: &str,
+) -> FleetUpdateRun {
+    repo.create_fleet_update(FleetUpdateRequest {
+        version: evidence.version.clone(),
+        artifact_sha256: evidence.artifact_sha256.clone(),
+        publisher_key_id: evidence.publisher_key_id.clone(),
+        publisher_fingerprint: evidence.publisher_fingerprint.clone(),
+        manifest_sha256: evidence.manifest_sha256.clone(),
+        signed_manifest: None,
+        machine_ids: vec![machine_id.to_string()],
+    })
+    .unwrap()
+    .update
+}
+
+fn wait_for_update_status(repo: &HubRepository, update_id: &str, status: &str) -> FleetUpdateRun {
+    for _ in 0..100 {
+        let update = repo.fleet_update(update_id).unwrap();
+        if update.status == status {
+            return update;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("fleet update {update_id} did not reach {status}");
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[test]
 fn fleet_update_requires_hub_gate_and_isolates_collector_failure() {
     let repo = test_repo();
@@ -3224,6 +3428,284 @@ fn fleet_update_requires_hub_gate_and_isolates_collector_failure() {
     assert_ne!(action_a.command_id, action_b.command_id);
     assert_eq!(after_hub.status, "collectors-queued");
     let _ = credentials;
+}
+
+#[cfg(unix)]
+#[test]
+fn hub_update_installs_executable_and_reconciles_after_restart_proof() {
+    let dir = tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(&bin.join("systemctl"), b"#!/bin/sh\nexit 0\n");
+    let _path_guard = prepend_test_path(&bin);
+    let artifact_dir = dir.path().join("artifacts");
+    let install_dir = dir.path().join("install");
+    fs::create_dir_all(&artifact_dir).unwrap();
+    fs::create_dir_all(&install_dir).unwrap();
+    let target = install_dir.join("dirtydash-hub");
+    let old = b"#!/bin/sh\necho old hub\n";
+    let new = b"#!/bin/sh\necho new hub\n";
+    write_executable(&target, old);
+    write_executable(&artifact_dir.join("2.0.0.artifact"), new);
+
+    let repo = test_repo();
+    enroll_machine_for_update(&repo, "machine-hub-success");
+    let evidence = update_evidence_for_artifact("2.0.0", new);
+    let update = create_update_for_machine(&repo, &evidence, "machine-hub-success");
+
+    let running = repo
+        .execute_server_fleet_update(
+            &update.update_id,
+            Some(&artifact_dir),
+            Some(&target),
+            Some("systemd-user"),
+        )
+        .unwrap();
+    assert_eq!(running.status, "hub-updating");
+    assert_eq!(fs::read(&target).unwrap(), new);
+    assert_ne!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o111,
+        0
+    );
+
+    repo.mark_hub_runtime_started("2.0.0").unwrap();
+    let reconciled = repo
+        .reconcile_server_fleet_update(&update.update_id, Some(&target))
+        .unwrap();
+    assert_eq!(reconciled.status, "collectors-queued");
+    assert_eq!(
+        reconciled
+            .nodes
+            .iter()
+            .map(|node| node.status.as_str())
+            .collect::<Vec<_>>(),
+        vec!["updating"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hub_update_rejects_non_executable_artifact_without_replacing_target() {
+    let dir = tempdir().unwrap();
+    let artifact_dir = dir.path().join("artifacts");
+    let install_dir = dir.path().join("install");
+    fs::create_dir_all(&artifact_dir).unwrap();
+    fs::create_dir_all(&install_dir).unwrap();
+    let target = install_dir.join("dirtydash-hub");
+    let old = b"#!/bin/sh\necho old hub\n";
+    let new = b"#!/bin/sh\necho new hub\n";
+    write_executable(&target, old);
+    let artifact = artifact_dir.join("2.0.0.artifact");
+    fs::write(&artifact, new).unwrap();
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let repo = test_repo();
+    enroll_machine_for_update(&repo, "machine-hub-nonexec");
+    let evidence = update_evidence_for_artifact("2.0.0", new);
+    let update = create_update_for_machine(&repo, &evidence, "machine-hub-nonexec");
+
+    let result = repo.execute_server_fleet_update(
+        &update.update_id,
+        Some(&artifact_dir),
+        Some(&target),
+        Some("systemd-user"),
+    );
+    assert!(result.is_err());
+    let failed = repo.fleet_update(&update.update_id).unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(fs::read(&target).unwrap(), old);
+}
+
+#[cfg(unix)]
+#[test]
+fn hub_update_restart_failure_restores_verified_backup_and_terminal_state() {
+    let dir = tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(&bin.join("systemctl"), b"#!/bin/sh\nexit 42\n");
+    let _path_guard = prepend_test_path(&bin);
+    let artifact_dir = dir.path().join("artifacts");
+    let install_dir = dir.path().join("install");
+    fs::create_dir_all(&artifact_dir).unwrap();
+    fs::create_dir_all(&install_dir).unwrap();
+    let target = install_dir.join("dirtydash-hub");
+    let old = b"#!/bin/sh\necho old hub\n";
+    let new = b"#!/bin/sh\necho new hub\n";
+    write_executable(&target, old);
+    write_executable(&artifact_dir.join("2.0.0.artifact"), new);
+
+    let repo = test_repo();
+    enroll_machine_for_update(&repo, "machine-hub-restart-fail");
+    let evidence = update_evidence_for_artifact("2.0.0", new);
+    let update = create_update_for_machine(&repo, &evidence, "machine-hub-restart-fail");
+
+    repo.execute_server_fleet_update(
+        &update.update_id,
+        Some(&artifact_dir),
+        Some(&target),
+        Some("systemd-user"),
+    )
+    .unwrap();
+    let failed = wait_for_update_status(&repo, &update.update_id, "failed");
+    assert_eq!(
+        failed.failure_reason.as_deref(),
+        Some("Hub service manager restart failed")
+    );
+    assert_eq!(fs::read(&target).unwrap(), old);
+    assert_ne!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o111,
+        0
+    );
+}
+
+#[test]
+fn collector_update_download_success_receipt_timeout_and_rollback_are_durable() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("collector/dirtydash");
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let old = b"old collector executable";
+    let new = b"new collector executable";
+    fs::write(&target, old).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+    let evidence = update_evidence_for_artifact(env!("CARGO_PKG_VERSION"), new);
+    let repo = test_repo();
+    let token = enroll_machine_for_update(&repo, "machine-collector-update");
+    let update = create_update_for_machine(&repo, &evidence, "machine-collector-update");
+    let snapshot = repo
+        .record_hub_snapshot(&update.update_id, &evidence)
+        .unwrap();
+    repo.record_hub_health(
+        &update.update_id,
+        FleetHubHealthRequest {
+            expected_state_revision: snapshot.state_revision,
+            healthy: true,
+            restarted: true,
+            health_checked: true,
+            hub_version: evidence.version.clone(),
+            evidence: evidence.clone(),
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    repo.start_collector_update(&update.update_id, "machine-collector-update")
+        .unwrap();
+
+    let usage_path = dir.path().join("usage.sqlite3");
+    let collector_path = dir.path().join("collector.sqlite3");
+    let mut collector = Collector::with_databases(
+        Database::open(&usage_path).unwrap(),
+        Database::open(&collector_path).unwrap(),
+        CollectorOptions {
+            machine_id: Some("machine-collector-update".to_string()),
+            credential_token: Some(token.clone()),
+            update_target: Some(target.clone()),
+            ..CollectorOptions::default()
+        },
+    )
+    .unwrap();
+    let mut transport = RepoUpdateTransport {
+        repo: repo.clone(),
+        token: token.clone(),
+        artifact: new.to_vec(),
+        receipts: Vec::new(),
+    };
+
+    let applied = collector
+        .poll_owner_command(&mut transport, Utc::now())
+        .unwrap()
+        .unwrap();
+    assert!(matches!(applied, CommandOutcome::UpdateApplied { .. }));
+    assert_eq!(fs::read(&target).unwrap(), new);
+    #[cfg(unix)]
+    assert_ne!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o111,
+        0
+    );
+    collector
+        .mark_runtime_started(Utc::now() + chrono::Duration::seconds(1))
+        .unwrap();
+    assert!(collector
+        .report_pending_update_receipt(&mut transport, Utc::now() + chrono::Duration::seconds(2))
+        .unwrap());
+    assert_eq!(transport.receipts.len(), 1);
+    assert_eq!(
+        repo.fleet_update(&update.update_id).unwrap().nodes[0].status,
+        "succeeded"
+    );
+
+    let token = enroll_machine_for_update(&repo, "machine-collector-rollback");
+    let update = create_update_for_machine(&repo, &evidence, "machine-collector-rollback");
+    let snapshot = repo
+        .record_hub_snapshot(&update.update_id, &evidence)
+        .unwrap();
+    repo.record_hub_health(
+        &update.update_id,
+        FleetHubHealthRequest {
+            expected_state_revision: snapshot.state_revision,
+            healthy: true,
+            restarted: true,
+            health_checked: true,
+            hub_version: evidence.version.clone(),
+            evidence,
+            failure_reason: None,
+        },
+    )
+    .unwrap();
+    repo.start_collector_update(&update.update_id, "machine-collector-rollback")
+        .unwrap();
+    fs::write(&target, old).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut collector = Collector::with_databases(
+        Database::open(dir.path().join("usage-rollback.sqlite3")).unwrap(),
+        Database::open(dir.path().join("collector-rollback.sqlite3")).unwrap(),
+        CollectorOptions {
+            machine_id: Some("machine-collector-rollback".to_string()),
+            credential_token: Some(token.clone()),
+            update_target: Some(target.clone()),
+            ..CollectorOptions::default()
+        },
+    )
+    .unwrap();
+    let mut transport = RepoUpdateTransport {
+        repo: repo.clone(),
+        token,
+        artifact: new.to_vec(),
+        receipts: Vec::new(),
+    };
+    assert!(matches!(
+        collector
+            .poll_owner_command(&mut transport, Utc::now())
+            .unwrap()
+            .unwrap(),
+        CommandOutcome::UpdateApplied { .. }
+    ));
+    assert_eq!(fs::read(&target).unwrap(), new);
+    let stale_started_at = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+    repo.db
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE fleet_update_nodes SET update_started_at = ?3 WHERE update_id = ?1 AND machine_id = ?2",
+            params![update.update_id, "machine-collector-rollback", stale_started_at],
+        )
+        .unwrap();
+    repo.reconcile_server_fleet_update(&update.update_id, None)
+        .unwrap();
+    let rolling_back = repo.fleet_update(&update.update_id).unwrap();
+    assert_eq!(rolling_back.nodes[0].status, "rolling-back");
+    assert!(matches!(
+        collector
+            .poll_owner_command(&mut transport, Utc::now())
+            .unwrap()
+            .unwrap(),
+        CommandOutcome::UpdateRolledBack { .. }
+    ));
+    let completed = repo.fleet_update(&update.update_id).unwrap();
+    assert_eq!(completed.status, "completed-with-failures");
+    assert_eq!(completed.nodes[0].status, "rolled-back");
+    assert_eq!(fs::read(&target).unwrap(), old);
 }
 
 #[derive(Default)]

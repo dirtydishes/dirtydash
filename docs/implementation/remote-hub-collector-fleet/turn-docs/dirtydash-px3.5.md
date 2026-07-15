@@ -136,6 +136,8 @@ The bound implementation checkout contains the Hub fleet repository/router, addi
 
 Slice `dirtydash-px3.8` tightens hosted enrollment through first Hub ingest: hosted execute now rejects loopback/unspecified canonical Hub origins, revokes the reserved pending Collector credential on post-reservation failure paths, and leaves retry bound to the same enrollment credential row with a newly hashed secret. Repair cycle 1 updates the production HTTP Collector test to install the Hub-issued credential through `DeploymentRunner`, verify the generated config omits raw credential material, verify `secrets.json` is restrictive secret material, load that installed config/secret through `Config::load` and `Collector::open`, then run real HTTP ingest and diagnostics polling against an Axum Hub listener.
 
+Slice `dirtydash-px3.9` hardens executable update installation for both Hub and Collector. Hub artifact serving and server-owned apply now share a bounded, digest-checked, non-symlink, executable-source reader; Hub install snapshots/restores through durable private markers or fsynced rollback files, chmods before fsync, fsyncs files and parent directories around rename, repairs executable mode on idempotent replay, and restores the verified backup on service-manager restart failure. Collector transport updates can use the Hub-authenticated command/download path without a static local allowlist, while local artifact-dir updates still require an allowlist plus executable source file; the atomic updater rejects symlink rollback snapshots, uses fsynced backup/missing markers, preserves the original rollback snapshot across replay, chmods before fsync, repairs executable mode on replay, and restores/removes the target on rollback. Collector update receipt completion now releases the repository write guard before terminal reconciliation so successful receipts cannot deadlock in `node-updating`.
+
 ## Changed Behavior And Files
 
 - Backend: `crates/dirtydash/src/hub/fleet.rs`, `hub/router.rs`, `hub/repository.rs`, `hub/auth.rs`, `hub/mod.rs`, `hub/protocol.rs`, `db.rs`, `config.rs`, `enrollment.rs`, and `collector.rs`.
@@ -146,6 +148,7 @@ Slice `dirtydash-px3.8` tightens hosted enrollment through first Hub ingest: hos
 - Slice `dirtydash-px3.8`: `crates/dirtydash/src/hub/router.rs`, `hub/repository.rs`, `hub/mod.rs`, and `hub/tests.rs` cover non-loopback hosted canonical URL enforcement, pending credential revocation/retry semantics, first-ingest/command-poll production HTTP evidence, and Machine-scoped long-poll notification.
 - Repair cycle 1: `dashboard/src/machines.tsx`, `dashboard/tests/machines-a11y.test.tsx`, and `dashboard/tests/machines-contract.test.mjs` cover probe secret clearing and retry-body scrubbing.
 - Repair cycle 2: `dashboard/src/machines.tsx`, `dashboard/tests/machines-a11y.test.tsx`, `dashboard/tests/machines-contract.test.mjs`, and regenerated `dashboard/dist` assets cover secret-bearing retry closures with no lexical request-body capture.
+- Slice `dirtydash-px3.9`: `crates/dirtydash/src/hub/fleet.rs`, `hub/router.rs`, `hub/repository.rs`, `hub/tests.rs`, `collector.rs`, and `crates/dirtydash/tests/collector.rs` cover bounded executable artifact reads, fsynced atomic install/rollback, Hub restart-failure restoration, Collector receipt terminal reconciliation, local non-executable/oversized artifact rejection, symlink rollback-snapshot rejection, and Collector timeout rollback.
 
 ## Review
 
@@ -205,9 +208,25 @@ Repair cycle 2 evidence:
 - `git diff --check` passed.
 - No Rust files changed; no Rust regression was required for this dashboard-only repair.
 
+Additional `dirtydash-px3.9` evidence:
+
+- `cargo test -p dirtydash --test collector local_update_command_requires_executable_artifact_and_rolls_back -- --nocapture` passed.
+- `cargo test -p dirtydash --test collector update -- --nocapture` passed: 6 focused Collector update tests.
+- `cargo test -p dirtydash hub_update_ -- --nocapture` passed: Hub success, non-executable prevention, and restart-failure rollback tests.
+- `cargo test -p dirtydash collector_update_download_success_receipt_timeout_and_rollback_are_durable -- --nocapture` passed.
+- `cargo test -p dirtydash hub::tests:: -- --nocapture` passed: 46 Hub tests.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo test --all-targets --all-features` passed: 124 library tests, 9 CLI tests, and 17 Collector integration tests.
+- `npm --prefix dashboard run test` passed: 3 rendered tests.
+- `npm --prefix dashboard run test:contract` passed.
+- `cd dashboard && npx tsc --noEmit` passed.
+- `npm --prefix dashboard run build` passed.
+- `git diff --check` passed.
+
 ## PR And Commits
 
-Base implementation commit `d2ace45` remains the PR #12 base. Slice `dirtydash-px3.8` is pushed as commits `90d60a1`, `3070b74`, and `9208aeb` on `lavender/remote-hub-collector-fleet-5-fleet`. The branch is clean and up to date with origin. The PR target remains `lavender/remote-hub-collector-fleet-implementation`; GitHub reports no configured status checks.
+Base implementation commit `d2ace45` remains the PR #12 base. Slice `dirtydash-px3.8` is pushed as commits `90d60a1`, `3070b74`, and `9208aeb` on `lavender/remote-hub-collector-fleet-5-fleet`. Slice `dirtydash-px3.9` adds the executable Hub/Collector install and rollback hardening on the same PR branch. The PR target remains `lavender/remote-hub-collector-fleet-implementation`; GitHub reports no configured status checks.
 
 ## Beads Updates And Follow-Ups
 

@@ -1542,6 +1542,7 @@ impl HubRepository {
             ));
         }
         tx.commit().map_err(HubError::internal)?;
+        drop(_guard);
         self.finish_update_if_terminal(&receipt.update_id)
     }
 

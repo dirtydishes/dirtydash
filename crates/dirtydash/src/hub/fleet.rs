@@ -385,6 +385,7 @@ pub(crate) fn fleet_rollback_command_id(update_id: &str, machine_id: &str) -> St
 
 const COLLECTOR_UPDATE_TIMEOUT: Duration = Duration::minutes(5);
 const HUB_UPDATE_TIMEOUT: Duration = Duration::minutes(5);
+const MAX_FLEET_UPDATE_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 impl HubRepository {
     pub(crate) fn list_machines(&self) -> HubResult<Vec<MachineRecord>> {
@@ -972,6 +973,7 @@ impl HubRepository {
         )
         .map_err(HubError::internal)?;
         set_private_file(&snapshot_path).map_err(HubError::internal)?;
+        sync_file(&snapshot_path).map_err(HubError::internal)?;
         if let Some(parent) = snapshot_path.parent() {
             sync_parent_directory(parent).map_err(HubError::internal)?;
         }
@@ -1312,42 +1314,36 @@ impl HubRepository {
             ));
         };
         let artifact_path = artifact_dir.join(format!("{}.artifact", update.version));
-        let artifact = fs::read(&artifact_path).map_err(|_| {
-            HubError::unprocessable(
-                "fleet-artifact-unavailable",
-                "the configured signed artifact is unavailable",
-            )
-        })?;
-        let digest = hex::encode(Sha256::digest(&artifact));
-        if !digest.eq_ignore_ascii_case(&update.artifact_sha256) {
-            return Err(HubError::unprocessable(
-                "fleet-artifact-mismatch",
-                "the configured artifact does not match the verified publisher plan",
-            ));
-        }
+        let artifact =
+            read_bounded_executable_update_artifact(&artifact_path, &update.artifact_sha256)?;
         let parent = update_target.parent().ok_or_else(|| {
             HubError::unprocessable("fleet-runtime-invalid", "Hub update target has no parent")
         })?;
         fs::create_dir_all(parent).map_err(HubError::internal)?;
+        let target_metadata = optional_safe_file_metadata(update_target, "Hub update target")?;
         let backup = hub_binary_backup_path(update_target, &update.update_id);
         let missing = hub_binary_missing_marker(update_target, &update.update_id);
-        if update_target.exists() && !backup.exists() {
-            fs::copy(update_target, &backup).map_err(HubError::internal)?;
-            set_executable_mode(&backup).map_err(HubError::internal)?;
-        } else if !update_target.exists() && !backup.exists() && !missing.exists() {
-            fs::File::create(&missing).map_err(HubError::internal)?;
-            set_private_file(&missing).map_err(HubError::internal)?;
-        }
-        let existing_digest = update_target
-            .exists()
-            .then(|| fs::read(update_target).ok())
-            .flatten()
+        let backup_exists =
+            optional_safe_file_metadata(&backup, "Hub rollback snapshot")?.is_some();
+        let missing_exists =
+            optional_safe_file_metadata(&missing, "Hub rollback missing marker")?.is_some();
+        let existing_digest = target_metadata
+            .as_ref()
+            .and_then(|_| fs::read(update_target).ok())
             .map(|bytes| hex::encode(Sha256::digest(bytes)));
         if existing_digest
             .as_deref()
             .is_some_and(|digest| digest.eq_ignore_ascii_case(&update.artifact_sha256))
         {
+            set_executable_mode(update_target).map_err(HubError::internal)?;
+            sync_file(update_target).map_err(HubError::internal)?;
+            sync_parent_directory(parent).map_err(HubError::internal)?;
             return Ok(());
+        }
+        if target_metadata.is_some() && !backup_exists {
+            copy_file_durable(update_target, &backup, true)?;
+        } else if target_metadata.is_none() && !backup_exists && !missing_exists {
+            create_private_marker_durable(&missing)?;
         }
         let temporary = parent.join(format!(".fleet-{}.tmp", random_token(8)));
         let mut file = fs::OpenOptions::new()
@@ -1356,12 +1352,22 @@ impl HubRepository {
             .open(&temporary)
             .map_err(HubError::internal)?;
         use std::io::Write;
-        file.write_all(&artifact).map_err(HubError::internal)?;
-        file.sync_all().map_err(HubError::internal)?;
+        let write_result = (|| -> std::io::Result<()> {
+            file.write_all(&artifact)?;
+            set_executable_mode(&temporary).map_err(std::io::Error::other)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(HubError::internal(error));
+        }
         drop(file);
-        set_executable_mode(&temporary).map_err(HubError::internal)?;
         fs::rename(&temporary, update_target).map_err(HubError::internal)?;
-        sync_parent_directory(parent).map_err(HubError::internal)?;
+        if let Err(error) = sync_parent_directory(parent) {
+            let _ = self.restore_hub_update_target(&update.update_id, Some(update_target));
+            return Err(HubError::internal(error));
+        }
         Ok(())
     }
 
@@ -1465,15 +1471,32 @@ impl HubRepository {
         let Some(update_target) = update_target else {
             return Ok(());
         };
+        let parent = update_target.parent().ok_or_else(|| {
+            HubError::unprocessable("fleet-runtime-invalid", "Hub update target has no parent")
+        })?;
         let backup = hub_binary_backup_path(update_target, update_id);
         let missing = hub_binary_missing_marker(update_target, update_id);
-        if backup.exists() {
-            fs::rename(backup, update_target).map_err(HubError::internal)?;
-        } else if missing.exists() {
-            if update_target.exists() {
+        let backup_exists =
+            optional_safe_file_metadata(&backup, "Hub rollback snapshot")?.is_some();
+        let missing_exists =
+            optional_safe_file_metadata(&missing, "Hub rollback missing marker")?.is_some();
+        if backup_exists {
+            fs::rename(&backup, update_target).map_err(HubError::internal)?;
+            set_executable_mode(update_target).map_err(HubError::internal)?;
+            sync_file(update_target).map_err(HubError::internal)?;
+            if missing_exists {
+                fs::remove_file(&missing).map_err(HubError::internal)?;
+            }
+            sync_parent_directory(parent).map_err(HubError::internal)?;
+        } else if missing_exists {
+            if optional_path_metadata(update_target)
+                .map_err(HubError::internal)?
+                .is_some()
+            {
                 fs::remove_file(update_target).map_err(HubError::internal)?;
             }
-            fs::remove_file(missing).map_err(HubError::internal)?;
+            fs::remove_file(&missing).map_err(HubError::internal)?;
+            sync_parent_directory(parent).map_err(HubError::internal)?;
         }
         Ok(())
     }
@@ -1955,6 +1978,152 @@ fn hub_binary_missing_marker(target: &Path, update_id: &str) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("dirtydash-hub");
     parent.join(format!(".{name}.previous-missing-{update_id}"))
+}
+
+pub(crate) fn read_bounded_executable_update_artifact(
+    path: &Path,
+    expected_sha256: &str,
+) -> HubResult<Vec<u8>> {
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if !digest_is_safe(&expected) {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-mismatch",
+            "the configured artifact digest is invalid",
+        ));
+    }
+    let metadata =
+        optional_safe_file_metadata(path, "signed update artifact")?.ok_or_else(|| {
+            HubError::not_found(
+                "fleet-artifact-unavailable",
+                "the signed update artifact is unavailable",
+            )
+        })?;
+    if metadata.len() > MAX_FLEET_UPDATE_ARTIFACT_BYTES {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-too-large",
+            "the signed update artifact exceeds the bounded size limit",
+        ));
+    }
+    require_executable_file(&metadata, "signed update artifact")?;
+    let bytes = fs::read(path).map_err(|_| {
+        HubError::not_found(
+            "fleet-artifact-unavailable",
+            "the signed update artifact is unavailable",
+        )
+    })?;
+    if bytes.len() as u64 > MAX_FLEET_UPDATE_ARTIFACT_BYTES {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-too-large",
+            "the signed update artifact exceeds the bounded size limit",
+        ));
+    }
+    if hex::encode(Sha256::digest(&bytes)) != expected {
+        return Err(HubError::unprocessable(
+            "fleet-artifact-mismatch",
+            "the configured artifact does not match the durable update digest",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn optional_path_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn optional_safe_file_metadata(path: &Path, label: &str) -> HubResult<Option<fs::Metadata>> {
+    let Some(metadata) = optional_path_metadata(path).map_err(HubError::internal)? else {
+        return Ok(None);
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(HubError::unprocessable(
+            "fleet-runtime-invalid",
+            format!("{label} must not be a symlink"),
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(HubError::unprocessable(
+            "fleet-runtime-invalid",
+            format!("{label} must be a regular file"),
+        ));
+    }
+    Ok(Some(metadata))
+}
+
+fn require_executable_file(metadata: &fs::Metadata, label: &str) -> HubResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(HubError::unprocessable(
+                "fleet-artifact-not-executable",
+                format!("{label} must be executable"),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (metadata, label);
+    }
+    Ok(())
+}
+
+fn create_private_marker_durable(path: &Path) -> HubResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(HubError::internal)?;
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(HubError::internal)?;
+    set_private_file(path).map_err(HubError::internal)?;
+    file.sync_all().map_err(HubError::internal)?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        sync_parent_directory(parent).map_err(HubError::internal)?;
+    }
+    Ok(())
+}
+
+fn copy_file_durable(source: &Path, destination: &Path, executable: bool) -> HubResult<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        HubError::unprocessable("fleet-runtime-invalid", "rollback snapshot has no parent")
+    })?;
+    fs::create_dir_all(parent).map_err(HubError::internal)?;
+    let temporary = parent.join(format!(".snapshot-{}.tmp", random_token(8)));
+    let mut input = fs::File::open(source).map_err(HubError::internal)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(HubError::internal)?;
+    let copy_result = (|| -> std::io::Result<()> {
+        std::io::copy(&mut input, &mut output)?;
+        if executable {
+            set_executable_mode(&temporary).map_err(std::io::Error::other)?;
+        } else {
+            set_private_file(&temporary).map_err(std::io::Error::other)?;
+        }
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(HubError::internal(error));
+    }
+    drop(output);
+    fs::rename(&temporary, destination).map_err(HubError::internal)?;
+    sync_parent_directory(parent).map_err(HubError::internal)?;
+    Ok(())
+}
+
+fn sync_file(path: &std::path::Path) -> anyhow::Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
 }
 
 fn set_private_directory(path: &std::path::Path) -> anyhow::Result<()> {

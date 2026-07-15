@@ -529,11 +529,20 @@ impl AtomicFileUpdater {
     }
 }
 
+fn executable_mode(mode: u32) -> u32 {
+    let mode = mode & 0o777;
+    if mode & 0o111 == 0 {
+        0o755
+    } else {
+        mode
+    }
+}
+
 fn set_executable_mode(path: &std::path::Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o111))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(executable_mode(mode)))?;
     }
     #[cfg(not(unix))]
     {
@@ -551,6 +560,111 @@ fn sync_parent_directory(parent: &std::path::Path) -> Result<()> {
     {
         let _ = parent;
     }
+    Ok(())
+}
+
+fn sync_file(path: &std::path::Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn optional_path_metadata(path: &std::path::Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn optional_safe_file_metadata(
+    path: &std::path::Path,
+    label: &str,
+) -> Result<Option<fs::Metadata>> {
+    let Some(metadata) = optional_path_metadata(path)? else {
+        return Ok(None);
+    };
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("{label} must not be a symlink");
+    }
+    if !metadata.file_type().is_file() {
+        anyhow::bail!("{label} must be a regular file");
+    }
+    Ok(Some(metadata))
+}
+
+fn require_executable_artifact(metadata: &fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("approved update artifact is not executable");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+    Ok(())
+}
+
+fn read_bounded_executable_artifact(path: &std::path::Path) -> Result<Vec<u8>> {
+    let metadata = optional_safe_file_metadata(path, "approved update artifact")?
+        .context("approved update artifact is unavailable")?;
+    if metadata.len() > MAX_UPDATE_ARTIFACT_BYTES as u64 {
+        anyhow::bail!("Collector update artifact exceeds the bounded size limit");
+    }
+    require_executable_artifact(&metadata)?;
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_UPDATE_ARTIFACT_BYTES {
+        anyhow::bail!("Collector update artifact exceeds the bounded size limit");
+    }
+    Ok(bytes)
+}
+
+fn create_private_marker(path: &std::path::Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_parent_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn copy_file_durable(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    mode: u32,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("rollback snapshot has no parent directory")?;
+    let temporary = parent.join(format!(".snapshot-{}.tmp", random_hex(8)));
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> std::io::Result<()> {
+        std::io::copy(&mut input, &mut output)?;
+        set_executable_mode(&temporary, mode).map_err(std::io::Error::other)?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    drop(output);
+    fs::rename(&temporary, destination)?;
+    sync_parent_directory(parent)?;
     Ok(())
 }
 
@@ -578,45 +692,56 @@ impl RestrictedUpdater for AtomicFileUpdater {
         if actual != expected {
             anyhow::bail!("update artifact digest does not match the approved digest");
         }
-        // A crash after atomic replacement but before the command receipt can
-        // replay the same update. Do not overwrite the original rollback
-        // snapshot with a copy of the already-installed artifact.
-        if self
-            .target
-            .exists()
-            .then(|| fs::read(&self.target).ok())
-            .flatten()
-            .is_some_and(|current| hex::encode(Sha256::digest(current)) == expected)
-        {
-            return Ok(());
-        }
         let parent = self
             .target
             .parent()
             .context("configured update target has no parent directory")?;
         fs::create_dir_all(parent)?;
+        let target_metadata = optional_safe_file_metadata(&self.target, "Collector update target")?;
         let backup = self.target.with_extension("previous");
-        let existing_mode = if self.target.exists() {
+        let missing = self.target.with_extension("previous-missing");
+        let backup_exists =
+            optional_safe_file_metadata(&backup, "Collector rollback snapshot")?.is_some();
+        let missing_exists =
+            optional_safe_file_metadata(&missing, "Collector rollback missing marker")?.is_some();
+        let existing_mode = if let Some(metadata) = target_metadata.as_ref() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                Some(fs::metadata(&self.target)?.permissions().mode() & 0o777)
+                Some(metadata.permissions().mode() & 0o777)
             }
             #[cfg(not(unix))]
             {
+                let _ = metadata;
                 None
             }
         } else {
             None
         };
-        if self.target.exists() {
-            fs::copy(&self.target, &backup).with_context(|| {
-                format!(
-                    "snapshotting the current Collector release at {}",
-                    self.target.display()
-                )
-            })?;
-            set_executable_mode(&backup, existing_mode.unwrap_or(0o755))?;
+        // A crash after atomic replacement but before the command receipt can
+        // replay the same update. Do not overwrite the original rollback
+        // snapshot with a copy of the already-installed artifact.
+        if target_metadata
+            .as_ref()
+            .and_then(|_| fs::read(&self.target).ok())
+            .is_some_and(|current| hex::encode(Sha256::digest(current)) == expected)
+        {
+            set_executable_mode(&self.target, existing_mode.unwrap_or(0o755))?;
+            sync_file(&self.target)?;
+            sync_parent_directory(parent)?;
+            return Ok(());
+        }
+        if target_metadata.is_some() && !backup_exists {
+            copy_file_durable(&self.target, &backup, existing_mode.unwrap_or(0o755)).with_context(
+                || {
+                    format!(
+                        "snapshotting the current Collector release at {}",
+                        self.target.display()
+                    )
+                },
+            )?;
+        } else if target_metadata.is_none() && !backup_exists && !missing_exists {
+            create_private_marker(&missing)?;
         }
         let temp = parent.join(format!(
             ".{}.{}.tmp",
@@ -630,10 +755,18 @@ impl RestrictedUpdater for AtomicFileUpdater {
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(artifact)?;
-        file.sync_all()?;
+        let write_result = (|| -> std::io::Result<()> {
+            file.write_all(artifact)?;
+            set_executable_mode(&temp, existing_mode.unwrap_or(0o755))
+                .map_err(std::io::Error::other)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
         drop(file);
-        set_executable_mode(&temp, existing_mode.unwrap_or(0o755))?;
         fs::rename(&temp, &self.target).with_context(|| {
             format!(
                 "atomically applying approved update {} to {}",
@@ -641,7 +774,10 @@ impl RestrictedUpdater for AtomicFileUpdater {
                 self.target.display()
             )
         })?;
-        sync_parent_directory(parent)?;
+        if let Err(error) = sync_parent_directory(parent) {
+            let _ = self.rollback(version, &expected);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -649,34 +785,52 @@ impl RestrictedUpdater for AtomicFileUpdater {
         if !is_safe_update_version(version) || !is_sha256_hex(expected_sha256) {
             anyhow::bail!("rollback evidence is invalid");
         }
+        let parent = self
+            .target
+            .parent()
+            .context("Collector rollback target has no parent")?;
         let backup = self.target.with_extension("previous");
-        if !backup.exists() {
-            // A process can die after the atomic rename but before the Hub
-            // acknowledgement. Treat an already non-target executable as the
-            // completed rollback rather than moving the node into a permanent
-            // retry loop.
-            if self
-                .target
-                .exists()
-                .then(|| fs::read(&self.target).ok())
-                .flatten()
-                .is_some_and(|current| {
-                    !hex::encode(Sha256::digest(current)).eq_ignore_ascii_case(expected_sha256)
-                })
-            {
-                return Ok(());
+        let missing = self.target.with_extension("previous-missing");
+        let backup_exists =
+            optional_safe_file_metadata(&backup, "Collector rollback snapshot")?.is_some();
+        let missing_exists =
+            optional_safe_file_metadata(&missing, "Collector rollback missing marker")?.is_some();
+        if backup_exists {
+            fs::rename(&backup, &self.target).with_context(|| {
+                format!("restoring the Collector rollback snapshot for {version}")
+            })?;
+            set_executable_mode(&self.target, 0o755)?;
+            sync_file(&self.target)?;
+            if missing_exists {
+                fs::remove_file(&missing)?;
             }
-            anyhow::bail!("Collector rollback snapshot is unavailable");
+            sync_parent_directory(parent)?;
+            return Ok(());
         }
-        fs::rename(&backup, &self.target)
-            .with_context(|| format!("restoring the Collector rollback snapshot for {version}"))?;
-        set_executable_mode(&self.target, 0o755)?;
-        sync_parent_directory(
-            self.target
-                .parent()
-                .context("Collector rollback target has no parent")?,
-        )?;
-        Ok(())
+        if missing_exists {
+            if optional_path_metadata(&self.target)?.is_some() {
+                fs::remove_file(&self.target)?;
+            }
+            fs::remove_file(&missing)?;
+            sync_parent_directory(parent)?;
+            return Ok(());
+        }
+        // A process can die after the atomic rename but before the Hub
+        // acknowledgement. Treat an already non-target executable as the
+        // completed rollback rather than moving the node into a permanent
+        // retry loop.
+        if optional_safe_file_metadata(&self.target, "Collector rollback target")?
+            .and_then(|_| fs::read(&self.target).ok())
+            .is_some_and(|current| {
+                !hex::encode(Sha256::digest(current)).eq_ignore_ascii_case(expected_sha256)
+            })
+        {
+            set_executable_mode(&self.target, 0o755)?;
+            sync_file(&self.target)?;
+            sync_parent_directory(parent)?;
+            return Ok(());
+        }
+        anyhow::bail!("Collector rollback snapshot is unavailable");
     }
 }
 
@@ -1809,27 +1963,36 @@ impl Collector {
                 reason: "approved update version, digest, or revision is invalid".to_string(),
             });
         }
-        if !self
-            .options
-            .approved_updates
-            .iter()
-            .any(|entry| entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest))
-        {
-            return Ok(CommandOutcome::Rejected {
-                reason: "update is not present in the approved version/digest allowlist"
-                    .to_string(),
-            });
-        }
         if let Some(directory) = &self.options.update_artifact_dir {
-            let artifact = match fs::read(directory.join(format!("{version}.artifact"))) {
+            if !self
+                .options
+                .approved_updates
+                .iter()
+                .any(|entry| entry.version == version && entry.sha256.eq_ignore_ascii_case(&digest))
+            {
+                return Ok(CommandOutcome::Rejected {
+                    reason: "update is not present in the approved version/digest allowlist"
+                        .to_string(),
+                });
+            }
+            let artifact_path = directory.join(format!("{version}.artifact"));
+            let artifact = match read_bounded_executable_artifact(&artifact_path) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return Ok(CommandOutcome::Rejected {
-                        reason: "approved update artifact is unavailable".to_string(),
+                        reason: "approved update artifact is unavailable or not executable"
+                            .to_string(),
                     })
                 }
             };
-            self.apply_update_artifact_bytes(&version, &digest, &artifact, true)?;
+            if self
+                .apply_update_artifact_bytes(&version, &digest, &artifact, true)
+                .is_err()
+            {
+                return Ok(CommandOutcome::Rejected {
+                    reason: "approved update artifact failed verification or install".to_string(),
+                });
+            }
         } else {
             let artifact = match transport
                 .download_update_artifact(credential, &update_id, &version, &digest)
@@ -1844,7 +2007,14 @@ impl Collector {
                 }
                 Err(error) => return Err(anyhow::anyhow!(error)),
             };
-            self.apply_update_artifact_bytes(&version, &digest, &artifact, true)?;
+            if self
+                .apply_update_artifact_bytes(&version, &digest, &artifact, false)
+                .is_err()
+            {
+                return Ok(CommandOutcome::Rejected {
+                    reason: "downloaded update artifact failed verification or install".to_string(),
+                });
+            }
         }
         self.stage_approved_update(
             update_id,
@@ -2041,40 +2211,36 @@ impl Collector {
                 if let Some(directory) = &self.options.update_artifact_dir {
                     let artifact_name = format!("{}.artifact", version);
                     let artifact_path = directory.join(&artifact_name);
-                    let artifact = match fs::read(&artifact_path) {
+                    let artifact = match read_bounded_executable_artifact(&artifact_path) {
                         Ok(bytes) => bytes,
                         Err(_) => {
                             return Ok(CommandOutcome::Rejected {
-                                reason: "approved update artifact is unavailable".to_string(),
+                                reason: "approved update artifact is unavailable or not executable"
+                                    .to_string(),
                             })
                         }
                     };
-                    self.apply_approved_update_artifact(&approved.version, &digest, &artifact)?;
+                    if self
+                        .apply_approved_update_artifact(&approved.version, &digest, &artifact)
+                        .is_err()
+                    {
+                        return Ok(CommandOutcome::Rejected {
+                            reason: "approved update artifact failed verification or install"
+                                .to_string(),
+                        });
+                    }
                 } else {
                     return Ok(CommandOutcome::Rejected {
                         reason: "approved update artifact directory is not configured".to_string(),
                     });
                 }
-                self.store
-                    .set_collector_state("pending_update_id", &update_id)?;
-                self.store
-                    .set_collector_state("pending_update_command_id", &command_id)?;
-                self.store
-                    .set_collector_state("pending_update_version", &version)?;
-                self.store
-                    .set_collector_state("pending_update_sha256", &digest)?;
-                self.store.set_collector_state(
-                    "pending_update_state_revision",
-                    &expected_state_revision.to_string(),
-                )?;
-                self.store
-                    .set_collector_state("restart_requested", "true")?;
-                Ok(CommandOutcome::UpdateApplied {
+                self.stage_approved_update(
                     update_id,
                     command_id,
                     version,
-                    sha256: digest,
-                })
+                    digest,
+                    expected_state_revision,
+                )
             }
             OwnerCommand::RollbackUpdate {
                 update_id,
