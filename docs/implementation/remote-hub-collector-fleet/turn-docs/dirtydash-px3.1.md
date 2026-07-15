@@ -98,14 +98,17 @@ State: unresolved
 Evidence:
 
 - Environment verified before mutation: `pwd`, `git rev-parse --show-toplevel`, `git symbolic-ref --short HEAD`, `git status --short --branch` all matched the bound worktree and branch.
-- Documentation link check: `python3` local-link validation over 20 touched Markdown files passed.
-- Documentation integrity check: `git diff --check` passed.
-- Terminology/roadmap scan: targeted `grep` confirmed the active stream now points to Hub/Collector push sync and the old SSH-pull stream is explicitly marked superseded.
+- Documentation link check passed via a `python3` local-link validation over 20 touched Markdown files.
+- Documentation integrity check passed via `git diff --check`.
+- Terminology/roadmap scan passed via targeted `grep` across the active stream, product copy, and superseded SSH-pull docs.
 - `cargo test` and `npm --prefix dashboard run build` were intentionally not run because no executable or generated product surfaces changed in this docs-only phase.
 
 ## PR And Commits
 
-Pending final commit, push, and PR creation from this implementation session.
+- Commit: `b1f1483` — `docs: define remote hub collector phase-1 canon`
+- Branch pushed: `lavender/remote-hub-collector-fleet-1-docs`
+- PR: #8 — `dirtydash-px3.1: define remote hub/collector docs canon`
+- PR URL: https://github.com/dirtydishes/dirtydash/pull/8
 
 ## Beads Updates And Follow-Ups
 
@@ -123,4 +126,4 @@ None. The work stayed within phase-1 documentation/tracker-record scope.
 
 ## Closeout
 
-In progress: documentation implementation completed; final commit/branch push/PR creation still pending from this session.
+Implementation session complete for the bounded phase-1 scope: docs committed, branch pushed, and exactly one PR opened against `lavender/remote-hub-collector-fleet-implementation`. Review, CI closeout, Beads mutation, and phase advancement remain coordinator-owned.
